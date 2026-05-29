@@ -294,62 +294,174 @@ class WebotsCamera:
     OUTPUT_HEIGHT = 360
 
     def __init__(self, simulation: bool = True, robot_instance=None,
+                 robot_hosts: Optional[List[Any]] = None,
+                 supervisor=None,
                  color_device_name: str = 'realsense_color',
                  range_device_name: str = 'realsense_range',
+                 color_def: Optional[str] = None,
+                 range_def: Optional[str] = None,
+                 alt_color_names: Optional[List[str]] = None,
+                 alt_range_names: Optional[List[str]] = None,
+                 discover_tag: Optional[str] = None,
                  rot90_k: int = 3,
-                 flip_lr: bool = True):
+                 flip_lr: bool = True,
+                 defer_setup: bool = False):
         """
         Args:
-            simulation: Flag indicating if the environment is active.
-            robot_instance: Shared Webots Supervisor handle.
-            color_device_name: Node DEF name for the RGB camera.
-            range_device_name: Node DEF name for the Depth/Range camera.
+            simulation: True = mock/offline mode; False = live Webots devices.
+            robot_instance: Legacy single host (appended to robot_hosts if set).
+            robot_hosts: Webots Robot/Supervisor handles to search for devices.
+            supervisor: Supervisor used to read Camera/RangeFinder DEF -> name fields.
+            color_device_name: Primary RGB Camera device name.
+            range_device_name: Primary RangeFinder device name.
+            color_def / range_def: Scene DEF names (device 'name' may differ from DEF).
+            alt_color_names / alt_range_names: Kinect-style fallbacks (paired in order).
+            discover_tag: If set, auto-pick the sole color/range device whose name contains this.
             rot90_k: Orientation correction integer (0=none, 1=90° CCW, 2=180°, 3=270° CCW).
             flip_lr: Boolean flag to apply a left/right mirror correction.
+            defer_setup: If True, call setup_devices() later (lazy init).
         """
         self.simulation = simulation
         self.logger = logging.getLogger('WebotsCamera')
-        self.robot = robot_instance  
+        self.robot = robot_instance
+        self.supervisor = supervisor
 
         self.color_device_name = color_device_name
         self.range_device_name = range_device_name
+        self.color_def = color_def
+        self.range_def = range_def
+        self._alt_color_names = list(alt_color_names or [])
+        self._alt_range_names = list(alt_range_names or [])
+        self.discover_tag = discover_tag
 
         self.rot90_k = rot90_k
         self.flip_lr = flip_lr
 
         self.timestep = 4
-        
         self.image_width  = 1280
         self.image_height = 720
+        self.devices_ready = False
 
-        if self.robot and not simulation:
-            self._setup_devices()
+        hosts: List[Any] = list(robot_hosts or [])
+        if robot_instance is not None and robot_instance not in hosts:
+            hosts.insert(0, robot_instance)
+        self.robot_hosts = hosts
+
+        if defer_setup:
+            self._init_mock_camera()
+        elif not simulation and self.robot_hosts:
+            self.setup_devices()
         else:
             self._init_mock_camera()
 
-    def _setup_devices(self):
-        self.camera       = self.robot.getDevice(self.color_device_name)
-        self.depth_camera = self.robot.getDevice(self.range_device_name)
-        
-        if self.camera:
-            self.camera.enable(self.timestep)
-            self.image_width  = self.camera.getWidth()
-            self.image_height = self.camera.getHeight()
-            self.logger.info(
-                f"Webots RGB camera '{self.color_device_name}' "
-                f"native resolution: {self.image_width}x{self.image_height}"
-            )
-        else:
-            self.logger.error(f"Camera device '{self.color_device_name}' not found in Webots scene!")
-            
-        if self.depth_camera:
-            self.depth_camera.enable(self.timestep)
-        else:
-            self.logger.error(f"Depth device '{self.range_device_name}' not found in Webots scene!")
+    def _resolve_def_device_name(self, def_name: str) -> Optional[str]:
+        """Read the Webots device 'name' field from a DEF (often differs from DEF id)."""
+        if not self.supervisor or not def_name:
+            return None
+        try:
+            node = self.supervisor.getFromDef(def_name)
+            if node is None:
+                return None
+            name_field = node.getField('name')
+            if name_field:
+                return name_field.getSFString()
+        except Exception as e:
+            self.logger.debug(f"Could not read name from DEF '{def_name}': {e}")
+        return None
+
+    def _ordered_device_pairs(self) -> List[Tuple[str, str]]:
+        """Build (color, range) pairs to try — avoids cartesian-product getDevice spam."""
+        pairs: List[Tuple[str, str]] = []
+
+        if self.color_def and self.range_def:
+            def_cn = self._resolve_def_device_name(self.color_def)
+            def_rn = self._resolve_def_device_name(self.range_def)
+            if def_cn and def_rn:
+                pairs.append((def_cn, def_rn))
+            pairs.append((self.color_def, self.range_def))
+
+        pairs.append((self.color_device_name, self.range_device_name))
+
+        for cn, rn in zip(self._alt_color_names, self._alt_range_names):
+            pairs.append((cn, rn))
+
+        seen = set()
+        unique: List[Tuple[str, str]] = []
+        for pair in pairs:
+            if pair not in seen:
+                seen.add(pair)
+                unique.append(pair)
+        return unique
+
+    @staticmethod
+    def _discover_singleton_rgbd_pair(host, tag: Optional[str] = None
+                                      ) -> Optional[Tuple[str, str]]:
+        """If a host exposes exactly one color + one range (optionally matching tag), use them."""
+        if host is None or not hasattr(host, 'getNumberOfDevices'):
+            return None
+        try:
+            names = [host.getDeviceName(i) for i in range(host.getNumberOfDevices())]
+        except Exception:
+            return None
+
+        colors = [n for n in names if 'color' in n.lower()]
+        ranges = [n for n in names if 'range' in n.lower()]
+        if tag:
+            colors = [n for n in colors if tag in n]
+            ranges = [n for n in ranges if tag in n]
+        if len(colors) == 1 and len(ranges) == 1:
+            return colors[0], ranges[0]
+        return None
+
+    def setup_devices(self):
+        """Bind RGB-D devices. Safe to call again after lazy defer_setup."""
+        if self.simulation or not self.robot_hosts:
+            return
+
+        self.camera = None
+        self.depth_camera = None
+        pairs = self._ordered_device_pairs()
+
+        for host_idx, host in enumerate(self.robot_hosts):
+            if host is None or not hasattr(host, 'getDevice'):
+                continue
+
+            discovered = self._discover_singleton_rgbd_pair(host, self.discover_tag)
+            if discovered:
+                pairs = [discovered] + [p for p in pairs if p != discovered]
+
+            for cn, rn in pairs:
+                try:
+                    cam = host.getDevice(cn)
+                    dep = host.getDevice(rn)
+                except Exception:
+                    cam, dep = None, None
+                if cam and dep:
+                    self.camera = cam
+                    self.depth_camera = dep
+                    self.color_device_name = cn
+                    self.range_device_name = rn
+                    self.camera.enable(self.timestep)
+                    self.depth_camera.enable(self.timestep)
+                    self.image_width = self.camera.getWidth()
+                    self.image_height = self.camera.getHeight()
+                    self.devices_ready = True
+                    self.logger.info(
+                        f"RGB-D bound on host[{host_idx}]: "
+                        f"color='{cn}', range='{rn}' "
+                        f"({self.image_width}x{self.image_height})"
+                    )
+                    return
+
+        self.logger.error(
+            f"Camera devices not found. Tried pairs={pairs} "
+            f"on {len(self.robot_hosts)} host(s)."
+        )
 
     def _init_mock_camera(self):
         self.camera = None
         self.depth_camera = None
+        self.devices_ready = False
         
     def _init_ros_services(self):
         try:
@@ -394,7 +506,7 @@ class WebotsCamera:
                     return image
             except Exception as e:
                 self.logger.error(f"Failed to capture RGB image: {e}")
-        return np.random.randint(0, 255, (self.OUTPUT_HEIGHT, self.OUTPUT_WIDTH, 3), dtype=np.uint8)
+        return None
 
     def capture_depth_image(self) -> Optional[np.ndarray]:
         if self.depth_camera and WEBOTS_AVAILABLE:
@@ -412,7 +524,7 @@ class WebotsCamera:
                     return depth
             except Exception as e:
                 self.logger.error(f"Failed to capture depth image: {e}")
-        return np.random.uniform(0.1, 2.0, (self.OUTPUT_HEIGHT, self.OUTPUT_WIDTH)).astype(np.float32)
+        return None
         
     def capture_rgbd(self) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
         rgb_image = self.capture_rgb_image()
@@ -444,15 +556,63 @@ class WebotsCamera:
 # CENTRAL INTEGRATION BRIDGE
 # =========================================================================
 
+# Webots Robot DEF names in Environmentnewww.wbt (try canonical first, then legacy).
+ROBOT1_DEF_CANDIDATES = ("ur3e_robot", "UR3", "ur3_robot")
+ROBOT2_DEF_CANDIDATES = ("ur3e_robot2", "ur3_robot2")
+
+
 class WebotsBridge:
     """
     Main orchestration class that ties together the Supervisor and individual Camera
     nodes. Supports dual-robot setups by mapping independent camera streams to a 
     single shared supervisor backend.
     """
-    def __init__(self, simulation: bool = True, world_file: str = "Environmentnewww.wbt"):
+    @staticmethod
+    def _resolve_robot_device_host(supervisor, robot_defs):
+        """
+        Return the Webots node that owns a robot's devices (motors, cameras).
+        getDevice() only works on the robot node that contains the device, not on
+        a top-level Supervisor when devices live under a nested Robot DEF.
+
+        Args:
+            robot_defs: A single DEF string or ordered tuple of fallbacks.
+        Returns:
+            (node, matched_def) or (None, None).
+        """
+        if supervisor is None:
+            return None, None
+        if isinstance(robot_defs, str):
+            robot_defs = (robot_defs,)
+        logger = logging.getLogger('WebotsBridge')
+        for robot_def in robot_defs:
+            try:
+                node = supervisor.getFromDef(robot_def)
+                if node is not None:
+                    return node, robot_def
+            except Exception as e:
+                logger.debug(f"Could not resolve robot DEF '{robot_def}': {e}")
+        return None, None
+
+    @staticmethod
+    def _list_device_names(host, label: str) -> List[str]:
+        """Logs available Webots device names on a Robot/Supervisor (for debugging)."""
+        names: List[str] = []
+        if host is None or not hasattr(host, 'getNumberOfDevices'):
+            return names
+        try:
+            for i in range(host.getNumberOfDevices()):
+                names.append(host.getDeviceName(i))
+        except Exception as e:
+            logging.getLogger('WebotsBridge').debug(
+                f"Could not list devices on {label}: {e}"
+            )
+        return names
+
+    def __init__(self, simulation: bool = True, world_file: str = "Environmentnewww.wbt",
+                 robot_id: int = 1):
         self.simulation = simulation
         self.logger = logging.getLogger('WebotsBridge')
+        self.robot_id = robot_id
         
         self.shared_robot = None
         if not simulation and WEBOTS_AVAILABLE:
@@ -464,25 +624,64 @@ class WebotsBridge:
 
         self.supervisor = WebotsSupervisor(simulation, world_file, robot_instance=self.shared_robot)
 
-        self.camera = WebotsCamera(
-            simulation,
-            robot_instance=self.shared_robot,
-            color_device_name='realsense_color',
-            range_device_name='realsense_range',
-            rot90_k=3,
-            flip_lr=True
-        )
+        # One extern controller process attaches to one Webots robot (WEBOTS_ROBOT_NAME).
+        # getDevice() works on that Supervisor/Robot handle — not on getFromDef() nodes.
+        host = [self.shared_robot] if self.shared_robot else []
 
-        self.camera2 = WebotsCamera(
-            simulation,
-            robot_instance=self.shared_robot,
-            color_device_name='realsense_color2',
-            range_device_name='realsense_range2',
-            rot90_k=3,
-            flip_lr=True
-        )
+        if self.shared_robot:
+            devices = self._list_device_names(self.shared_robot, "controller")
+            self.logger.info(f"Webots controller devices ({len(devices)}): {devices}")
 
-        self.logger.info(f"Webots bridge initialized (simulation={simulation})")
+        self.camera: Optional[WebotsCamera] = None
+        self.camera2: Optional[WebotsCamera] = None
+
+        if robot_id == 1:
+            self.camera = WebotsCamera(
+                simulation,
+                robot_hosts=host,
+                supervisor=self.shared_robot,
+                color_device_name='realsense_color',
+                range_device_name='realsense_range',
+                color_def='realsense_color',
+                range_def='realsense_range',
+                rot90_k=3,
+                flip_lr=True
+            )
+            print(
+                "[WebotsBridge] Robot 2 cameras not opened (running as Robot 1). "
+                "Use --robot-id 2 if you need camera 2."
+            )
+        else:
+            self.camera2 = WebotsCamera(
+                simulation,
+                robot_hosts=host,
+                supervisor=self.shared_robot,
+                color_device_name='realsense_color2',
+                range_device_name='realsense_range2',
+                color_def='realsense_color2',
+                range_def='realsense_range2',
+                rot90_k=3,
+                flip_lr=True
+            )
+            if not self.camera2.devices_ready:
+                self.logger.error(
+                    "Robot 2 cameras NOT bound. Ensure WEBOTS_ROBOT_NAME=ur3e_robot2 "
+                    "and Webots is playing."
+                )
+            print(
+                "[WebotsBridge] Robot 1 cameras not opened (running as Robot 2)."
+            )
+
+        self.logger.info(f"Webots bridge initialized (simulation={simulation}, robot_id={robot_id})")
+
+    def _init_camera2(self, log_devices: bool = False) -> 'WebotsCamera':
+        """Return Robot 2 camera (created at init when robot_id==2)."""
+        if self.camera2 is None:
+            raise RuntimeError(
+                "Robot 2 camera not initialized — launch with --robot-id 2 "
+                "and WEBOTS_ROBOT_NAME=ur3e_robot2"
+            )
+        return self.camera2
 
     def step(self) -> bool:
         """Step the simulation forward"""
@@ -496,15 +695,17 @@ class WebotsBridge:
         
     def capture_images(self) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
         """Capture RGB and depth images from Robot 1's cameras."""
+        if self.camera is None:
+            return None, None
         return self.camera.capture_rgbd()
 
     def capture_images2(self) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
         """Capture RGB and depth images from Robot 2's cameras."""
-        return self.camera2.capture_rgbd()
+        return self._init_camera2().capture_rgbd()
 
     def get_camera(self, robot_id: int = 1) -> 'WebotsCamera':
         """Return the WebotsCamera instance for the given robot_id (1 or 2)."""
-        return self.camera if robot_id == 1 else self.camera2
+        return self.camera if robot_id == 1 else self._init_camera2()
 
     @staticmethod
     def _signed_uniform(lo: float, hi: float) -> float:

@@ -1,0 +1,7 @@
+network:
+  host_ip: "0.0.0.0"
+  host_port: 8888
+  port: 8888
+  vm_ip: "192.168.241.128"
+  timeout: 30
+  retry_attempts: 5

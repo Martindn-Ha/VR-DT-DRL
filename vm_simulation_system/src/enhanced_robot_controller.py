@@ -44,6 +44,25 @@ except ImportError:
         def as_euler(self, seq): return [0, 0, 0]
     Rot = MockRotation
 
+
+ROBOT1_DEF_CANDIDATES = ("ur3e_robot", "UR3", "ur3_robot")
+ROBOT2_DEF_CANDIDATES = ("ur3e_robot2", "ur3_robot2")
+
+
+def resolve_webots_robot_node(supervisor, robot_id: int):
+    """Return the Webots Robot node for robot_id using world-file DEF fallbacks."""
+    if supervisor is None:
+        return None
+    candidates = ROBOT2_DEF_CANDIDATES if robot_id == 2 else ROBOT1_DEF_CANDIDATES
+    for def_name in candidates:
+        try:
+            node = supervisor.getFromDef(def_name)
+            if node is not None:
+                return node
+        except Exception:
+            continue
+    return None
+
 class UR3KinematicsController:
     """
     Kinematics and motion controller for the UR3 arm.
@@ -127,6 +146,7 @@ class UR3KinematicsController:
                 self.motors.append(motor)
             else:
                 self.logger.error(f"Motor {name} NOT FOUND!")
+        print(f"[UR3 R{self.robot_id}] Webots motors bound: {len(self.motors)}/6")
 
     def _setup_ros_interface(self):
         """Initializes ROS subscribers for real-world state tracking."""
@@ -482,8 +502,7 @@ class UR3KinematicsController:
             if hasattr(sup, 'supervisor'):
                 sup = sup.supervisor
 
-            robot_def = "UR3" if self.robot_id == 1 else "ur3_robot2"
-            robot_node = sup.getFromDef(robot_def)
+            robot_node = resolve_webots_robot_node(sup, self.robot_id)
             if robot_node:
                 rot_field = robot_node.getField("rotation").getSFRotation()
                 axis_y = rot_field[1] if len(rot_field) == 4 else 1.0
@@ -681,13 +700,8 @@ def create_robot_system(config_path: str = "config.yaml",
             else:
                 robot_instance = webots_bridge.supervisor
 
-    if robot_id == 2 and robot_instance is not None:
-        try:
-            robot2_node = robot_instance.getFromDef("ur3_robot2")
-            if robot2_node is not None:
-                robot_instance = robot2_node
-        except Exception as e:
-            print(f"[create_robot_system] Could not get ur3_robot2 node: {e}")
+    # Devices (motors, cameras) must use the live Supervisor/Robot handle from
+    # WEBOTS_ROBOT_NAME — getFromDef() returns a Node without getDevice().
 
     robot_controller = UR3KinematicsController(
         config_path=config_path, 
@@ -729,7 +743,7 @@ if __name__ == "__main__":
 
         print("--> Dual Robot Controller Ready. Press Ctrl+C to exit.")
         print("    Robot 1 (UR3):       base at x=-0.685, TARGET_OBJECT")
-        print("    Robot 2 (ur3_robot2): base at x=-1.226, TARGET_OBJECT2")
+        print("    Robot 2 (ur3e_robot2): base at x=-1.226, TARGET_OBJECT2")
         
         rate = rospy.Rate(30) if ROS_AVAILABLE else None
         

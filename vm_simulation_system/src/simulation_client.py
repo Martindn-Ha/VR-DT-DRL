@@ -9,6 +9,7 @@ automated curriculum for reinforcement learning.
 
 import socket
 import json
+import os
 import numpy as np
 import math
 import cv2
@@ -18,9 +19,23 @@ import yaml
 import argparse
 import base64
 import struct
+import csv
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 from collections import deque
+
+EPISODE_CSV_COLUMNS = [
+    'timestamp', 'robot_id', 'episode', 'run_mode', 'inference_mode',
+    'curriculum_phase', 'spawn_phase',
+    'spawn_x', 'spawn_y', 'spawn_z', 'spawn_radius_cm',
+    'cam_delta_x_cm', 'cam_delta_y_cm', 'cam_delta_z_cm',
+    'cam_delta_pitch_deg', 'cam_delta_yaw_deg', 'cam_delta_roll_deg',
+    'grasp_mode',
+    'ai_pose_0', 'ai_pose_1', 'ai_pose_2', 'ai_pose_3', 'ai_pose_4', 'ai_pose_5',
+    'clamp_pose_0', 'clamp_pose_1', 'clamp_pose_2',
+    'success', 'lifted_m', 'closest_dist_m', 'finger_dist_m', 'reward', 'object_found',
+]
 
 #  RealSense dependencies (--real mode only) 
 try:
@@ -398,6 +413,12 @@ class SimulationClient:
         self._cycle_phase             = 0
         self._cycle_count_in_phase    = 0
 
+        self._episode_log_dir  = Path("data")
+        self._episode_log_path = self._episode_log_dir / f"episode_log_r{robot_id}.csv"
+        self._episode_csv_lock = threading.Lock()
+        self._reset_episode_log_fields()
+        print(f"[CSV LOG R{robot_id}] Episode CSV → {self._episode_log_path.resolve()}")
+
         if real_robot:
             self.webots_bridge = None
             if ros_camera:
@@ -408,7 +429,7 @@ class SimulationClient:
             self._init_robotiq_gripper()
         else:
             # Setup Webots Simulation Bridge
-            self.webots_bridge = WebotsBridge(simulation=False)
+            self.webots_bridge = WebotsBridge(simulation=False, robot_id=robot_id)
 
             self.robot_controller, self.gripper_controller, self.motion_planner = \
                 create_robot_system(
@@ -431,6 +452,107 @@ class SimulationClient:
                 self._setup_ros_interface()
 
             self._cam_base = {}
+            cam = getattr(self.webots_bridge, 'camera2' if robot_id == 2 else 'camera', None)
+            if cam is not None:
+                status = "ready" if cam.devices_ready else "NOT bound"
+                print(f"[WebotsBridge] R{robot_id} RGB-D devices: {status}")
+            if robot_id == 2:
+                print(
+                    "[STARTUP] Dual-robot world: start a Robot 1 client too "
+                    "(--robot-id 1) or Webots may not step the simulation."
+                )
+
+    def _reset_episode_log_fields(self):
+        """Clears per-episode fields before a new grasp attempt."""
+        self._episode_log_fields = {col: '' for col in EPISODE_CSV_COLUMNS}
+
+    def _ensure_episode_csv_header(self, path: Path):
+        path.parent.mkdir(parents=True, exist_ok=True)
+        if not path.exists() or path.stat().st_size == 0:
+            with path.open('w', newline='', encoding='utf-8') as f:
+                csv.DictWriter(f, fieldnames=EPISODE_CSV_COLUMNS).writeheader()
+
+    def _append_episode_csv_row(self, success: bool):
+        """Writes one episode observation row to robot-specific CSV."""
+        row = dict(self._episode_log_fields)
+        row['timestamp']        = datetime.now(timezone.utc).isoformat()
+        row['robot_id']         = self.robot_id
+        row['episode']          = self.episode_count
+        row['run_mode']         = self.mode
+        row['inference_mode']   = self.inference_mode if self.mode == 'inference' else ''
+        row['curriculum_phase'] = self.curriculum.phase
+        row['success']          = int(bool(success))
+        if row.get('spawn_phase') == '':
+            row['spawn_phase'] = self._spawn_phase_label()
+
+        path = self._episode_log_path
+        try:
+            with self._episode_csv_lock:
+                self._ensure_episode_csv_header(path)
+                with path.open('a', newline='', encoding='utf-8') as f:
+                    csv.DictWriter(f, fieldnames=EPISODE_CSV_COLUMNS).writerow(row)
+            print(f"[CSV LOG R{self.robot_id}] Appended episode {self.episode_count} → {path.resolve()}")
+        except Exception as e:
+            rospy.logwarn(f"[CSV LOG R{self.robot_id}] Failed to write episode row: {e}")
+
+    def _spawn_phase_label(self) -> str:
+        if self.mode != 'inference':
+            return str(self.curriculum.phase)
+        if self.inference_mode == 'free':
+            return 'free'
+        if self.inference_mode == 'phase':
+            return str(self.fixed_phase)
+        if self.inference_mode == 'cycle':
+            return str(self._cycle_phase)
+        return str(self.curriculum.phase)
+
+    def _record_spawn_for_log(self, spawn_x: float, spawn_y: float, spawn_z: float,
+                              spawn_radius_cm: Optional[float] = None):
+        cx = self.curriculum.PLATFORM_CENTER_X
+        cz = self.curriculum.PLATFORM_CENTER_Z
+        if spawn_radius_cm is None:
+            spawn_radius_cm = math.hypot(spawn_x - cx, spawn_z - cz) * 100.0
+        self._episode_log_fields.update({
+            'spawn_phase':       self._spawn_phase_label(),
+            'spawn_x':           f'{spawn_x:.6f}',
+            'spawn_y':           f'{spawn_y:.6f}',
+            'spawn_z':           f'{spawn_z:.6f}',
+            'spawn_radius_cm':   f'{spawn_radius_cm:.4f}',
+        })
+
+    def _record_cam_rand_for_log(self, dx: float, dy: float, dz: float,
+                                 d_pitch: float, d_yaw: float, d_roll: float):
+        self._episode_log_fields.update({
+            'cam_delta_x_cm':        f'{dx * 100:.4f}',
+            'cam_delta_y_cm':        f'{dy * 100:.4f}',
+            'cam_delta_z_cm':        f'{dz * 100:.4f}',
+            'cam_delta_pitch_deg':   f'{math.degrees(d_pitch):.4f}',
+            'cam_delta_yaw_deg':     f'{math.degrees(d_yaw):.4f}',
+            'cam_delta_roll_deg':    f'{math.degrees(d_roll):.4f}',
+        })
+
+    def _record_grasp_for_log(self, *, grasp_mode: str, raw_pose: Optional[List[float]],
+                              clamp_pose: Optional[List[float]], success: bool,
+                              lift_delta: Optional[float], closest_dist: float,
+                              reward: float, object_found: bool):
+        WRIST_OFFSET = 0.060
+        finger_dist  = max(0.0, closest_dist - WRIST_OFFSET)
+        fields = {
+            'grasp_mode':      grasp_mode,
+            'success':         int(bool(success)),
+            'lifted_m':        '' if lift_delta is None else f'{lift_delta:.6f}',
+            'closest_dist_m':  f'{closest_dist:.6f}',
+            'finger_dist_m':   f'{finger_dist:.6f}',
+            'reward':          f'{reward:.6f}',
+            'object_found':    int(bool(object_found)),
+        }
+        if raw_pose is not None:
+            for i, val in enumerate(raw_pose[:6]):
+                fields[f'ai_pose_{i}'] = f'{float(val):.6f}'
+        if clamp_pose is not None:
+            for i, val in enumerate(clamp_pose[:3]):
+                fields[f'clamp_pose_{i}'] = f'{float(val):.6f}'
+        self._episode_log_fields.update(fields)
 
     def _cache_camera_base_poses(self):
         """
@@ -527,6 +649,7 @@ class SimulationClient:
               f"Δpitch={np.rad2deg(d_pitch):.2f}°  "
               f"Δyaw={np.rad2deg(d_yaw):.2f}°  "
               f"Δroll={np.rad2deg(d_roll):.2f}°")
+        self._record_cam_rand_for_log(dx, dy, dz, d_pitch, d_yaw, d_roll)
 
     # =========================================================================
     # HARDWARE INITIALIZATION & CONTROL (--real mode)
@@ -1073,6 +1196,10 @@ class SimulationClient:
                         rospy.logwarn(f"[REAL R{self.robot_id}] Unexpected barrier response: {barrier_resp}")
                 else:
                     self._execute_grasp_prediction(response)
+            elif response and response.get('type') == 'error':
+                print(f"[GPU R{self.robot_id}] Inference error: {response.get('message')}")
+            elif self.episode_active:
+                print(f"[GPU R{self.robot_id}] Unexpected response: {response}")
         except Exception as e:
             rospy.logerr(f"Camera Send Error (R{self.robot_id}): {e}")
 
@@ -1185,6 +1312,10 @@ class SimulationClient:
 
     def _execute_grasp_prediction(self, prediction: Dict):
         """Processes the neural network outputs inside Webots Simulation."""
+        if not self.episode_active:
+            return
+        self.episode_active = False
+
         robot_id = self.robot_id
         try:
             supervisor = self.webots_bridge.supervisor
@@ -1214,6 +1345,10 @@ class SimulationClient:
                         self._reset_simulation_for_nan()
                     else:
                         rospy.logwarn(f"[NaN GUARD R{robot_id}] NaN persists — skipping episode.")
+                    self._record_grasp_for_log(
+                        grasp_mode='nan_abort', raw_pose=None, clamp_pose=None,
+                        success=False, lift_delta=None, closest_dist=9999.0,
+                        reward=0.0, object_found=node_found)
                     self._end_episode_and_restart(False)
                     return
 
@@ -1222,6 +1357,7 @@ class SimulationClient:
 
             if mode == 'explore':
                 pose = self._generate_guided_random_grasp()
+                raw_pose = None
             else:
                 raw_pose = list(prediction['pose'])
                 print(f"[AI PREDICTION R{robot_id}] Network output: {raw_pose}")
@@ -1234,12 +1370,15 @@ class SimulationClient:
                     print(f"[AI CLAMP R{robot_id}] [{raw_pose[0]:.3f},{raw_pose[1]:.3f},{raw_pose[2]:.3f}]"
                           f" → [{pose[0]:.3f},{pose[1]:.3f},{pose[2]:.3f}]")
 
+            clamp_xyz = [pose[0], pose[1], pose[2]]
+
             self.robot_controller._closest_approach_dist = 9999.0
             self.robot_controller.execute_grasp(pose)
 
             closest_dist = getattr(self.robot_controller, '_closest_approach_dist', 9999.0)
 
             success = False
+            lift_delta = None
             if node_found:
                 final_y    = duck_node.getPosition()[1]
                 lift_delta = final_y - initial_y
@@ -1253,6 +1392,11 @@ class SimulationClient:
                 print(f"[RESULT R{robot_id}] FAIL. Object not found.")
 
             reward = self._calculate_shaped_reward(success, closest_dist)
+
+            self._record_grasp_for_log(
+                grasp_mode=mode, raw_pose=raw_pose, clamp_pose=clamp_xyz,
+                success=success, lift_delta=lift_delta, closest_dist=closest_dist,
+                reward=reward, object_found=node_found)
 
             self.webots_bridge.step()
             self.camera_handler.update_from_webots()
@@ -1303,6 +1447,7 @@ class SimulationClient:
         """Records episode results and issues environment resets."""
         self.end_current_episode(success)
         self.robot_controller.home_position()
+        self._flush_camera_buffers()
 
         print(f"[BARRIER R{self.robot_id}] Waiting for other robot to finish episode...")
         response = self._send_message_to_host({
@@ -1317,6 +1462,7 @@ class SimulationClient:
 
         time.sleep(2.0)
         self.start_new_episode()
+        self._flush_camera_buffers(steps=20)
 
     def _reset_simulation_for_nan(self):
         """Teleports physics entities to reset physics engines resolving NaN anomalies."""
@@ -1511,6 +1657,7 @@ class SimulationClient:
             print(f"[DOMAIN RAND] Skipping randomization (nodes not found or error): {e}")
 
     def start_new_episode(self):
+        self._reset_episode_log_fields()
         self.episode_count  += 1
         self.episode_active  = True
         self.curriculum.update(self.episode_count)
@@ -1542,12 +1689,14 @@ class SimulationClient:
             if self.mode == 'inference' and self.inference_mode == 'free':
                 pos = obj_node.getPosition()
                 print(f"[INFERENCE R{robot_id}/free] Object left at ({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f})")
+                self._record_spawn_for_log(float(pos[0]), float(pos[1]), float(pos[2]))
                 return
 
+            spawn_radius_cm = None
             if self.mode == 'inference' and self.inference_mode == 'cycle':
-                spawn_x, spawn_z = self._get_spawn_for_phase(self._cycle_phase)
+                spawn_x, spawn_z, spawn_radius_cm = self._get_spawn_for_phase(self._cycle_phase)
             elif self.mode == 'inference' and self.inference_mode == 'phase':
-                spawn_x, spawn_z = self._get_spawn_for_phase(self.fixed_phase)
+                spawn_x, spawn_z, spawn_radius_cm = self._get_spawn_for_phase(self.fixed_phase)
             else:
                 spawn_x, _, spawn_z = self.curriculum.get_spawn_position()
 
@@ -1559,6 +1708,7 @@ class SimulationClient:
             if rotation_field:
                 rotation_field.setSFRotation([0.0, 1.0, 0.0, 0.0])
             obj_node.resetPhysics()
+            self._record_spawn_for_log(spawn_x, spawn_y, spawn_z, spawn_radius_cm)
 
         except Exception as e:
             rospy.logerr(f"[CURRICULUM R{robot_id}] Spawn error: {e}")
@@ -1576,7 +1726,7 @@ class SimulationClient:
 
         if r_max < 0.001:
             print(f"[INFERENCE R{self.robot_id}] Phase {phase_index}: static centre ({cx:.3f}, {cz:.3f})")
-            return (cx, cz)
+            return (cx, cz, 0.0)
 
         angle  = np.random.uniform(0, 2 * np.pi)
         radius = np.random.uniform(r_min, r_max)
@@ -1584,7 +1734,7 @@ class SimulationClient:
         sz = np.clip(cz + radius * np.sin(angle), cz - half_z, cz + half_z)
         print(f"[INFERENCE R{self.robot_id}] Phase {phase_index} spawn: ({sx:.3f}, {sz:.3f}) | "
               f"radius {radius*100:.1f}cm (max {r_max*100:.1f}cm)")
-        return (sx, sz)
+        return (sx, sz, radius * 100.0)
 
     def end_current_episode(self, success: bool):
         self.episode_active = False
@@ -1621,13 +1771,38 @@ class SimulationClient:
                   f"Phase {self.curriculum.phase} | "
                   f"AI: {ai_rate*100:.1f}% ({ai_attempts}/{ai_window}) | Mode: {mode}")
 
+        self._append_episode_csv_row(success)
+
+    def _flush_camera_buffers(self, steps: int = 40):
+        """
+        Step the sim and discard frames until the camera catches up.
+        Required after the arm moves (e.g. home) — otherwise RGB/depth can show
+        a stale frame from before the move.
+        """
+        if not self.webots_bridge:
+            return
+        for _ in range(steps):
+            self.webots_bridge.step()
+            self.camera_handler.update_from_webots()
+            time.sleep(0.016)
+        self.latest_rgb_image   = self.camera_handler.current_rgb_frame
+        self.latest_depth_image = self.camera_handler.current_depth_frame
+        if self.latest_rgb_image is not None:
+            print(f"[CAM R{self.robot_id}] Fresh camera frame after {steps}-step flush")
+        else:
+            print(
+                f"[CAM R{self.robot_id}] WARNING: No frame after flush. "
+                "Webots playing? Both extern controllers running?"
+            )
+
     def run_simulation_loop(self, max_episodes: int = None):
         if not self.connect_to_host():
             return
 
         if not self.real_robot:
             self.robot_controller.home_position()
-            time.sleep(2.0)
+            time.sleep(1.0)
+            self._flush_camera_buffers()
             self._cache_camera_base_poses()
             print(f"[BARRIER R{self.robot_id}] Waiting at startup barrier...")
             response = self._send_message_to_host({
@@ -1637,6 +1812,7 @@ class SimulationClient:
             })
             print(f"[BARRIER R{self.robot_id}] Startup barrier cleared")
             self.start_new_episode()
+            self._flush_camera_buffers(steps=20)
         else:
             rospy.loginfo(f'[REAL R{self.robot_id}] Moving to home position before starting...')
             home = self.robot_controller.get_home_joints(simulation=False)
@@ -1686,6 +1862,7 @@ class SimulationClient:
 
         else:
             rate = rospy.Rate(10)
+            _cam_warn_at = 0.0
             while not rospy.is_shutdown():
                 if max_episodes is not None and self.episode_count > max_episodes:
                     print(f"[CLIENT R{self.robot_id}] Reached {max_episodes} episodes. Stopping.")
@@ -1696,8 +1873,16 @@ class SimulationClient:
                 self.latest_rgb_image   = self.camera_handler.current_rgb_frame
                 self.latest_depth_image = self.camera_handler.current_depth_frame
 
-                if self.latest_rgb_image is not None and self.connected:
+                if self.episode_active and self.latest_rgb_image is not None and self.connected:
                     self._send_camera_data_to_host()
+                elif self.episode_active and self.latest_rgb_image is None:
+                    now = time.time()
+                    if now - _cam_warn_at > 5.0:
+                        _cam_warn_at = now
+                        print(
+                            f"[CAM R{self.robot_id}] Waiting for camera frames "
+                            "(Webots playing? both extern controllers running?)"
+                        )
                 rate.sleep()
 
 
@@ -1756,6 +1941,11 @@ def main():
 
     robot_id = args.robot_id
     print(f"[STARTUP] Launching as Robot {robot_id}")
+
+    if not is_real:
+        webots_robot = "ur3e_robot2" if robot_id == 2 else "ur3e_robot"
+        os.environ["WEBOTS_ROBOT_NAME"] = webots_robot
+        print(f"[STARTUP] WEBOTS_ROBOT_NAME={webots_robot}")
 
     client = SimulationClient(mode=mode, real_robot=is_real, robot_id=robot_id,
                               ros_camera=args.ros_camera)

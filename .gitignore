@@ -1,0 +1,35 @@
+# Local session notes (not for version control)
+CHANGES_SUMMARY.md
+
+# Runtime episode logs and debug captures (regenerated each run)
+data/
+
+# Local analysis and exports (not for version control)
+docs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Virtual environments
+venv/
+.venv/
+env/
+
+# ML checkpoints (large binaries — copy locally, do not commit)
+host_gpu_system/models/*.pth
+
+# IDE / OS
+.vscode/
+.idea/
+*.swdoc
+~$*
+.DS_Store
+Thumbs.db
+
+# Webots / env extract scratch
+_env_extract/
