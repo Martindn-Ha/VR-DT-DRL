@@ -7,37 +7,244 @@ Handles dynamic library path resolution, supervisor node management, and
 simulated camera data extraction.
 """
 
+import json
 import os
 import sys
+import subprocess
 import numpy as np
 import time
 import logging
 from typing import List, Dict, Tuple, Optional, Any
 from pathlib import Path
 
+_AGENT_DEBUG_LOG = Path(__file__).resolve().parent.parent.parent / "debug-4ce223.log"
+
+
+def _agent_debug_log(location: str, message: str, data: Optional[Dict] = None,
+                     hypothesis_id: str = "") -> None:
+    # #region agent log
+    try:
+        payload = {
+            "sessionId": "4ce223",
+            "runId": "pre-fix",
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data or {},
+            "timestamp": int(time.time() * 1000),
+        }
+        with _AGENT_DEBUG_LOG.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, default=str) + "\n")
+    except Exception:
+        pass
+    # #endregion
+
 # =========================================================================
 # WEBOTS LIBRARY PATH DETECTION
 # =========================================================================
-# Automatically locates and prepends the Webots Python controller library 
-# to sys.path based on the current Python interpreter version.
+# Locates Webots install (WEBOTS_HOME env or common paths), prepends the
+# matching controller Python API, and exports WEBOTS_HOME for controller.py.
 # =========================================================================
 
-WEBOTS_HOME = "/opt/webots"
-CONTROLLER_BASE = os.path.join(WEBOTS_HOME, "lib", "controller")
+def _resolve_webots_home() -> Optional[str]:
+  """Return Webots root if installed, else None."""
+  env_home = os.environ.get("WEBOTS_HOME")
+  if env_home and os.path.isdir(env_home):
+    return os.path.normpath(env_home)
 
-py_ver = f"{sys.version_info.major}{sys.version_info.minor}"
-python_lib_folder = f"python{py_ver}"
-LIB_PATH = os.path.join(CONTROLLER_BASE, python_lib_folder)
+  candidates = []
+  if sys.platform == "win32":
+    local = os.environ.get("LOCALAPPDATA", "")
+    if local:
+      candidates.append(os.path.join(local, "Programs", "Webots"))
+    candidates.extend([
+      r"C:\Program Files\Webots",
+      r"C:\Program Files (x86)\Webots",
+    ])
+  else:
+    candidates.append("/opt/webots")
 
-if os.path.exists(LIB_PATH):
-    if LIB_PATH not in sys.path:
-        sys.path.insert(0, LIB_PATH)
-else:
-    for ver in ["python38", "python39", "python36", "python37", "python27"]:
-        fallback_path = os.path.join(CONTROLLER_BASE, ver)
-        if os.path.exists(fallback_path):
-            sys.path.insert(0, fallback_path)
-            break
+  for path in candidates:
+    if path and os.path.isdir(path):
+      return os.path.normpath(path)
+  return None
+
+
+def _controller_python_lib(webots_home: Optional[str] = None) -> Optional[str]:
+    """Return Webots controller API folder matching THIS Python version only."""
+    home = webots_home or _resolve_webots_home()
+    if not home:
+        return None
+    folder = f"python{sys.version_info.major}{sys.version_info.minor}"
+    lib = os.path.join(home, "lib", "controller", folder)
+    return lib if os.path.isdir(lib) else None
+
+
+def _add_webots_dll_directories(webots_home: Optional[str] = None) -> None:
+    """Windows: load Controller.dll / mingw64 deps (matches controller.py)."""
+    if os.name != "nt" or sys.version_info < (3, 8):
+        return
+    home = webots_home or _resolve_webots_home()
+    if not home:
+        return
+    for sub in (
+        os.path.join("lib", "controller"),
+        os.path.join("msys64", "mingw64", "bin", "cpp"),
+        os.path.join("msys64", "mingw64", "bin"),
+    ):
+        path = os.path.join(home, sub)
+        if os.path.isdir(path):
+            try:
+                os.add_dll_directory(path)
+            except (AttributeError, OSError):
+                pass
+
+
+def _configure_webots_env() -> None:
+    """Apply R2021a Windows extern-controller environment (PATH, PYTHONPATH, PID)."""
+    if not WEBOTS_HOME:
+        return
+
+    os.environ.setdefault("WEBOTS_HOME", WEBOTS_HOME)
+    os.environ.setdefault("PYTHONIOENCODING", "UTF-8")
+
+    path_add = [
+        os.path.join(WEBOTS_HOME, "lib", "controller"),
+        os.path.join(WEBOTS_HOME, "msys64", "mingw64", "bin"),
+        os.path.join(WEBOTS_HOME, "msys64", "mingw64", "bin", "cpp"),
+    ]
+    existing = os.environ.get("PATH", "")
+    prefix = os.pathsep.join(p for p in path_add if os.path.isdir(p))
+    if prefix and prefix not in existing:
+        os.environ["PATH"] = prefix + os.pathsep + existing
+
+    py_lib = _controller_python_lib(WEBOTS_HOME) or ""
+    if py_lib:
+        os.environ["PYTHONPATH"] = py_lib
+
+    if not os.environ.get("WEBOTS_PID"):
+        try:
+            import psutil
+            for proc in psutil.process_iter(["pid", "name", "exe"]):
+                try:
+                    name = (proc.info.get("name") or "").lower()
+                    exe = (proc.info.get("exe") or "").lower()
+                    if "webots" in name or "webots" in exe:
+                        if "unins" not in exe:
+                            os.environ["WEBOTS_PID"] = str(proc.info["pid"])
+                            break
+                except (psutil.NoSuchProcess, psutil.AccessDenied):
+                    pass
+        except ImportError:
+            pass
+
+
+def _webots_is_running() -> bool:
+    """True if a Webots process appears to be running."""
+    try:
+        import psutil
+        for proc in psutil.process_iter(["pid", "name", "exe"]):
+            try:
+                name = (proc.info.get("name") or "").lower()
+                exe = (proc.info.get("exe") or "").lower()
+                if "webots" in name or "webots" in exe:
+                    if "unins" not in exe:
+                        if not os.environ.get("WEBOTS_PID"):
+                            os.environ["WEBOTS_PID"] = str(proc.info["pid"])
+                        return True
+            except (psutil.NoSuchProcess, psutil.AccessDenied):
+                pass
+    except ImportError:
+        return True
+    return False
+
+
+def running_inside_webots() -> bool:
+    """True when connected as a Webots extern controller (URL set by Webots or after Supervisor())."""
+    return bool(os.environ.get("WEBOTS_CONTROLLER_URL"))
+
+
+def _probe_webots_connection() -> bool:
+    """
+    Check whether Webots is playing and accepting an extern controller.
+
+    Calling Supervisor() in-process when Webots is not ready aborts the Python
+    interpreter (native crash). The probe runs in a subprocess so the client
+    survives and can print a useful error.
+    """
+    script = (
+        Path(__file__).resolve().parent.parent
+        / "Webots" / "scripts" / "probe_webots_connection.py"
+    )
+    if not script.is_file():
+        return False
+
+    env = os.environ.copy()
+    _configure_webots_env()
+    env = os.environ.copy()
+    if WEBOTS_HOME:
+        env.setdefault("WEBOTS_HOME", WEBOTS_HOME)
+    robot = env.get("WEBOTS_ROBOT_NAME", "?")
+
+    try:
+        result = subprocess.run(
+            [sys.executable, str(script)],
+            env=env,
+            capture_output=True,
+            text=True,
+            timeout=15,
+        )
+    except subprocess.TimeoutExpired:
+        print(
+            f"[WebotsBridge] Timed out waiting for Webots (robot={robot}). "
+            "Is the simulation playing?"
+        )
+        return False
+
+    if result.returncode == 0 and "OK" in (result.stdout or ""):
+        return True
+
+    print(
+        "[WebotsBridge] Could not connect extern controller to Webots.\n"
+        f"  WEBOTS_ROBOT_NAME={robot}\n"
+        "  Checklist:\n"
+        "  1. Webots: updated_world/worlds/Environmentnewww.wbt open -> Reset Simulation -> Play.\n"
+        "     Console should say 'Waiting for external controller' for ur3e_robot.\n"
+        "  2. Start this client within ~30s of pressing Play.\n"
+        "  3. Task Manager: kill stale python.exe from old simulation_client runs.\n"
+        "  4. Run probe: python Webots/scripts/probe_webots_connection.py\n"
+        "     Log: %TEMP%\\webots_probe.log"
+    )
+    if result.stdout:
+        print(f"  probe stdout: {result.stdout.strip()}")
+    if result.stderr:
+        print(f"  probe stderr: {result.stderr.strip()}")
+    return False
+
+
+WEBOTS_HOME = _resolve_webots_home()
+CONTROLLER_BASE = (
+  os.path.join(WEBOTS_HOME, "lib", "controller") if WEBOTS_HOME else ""
+)
+
+if WEBOTS_HOME:
+  os.environ.setdefault("WEBOTS_HOME", WEBOTS_HOME)
+
+LIB_PATH = _controller_python_lib(WEBOTS_HOME) or ""
+
+if LIB_PATH:
+  if LIB_PATH not in sys.path:
+    sys.path.insert(0, LIB_PATH)
+  _add_webots_dll_directories(WEBOTS_HOME)
+elif WEBOTS_HOME:
+  ver = f"{sys.version_info.major}.{sys.version_info.minor}"
+  print(
+    f"--> [FAIL] Webots has no python{sys.version_info.major}"
+    f"{sys.version_info.minor} API folder. This venv is Python {ver}. "
+    f"Use Python 3.9 with Webots 2021a (see UR3e_Setup_Guide Part 5)."
+  )
+
+_configure_webots_env()
 
 try:
     from controller import Supervisor, Robot
@@ -616,13 +823,31 @@ class WebotsBridge:
         
         self.shared_robot = None
         if not simulation and WEBOTS_AVAILABLE:
-            try:
-                self.shared_robot = Supervisor()
-                self.logger.info("Shared Webots Supervisor created.")
-            except Exception as e:
-                self.logger.error(f"Could not create Supervisor: {e}")
+            _configure_webots_env()
+            if not _webots_is_running():
+                print(
+                    "[WebotsBridge] No Webots process found.\n"
+                    "  Open updated_world/worlds/Environmentnewww.wbt and press Play, then restart this client."
+                )
+                simulation = True
+            else:
+                try:
+                    self.shared_robot = Supervisor()
+                    self.timestep = int(self.shared_robot.getBasicTimeStep())
+                    name = self.shared_robot.getName()
+                    self.logger.info("Connected to Webots (extern controller).")
+                    print(f"[WebotsBridge] Connected to robot '{name}'")
+                except Exception as e:
+                    self.logger.error(f"Could not connect to Webots: {e}")
+                    print(
+                        f"[WebotsBridge] Supervisor() failed: {e}\n"
+                        "  Reset Simulation in Webots, press Play, then restart this client."
+                    )
+                    simulation = True
 
-        self.supervisor = WebotsSupervisor(simulation, world_file, robot_instance=self.shared_robot)
+        self.supervisor = WebotsSupervisor(
+            simulation, world_file, robot_instance=self.shared_robot
+        )
 
         # One extern controller process attaches to one Webots robot (WEBOTS_ROBOT_NAME).
         # getDevice() works on that Supervisor/Robot handle — not on getFromDef() nodes.
@@ -685,7 +910,24 @@ class WebotsBridge:
 
     def step(self) -> bool:
         """Step the simulation forward"""
-        return self.supervisor.step()
+        try:
+            ok = bool(self.supervisor.step())
+            if not ok:
+                _agent_debug_log(
+                    "webots_bridge.py:WebotsBridge.step",
+                    "supervisor_step_false",
+                    {"robot_id": getattr(self, "robot_id", None)},
+                    hypothesis_id="A",
+                )
+            return ok
+        except Exception as exc:
+            _agent_debug_log(
+                "webots_bridge.py:WebotsBridge.step",
+                "supervisor_step_exception",
+                {"robot_id": getattr(self, "robot_id", None), "error": repr(exc)},
+                hypothesis_id="A",
+            )
+            return False
  
     def get_block_poses(self) -> List[Dict[str, Any]]:
         return self.supervisor.get_block_poses()

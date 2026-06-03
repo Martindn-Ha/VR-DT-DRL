@@ -1,0 +1,6 @@
+---
+float64[] position
+float64[] rotation
+float64[] joint_angles
+float64[] end_effector_pose
+float64 timestamp

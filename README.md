@@ -1,285 +1,256 @@
 # VR-DT-DRL
 
-**Vision-based UR3e grasping with a Webots digital twin, behavior cloning, and optional real-robot deployment.**
+Vision-based **UR3e grasping** with a **Webots digital twin** and a **GPU inference server** on Windows.
 
-Developed by [Aqlanlab](LICENSE). The stack splits **inference and training** (Windows GPU host) from **simulation and robot control** (Ubuntu VM), connected over TCP. Supports **dual UR3e arms** with separate RGB-D cameras and per-robot models.
+MIT License · [Aqlanlab](LICENSE)
 
 ---
 
-## Overview
+## What runs where (Windows setup)
 
-| Layer | Role | Location |
-|-------|------|----------|
-| **Brain** | CNN inference, behavior-cloning buffers, checkpoint saves | `host_gpu_system/` (Windows) |
-| **Body** | Webots sim, ROS, cameras, arm control, curriculum | `vm_simulation_system/` (Ubuntu 18.04 VM) |
-| **World** | Dual-robot scene with RealSense-style cameras | `Environmentnewww.wbt` |
+Everything runs on **one Windows PC**:
 
-The AI watches **RGB-D** (color + depth), predicts a **6-DOF grasp pose**, and executes pick-and-lift episodes. Training uses **imitation learning**: a geometric **teacher** in simulation generates demos; a **MobileNetV2** CNN learns to copy them. An optional **curriculum** increases spawn difficulty as success rate improves.
+| Component | What it does |
+|-----------|----------------|
+| **Webots** | Simulation world (`updated_world/worlds/Environmentnewww.wbt`) |
+| **`gpu_server.py`** | CNN inference on your NVIDIA GPU |
+| **`simulation_client.py`** | Robot control, cameras, episodes (one process per arm) |
+
+Clients talk to the GPU server over **`127.0.0.1:8888`**.
 
 ```mermaid
 flowchart LR
-  subgraph Host["Windows — GPU host"]
-    GS["gpu_server.py"]
-    M1["ur3_live_model_r1.pth"]
-    M2["ur3_live_model_r2.pth"]
-    GS --- M1
-    GS --- M2
-  end
-  subgraph VM["Ubuntu VM — simulation"]
-    WB["Webots\nEnvironmentnewww.wbt"]
-    C1["simulation_client\n--robot-id 1"]
-    C2["simulation_client\n--robot-id 2"]
-  end
-  C1 -->|"TCP :8888 JSON"| GS
-  C2 -->|"TCP :8888 JSON"| GS
-  C1 --> WB
-  C2 --> WB
+  WB[Webots]
+  GS[gpu_server.py]
+  R1[simulation_client R1]
+  R2[simulation_client R2]
+  R1 --> WB
+  R2 --> WB
+  R1 -->|localhost :8888| GS
+  R2 -->|localhost :8888| GS
 ```
 
 ---
 
-## Repository structure
+## One-time setup
 
-```
-VR-DT-DRL/
-├── host_gpu_system/           # Windows GPU server
-│   ├── config/network_config.yaml
-│   ├── models/                # Trained checkpoints (r1, r2)
-│   ├── requirements.txt
-│   └── src/
-│       ├── gpu_server.py      # Main entry — inference + BC training
-│       └── enhanced_neural_network.py
-├── vm_simulation_system/      # Ubuntu VM client + Webots assets
-│   ├── config/                  # Network, robot, camera, Webots
-│   ├── src/
-│   │   ├── simulation_client.py # Main entry — episodes + TCP client
-│   │   ├── webots_bridge.py
-│   │   ├── enhanced_robot_controller.py
-│   │   └── Touch.py             # PyQt launcher (optional)
-│   ├── Webots/                  # Protos, controllers, world zip
-│   └── setup.sh                 # VM dependency installer
-└── LICENSE
-```
+### 1. Install software
 
----
+| Tool | Version / notes |
+|------|-----------------|
+| **Python** | **3.9** (required for Webots 2021a controller API) |
+| **Webots** | **2021a** ([download](https://github.com/cyberbotics/webots/releases)) |
+| **NVIDIA driver + CUDA** | For GPU inference (PyTorch cu118/cu121) |
 
-## Requirements
+Default Webots install path on Windows:
 
-### Windows (GPU host)
+`%LOCALAPPDATA%\Programs\Webots`
 
-- Python 3.8+
-- NVIDIA GPU with CUDA (recommended)
-- Dependencies: see [`host_gpu_system/requirements.txt`](host_gpu_system/requirements.txt) (PyTorch 2.0+, OpenCV, PyYAML, etc.)
+### 2. Webots world assets
 
-### Ubuntu VM (simulation body)
+The Webots project lives in **`updated_world/`** at the repo root (create that folder and put the contents of **`Webots.rar`** from Box inside — see [Files on Box](#files-on-box-not-on-github)). Open in Webots:
 
-- **Ubuntu 18.04**
-- **ROS Melodic**
-- **Webots** (R2023a recommended; installed to `/opt/webots`)
-- Python 3 + OpenCV, NumPy, PyYAML
+- `updated_world/worlds/Environmentnewww.wbt`
+- `updated_world/protos/` (meshes, textures, UR3e protos)
 
-Run the VM installer:
+If you copy a fresh tree from Box and paths still reference Linux (`/home/seth/...`), fix once:
 
-```bash
-cd vm_simulation_system
-chmod +x setup.sh
-./setup.sh
+```powershell
+cd VR-DT-DRL
+python vm_simulation_system\Webots\scripts\fix_vm_paths_for_windows.py
 ```
 
-Copy the simulation package into your catkin workspace as documented in `setup.sh` (typically `~/catkin_ws/src/vm_simulation_system/`).
+The script defaults to `updated_world/`. Domain-randomization texture JPGs are also read from `vm_simulation_system/Webots/protos/textures/Dataset/` when the client runs.
 
-### VMware networking (default)
-
-| Machine | IP | Port |
-|---------|-----|------|
-| Windows host (brain) | `192.168.241.1` | `8888` |
-| Ubuntu VM (body) | `192.168.241.128` | — |
-
-Edit [`host_gpu_system/config/network_config.yaml`](host_gpu_system/config/network_config.yaml) and [`vm_simulation_system/config/network_config.yaml`](vm_simulation_system/config/network_config.yaml) if your subnet differs.
-
----
-
-## Quick start
-
-### 1. Windows — start the GPU server
+### 3. Python environment (GPU + sim client)
 
 ```powershell
 cd host_gpu_system
 python -m venv venv
 .\venv\Scripts\Activate.ps1
-pip install -r requirements.txt
+pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu121
+```
 
+Confirm CUDA:
+
+```powershell
+python -c "import torch; print(torch.cuda.is_available())"
+```
+
+`openpyxl` is included in `requirements.txt` (episode Excel logs).
+
+### 4. Network config (localhost)
+
+In `vm_simulation_system/config/network_config.yaml`:
+
+```yaml
+network:
+  host_ip: "127.0.0.1"
+  host_port: 8888
+```
+
+Leave `host_gpu_system/config/network_config.yaml` as `host_ip: "0.0.0.0"`.
+
+### 5. Models
+
+Place trained weights in `host_gpu_system/models/`:
+
+- `ur3_live_model_r1.pth`
+- `ur3_live_model_r2.pth` (dual-arm world)
+
+### 6. GPU server firewall (once)
+
+```powershell
+netsh advfirewall firewall add rule name="UR3e GPU Server" dir=in action=allow protocol=TCP localport=8888
+```
+
+### 7. Dual-arm barrier (if using one or two robots)
+
+In `host_gpu_system/src/gpu_server.py` (~line 114), set `_barrier_num_robots`:
+
+| Arms running | Value |
+|--------------|-------|
+| Robot 1 only | `1` |
+| Robot 1 + 2 | `2` |
+
+With **two** clients, the GPU server uses setup barriers: Robot 1 sets up the world first, Robot 2 second, then **both** wait until setup is complete before either resumes grasping.
+
+---
+
+## Curriculum phases
+
+Grasp **training** progresses through six spawn phases (0–5). Each phase places the block at increasing distance from the platform centre. The client advances automatically when enough AI grasp attempts hit a success-rate target (training mode only).
+
+| Phase | Spawn region |
+|-------|----------------|
+| **0** | Centre only (fixed) |
+| **1** | 0.5–1.5 cm radius |
+| **2** | 1.5–3.5 cm radius |
+| **3** | 3.5–7.0 cm radius |
+| **4** | 7.0–11.5 cm radius band |
+| **5** | Anywhere on usable platform (uniform) |
+
+**Inference** (`--mode inference`) does not advance the curriculum. Pick how spawns behave:
+
+| Flag | Behavior |
+|------|----------|
+| `--phase N` | Lock spawns to phase **0–5** (e.g. **`--phase 4`** for the outer ring) |
+| *(no extra flag)* | Use saved curriculum state from `config/curriculum_state.json` |
+| `--cycle N` | Rotate through phases (default **0→5**); add **`--cycle-from`** / **`--cycle-to`** to limit the range |
+| `--cycle-from N` / `--cycle-to M` | With **`--cycle`**, only rotate phases **N…M** (e.g. **1–4**) |
+| `--free` | No auto-spawn; place the block manually in Webots |
+
+Episode logs for `--phase N` go to `data/episode_log_r1_phaseN.xlsx`.
+
+---
+
+## Run simulation (every session)
+
+**Order matters:** GPU server → Webots **Play** → client(s).
+
+**Stopping a running command:** In PowerShell, press **Ctrl+Pause** to interrupt `gpu_server.py`, `simulation_client.py`, or other long-running processes. On many laptops the **Pause** key is only available via **Fn** — use **Ctrl+Fn+Pause** instead.
+
+### Terminal 1 — GPU server
+
+```powershell
+cd host_gpu_system
+.\venv\Scripts\Activate.ps1
 python src\gpu_server.py
 ```
 
-Models load automatically from `host_gpu_system/models/`:
+Wait for: `BC Server listening on 0.0.0.0:8888`
 
-- `ur3_live_model_r1.pth` — Robot 1
-- `ur3_live_model_r2.pth` — Robot 2
+### Webots
 
-Optional: override Robot 1 weights only:
+1. Open `updated_world\worlds\Environmentnewww.wbt`
+2. **Reset Simulation**
+3. Press **Play**
+
+### Terminal 2 — Robot 1
 
 ```powershell
-python src\gpu_server.py --model "path\to\ur3_live_model_r1.pth"
+cd host_gpu_system
+.\venv\Scripts\Activate.ps1
+cd ..\vm_simulation_system
+
+$env:WEBOTS_HOME = "$env:LOCALAPPDATA\Programs\Webots"
+$env:WEBOTS_ROBOT_NAME = "ur3e_robot"
+
+python src\simulation_client.py --mode inference --cycle 20 --cycle-from 1 --cycle-to 4 --robot-id 1
 ```
 
-Robot 2 always loads `models/ur3_live_model_r2.pth` on the same startup. **One server process serves both robots.**
+This rotates **phases 1→2→3→4→1…**, **20 episodes per phase**. For a single phase, use **`--phase N`** (e.g. **`--phase 4`**). **`--phase 5`** is full-board spawns (hardest; use only when you intend to stress-test edges). See [Curriculum phases](#curriculum-phases).
 
-Set `_barrier_num_robots` in `gpu_server.py` (line ~114) to match your client count:
+### Terminal 3 — Robot 2 (optional, dual-arm world)
 
-| Setup | Value |
-|-------|-------|
-| One robot | `1` |
-| Two robots | `2` |
+```powershell
+cd host_gpu_system
+.\venv\Scripts\Activate.ps1
+cd ..\vm_simulation_system
 
-### 2. Ubuntu VM — sync code (after Windows edits)
+$env:WEBOTS_HOME = "$env:LOCALAPPDATA\Programs\Webots"
+$env:WEBOTS_ROBOT_NAME = "ur3e_robot2"
 
-The VM runs a copy under `~/catkin_ws/`. Sync via VMware shared folders:
-
-```bash
-sudo vmhgfs-fuse .host:/ /mnt/hgfs -o allow_other   # after VM reboot
-
-cp /mnt/hgfs/VR-DT-DRL/vm_simulation_system/src/*.py \
-   ~/catkin_ws/src/vm_simulation_system/src/
+python src\simulation_client.py --mode inference --cycle 20 --cycle-from 1 --cycle-to 4 --robot-id 2
 ```
 
-### 3. Ubuntu VM — run simulation
+### Good startup signs
 
-**Terminal 1** (optional):
-
-```bash
-roscore
-```
-
-**Webots:** Open `Environmentnewww.wbt` from your catkin workspace, press **Play**.
-
-**Terminal 2 — Robot 1:**
-
-```bash
-cd ~/catkin_ws/src/vm_simulation_system
-python3 src/simulation_client.py --mode inference --phase 4 --robot-id 1
-```
-
-**Terminal 3 — Robot 2** (dual-robot world):
-
-```bash
-cd ~/catkin_ws/src/vm_simulation_system
-python3 src/simulation_client.py --mode inference --phase 4 --robot-id 2
-```
-
-### Expected startup logs
-
-**Robot 1:** `WEBOTS_ROBOT_NAME=ur3e_robot` · `motors bound: 6/6` · `Fresh camera frame`
-
-**Robot 2:** `WEBOTS_ROBOT_NAME=ur3e_robot2` · `R2 RGB-D devices: ready` · AI predictions
-
-**GPU server:** two `Loaded weights` lines · `BC Server listening on 0.0.0.0:8888`
+- `[WebotsBridge] Connected to robot 'ur3e_robot'`
+- `Webots motors bound: 6/6`
+- `Connected to GPU server at 127.0.0.1:8888`
+- `[AI PREDICTION R1]` when an episode runs
 
 ---
 
-## Dual-robot reference
+## Episode logs
 
-| | Robot 1 | Robot 2 |
-|--|---------|---------|
-| Webots node | `ur3e_robot` | `ur3e_robot2` |
-| RGB camera | `realsense_color` | `realsense_color2` |
-| Depth camera | `realsense_range` | `realsense_range2` |
-| Target block | `TARGET_OBJECT` | `TARGET_OBJECT2` |
-| Model file | `ur3_live_model_r1.pth` | `ur3_live_model_r2.pth` |
-| Episode log (runtime) | `data/episode_log_r1.csv` | `data/episode_log_r2.csv` |
+Written under **`VR-DT-DRL/data/`** (repo root), e.g.:
 
-Each arm needs its **own** `simulation_client.py` process with matching `--robot-id`. Do not run one client for both arms.
+- `data/episode_log_r1.xlsx` (cycle / normal inference)
+- `data/episode_log_r1_phase4.xlsx` (when using `--phase 4`)
 
----
-
-## Modes
-
-### Inference (deploy trained model)
-
-```bash
-python3 src/simulation_client.py --mode inference --phase 4 --robot-id 1
-```
-
-Inference sub-modes (one at a time):
-
-| Flag | Effect |
-|------|--------|
-| `--phase N` | Lock curriculum spawn to phase 0–4 |
-| `--cycle N` | Cycle all phases, N episodes each |
-| `--free` | Manual object placement; AI grasps wherever you put it |
-
-### Training (simulation — behavior cloning)
-
-```bash
-python3 src/simulation_client.py --mode training --robot-id 1
-```
-
-Teacher demos (`explore`) and student policy (`exploit`) run in Webots; the GPU server buffers demos and runs BC updates. Checkpoints save to `host_gpu_system/models/` every 100 steps.
-
-### Real robot
-
-```bash
-python3 src/simulation_client.py --real --robot-id 1
-# or with ROS camera topics (e.g. Raspberry Pi):
-python3 src/simulation_client.py --ros-camera --robot-id 1
-```
-
-`--real` forces inference mode. Requires ROS, RealSense (`pyrealsense2`), and Robotiq gripper packages on the real cell.
-
----
-
-## How learning works
-
-1. **Teacher (`explore`)** — Hand-designed grasp from object pose in Webots.
-2. **Student (`exploit`)** — CNN predicts grasp from RGB-D.
-3. **Behavior cloning** — GPU server stores `(image, pose, reward)` tuples and trains pose regression on successful / near-miss episodes.
-4. **Curriculum** — Spawn radius increases when AI success rate crosses phase thresholds.
-5. **Domain randomization** — Textures, lighting, and colors vary each episode to narrow the sim-to-real gap.
-
-Message types over TCP (length-prefixed JSON):
-
-- `camera_data` → grasp prediction
-- `training_data` → demo buffer + async BC step
-- `episode_end` → multi-robot barrier sync
-
----
-
-## Configuration
-
-| File | Purpose |
-|------|---------|
-| `host_gpu_system/config/network_config.yaml` | Host bind address and port |
-| `vm_simulation_system/config/network_config.yaml` | VM → host connection |
-| `vm_simulation_system/config/robot_config.yaml` | UR3e joints, workspace, gripper |
-| `vm_simulation_system/config/camera_config.yaml` | Resolution, ROS topics |
-| `vm_simulation_system/config/webots_config.yaml` | World file, timestep |
-
----
-
-## Data and logging
-
-Each robot appends to a CSV after every episode (written under `data/` relative to the client working directory on the VM):
-
-- `data/episode_log_r1.csv`
-- `data/episode_log_r2.csv`
-
-Columns include timestamp, spawn pose, AI pose, success, reward, lift height, and curriculum phase. Debug camera snapshots:
-
-- `~/catkin_ws/src/vm_simulation_system/data/latest_camera_view_r{1|2}.jpg`
+Column **timestamp_local** uses your Windows timezone in 12-hour format.
 
 ---
 
 ## Troubleshooting
 
-| Symptom | Likely cause | Fix |
-|---------|--------------|-----|
-| Hang between episodes | Barrier mismatch | Set `_barrier_num_robots` to 1 or 2 |
-| `realsense_color2` warnings on R1 | Wrong client / stale code | `--robot-id 1`; sync `webots_bridge.py` |
-| `Node has no attribute getDevice` | Old controller code | Sync `enhanced_robot_controller.py` |
-| Robot 2 random / bad grasps | Missing r2 model | Add `ur3_live_model_r2.pth` to `models/` |
-| Stale camera image | Buffer not flushed | Sync `simulation_client.py`; keep Webots stepping |
-| VM changes not applied | Forgot hgfs copy | Copy from `/mnt/hgfs/VR-DT-DRL/...` |
-| Can't reach GPU server | Network / firewall | Verify `192.168.241.1:8888` and Windows firewall |
+| Problem | Fix |
+|---------|-----|
+| `Webots not connected` | Webots must be **playing** before starting the client; use **Reset Simulation** then Play |
+| `DLL load failed` / wrong python API | Use **Python 3.9** venv; Webots API folder must be `python39`, not `python38` |
+| Client exits immediately | Start `gpu_server.py` first; check `host_ip: "127.0.0.1"` in client config |
+| Hang between episodes | Match `_barrier_num_robots` to number of running clients (1 or 2) |
+| Missing textures / meshes | Ensure `updated_world/protos/` is complete; run path fix script on `updated_world/` |
+| `openpyxl` error | `pip install openpyxl` in `host_gpu_system\venv` |
+
+**Connection test** (Webots playing, Robot 1 env set):
+
+```powershell
+python vm_simulation_system\Webots\scripts\probe_webots_connection.py
+```
+
+Expected: `OK robot=ur3e_robot timestep=16`
+
+---
+
+## Files on Box (not on GitHub)
+
+Clone the repo first, then download these from **Box** and place them as shown.
+
+**`Webots.rar`** on Box contains the **contents** of the Webots project (`worlds/`, `protos/`, etc.) — not a folder named `updated_world/`. After clone:
+
+1. Create `VR-DT-DRL/updated_world/`
+2. Extract `Webots.rar` and move everything into that folder (you should see `updated_world/worlds/Environmentnewww.wbt`, `updated_world/protos/`, …)
+
+| Item | Put here |
+|------|----------|
+| Webots project (from `Webots.rar`) | `VR-DT-DRL/updated_world/` |
+| `ur3_live_model_r1.pth` | `host_gpu_system/models/` |
+| `ur3_live_model_r2.pth` | `host_gpu_system/models/` (dual-arm only) |
+
+Also copy `updated_world/protos/textures/Dataset/` → `vm_simulation_system/Webots/protos/textures/Dataset/` (domain randomization; sim runs without it, but with colour-only textures).
 
 ---
 

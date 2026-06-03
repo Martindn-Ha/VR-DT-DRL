@@ -1,7 +1,6 @@
 network:
-  host_ip: "192.168.241.1"   # Your Windows Brain
-  host_port: 8888            # The Port
-  vm_ip: "192.168.241.128"     # Your Ubuntu Body
-  timeout: 30                # Connection timeout
-  retry_attempts: 5          # How many times to try reconnecting
-
+  host_ip: "127.0.0.1"   # GPU server on same PC (Part 5 Windows)
+  host_port: 8888
+  vm_ip: "192.168.241.128"
+  timeout: 30
+  retry_attempts: 5

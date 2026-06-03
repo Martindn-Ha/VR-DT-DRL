@@ -10,6 +10,7 @@ automated curriculum for reinforcement learning.
 import socket
 import json
 import os
+import sys
 import numpy as np
 import math
 import cv2
@@ -19,13 +20,42 @@ import yaml
 import argparse
 import base64
 import struct
-import csv
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 from collections import deque
 
-EPISODE_CSV_COLUMNS = [
+# Repo-root data/ (VR-DT-DRL/data), not vm_simulation_system/data
+VR_DRL_DATA_DIR = Path(__file__).resolve().parent.parent.parent / "data"
+_AGENT_DEBUG_LOG = VR_DRL_DATA_DIR.parent / "debug-4ce223.log"
+
+
+def _agent_debug_log(location: str, message: str, data: Optional[Dict] = None,
+                     hypothesis_id: str = "", run_id: str = "pre-fix") -> None:
+    # #region agent log
+    try:
+        payload = {
+            "sessionId": "4ce223",
+            "runId": run_id,
+            "hypothesisId": hypothesis_id,
+            "location": location,
+            "message": message,
+            "data": data or {},
+            "timestamp": int(time.time() * 1000),
+        }
+        with _AGENT_DEBUG_LOG.open("a", encoding="utf-8") as f:
+            f.write(json.dumps(payload, default=str) + "\n")
+    except Exception:
+        pass
+    # #endregion
+
+
+def running_inside_webots() -> bool:
+    """True when Webots launched this process as an extern controller."""
+    return bool(os.environ.get("WEBOTS_CONTROLLER_URL"))
+
+
+EPISODE_LOG_COLUMNS = [
     'timestamp', 'robot_id', 'episode', 'run_mode', 'inference_mode',
     'curriculum_phase', 'spawn_phase',
     'spawn_x', 'spawn_y', 'spawn_z', 'spawn_radius_cm',
@@ -35,7 +65,60 @@ EPISODE_CSV_COLUMNS = [
     'ai_pose_0', 'ai_pose_1', 'ai_pose_2', 'ai_pose_3', 'ai_pose_4', 'ai_pose_5',
     'clamp_pose_0', 'clamp_pose_1', 'clamp_pose_2',
     'success', 'lifted_m', 'closest_dist_m', 'finger_dist_m', 'reward', 'object_found',
+    'support_shade_1', 'support_shade_2',
 ]
+
+# Excel-only: column B is local wall time derived from UTC ISO in column A.
+EPISODE_LOG_TIMESTAMP_LOCAL_COL = 'timestamp_local'
+EPISODE_LOG_XLSX_LOCAL_TIME_FORMAT = 'yyyy-mm-dd h:mm:ss AM/PM'
+EPISODE_LOG_XLSX_HEADERS = (
+    ['timestamp', EPISODE_LOG_TIMESTAMP_LOCAL_COL]
+    + [c for c in EPISODE_LOG_COLUMNS if c != 'timestamp']
+)
+
+EPISODE_LOG_XLSX_INT_COLS = frozenset({
+    'robot_id', 'episode', 'curriculum_phase', 'success', 'object_found',
+})
+EPISODE_LOG_XLSX_FLOAT_COLS = frozenset({
+    'spawn_x', 'spawn_y', 'spawn_z', 'spawn_radius_cm',
+    'cam_delta_x_cm', 'cam_delta_y_cm', 'cam_delta_z_cm',
+    'cam_delta_pitch_deg', 'cam_delta_yaw_deg', 'cam_delta_roll_deg',
+    'ai_pose_0', 'ai_pose_1', 'ai_pose_2', 'ai_pose_3', 'ai_pose_4', 'ai_pose_5',
+    'clamp_pose_0', 'clamp_pose_1', 'clamp_pose_2',
+    'lifted_m', 'closest_dist_m', 'finger_dist_m', 'reward',
+    'support_shade_1', 'support_shade_2',
+})
+
+
+def _iso_utc_to_local_naive(iso_str: str) -> Optional[datetime]:
+    """Parse UTC ISO timestamp from column A into local naive datetime for Excel."""
+    if not iso_str:
+        return None
+    try:
+        text = str(iso_str).replace('Z', '+00:00')
+        dt = datetime.fromisoformat(text)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone().replace(tzinfo=None)
+    except (ValueError, TypeError):
+        return None
+
+
+def _xlsx_cell_value(col_name: str, value: Any) -> Any:
+    """Coerce numeric log fields to int/float so Excel does not store them as text."""
+    if value == '' or value is None:
+        return ''
+    if col_name in EPISODE_LOG_XLSX_INT_COLS:
+        try:
+            return int(float(value))
+        except (TypeError, ValueError):
+            return value
+    if col_name in EPISODE_LOG_XLSX_FLOAT_COLS:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return value
+    return value
 
 #  RealSense dependencies (--real mode only) 
 try:
@@ -135,12 +218,15 @@ class CurriculumManager:
     # Dimensions: 0.30m (X) x 0.23m (Z) -> Half-sizes: 0.15m x 0.115m
     # Max usable radius before Z edge = 0.115m
     # =========================================================================
+    FULL_BOARD_PHASE = 5  # Uniform spawn anywhere on usable platform (inference --phase 5)
+
     PHASE_CONFIG = [
         (0.000, 0.000,  60,  0.85, 20),  # Phase 0: Static center
         (0.005, 0.015, 200,  0.75, 40),  # Phase 1: ±0.5cm - 1.5cm
         (0.015, 0.035, 250,  0.65, 50),  # Phase 2: ±1.5cm - 3.5cm
         (0.035, 0.070, 300,  0.55, 50),  # Phase 3: ±3.5cm - 7.0cm
-        (0.070, 0.115, 9999, 0.00, 50),  # Phase 4: Full platform
+        (0.070, 0.115, 9999, 0.00, 50),  # Phase 4: Radius ring 7–11.5cm (inference --phase 4)
+        (0.000, 0.000, 9999, 0.00, 50),  # Phase 5: Full board (uniform; see get_spawn / inference)
     ]
 
     def __init__(self, state_file="config/curriculum_state.json"):
@@ -166,9 +252,9 @@ class CurriculumManager:
                 
                 ai_window = self.PHASE_CONFIG[self.phase][4]
                 self.ai_recent_results = deque(state.get('ai_recent_results', []), maxlen=ai_window)
-                print(f"[CURRICULUM] 🔄 Resumed from Phase {self.phase}, Episode {self.episode}")
+                print(f"[CURRICULUM] Resumed from Phase {self.phase}, Episode {self.episode}")
             except Exception as e:
-                print(f"[CURRICULUM] ⚠️ Could not load state: {e}")
+                print(f"[CURRICULUM] WARNING: Could not load state: {e}")
 
     def _save_state(self):
         """Persists current curriculum state to disk."""
@@ -231,7 +317,7 @@ class CurriculumManager:
             self.ai_recent_results.clear()
 
             r_new_min, r_new_max, _, new_threshold, new_window = self.PHASE_CONFIG[self.phase]
-            print(f"[CURRICULUM] ✅ Phase {old_phase} → {self.phase} | "
+            print(f"[CURRICULUM] Phase {old_phase} -> {self.phase} | "
                   f"AI mastery: {ai_rate*100:.1f}% over {ai_attempts} attempts")
             print(f"[CURRICULUM] New radius: {r_new_min*100:.1f}–{r_new_max*100:.1f}cm | "
                   f"Next target: {new_threshold*100:.0f}% over {new_window} AI attempts")
@@ -252,8 +338,8 @@ class CurriculumManager:
         half_x = 0.143675   
         half_z = 0.083675  
 
-        if self.phase == 4:
-            # Full platform random distribution
+        if self.phase in (4, self.FULL_BOARD_PHASE):
+            # Full platform random distribution (training phase 4/5, or normal inference at phase 4+)
             spawn_x = np.random.uniform(cx - half_x, cx + half_x)
             spawn_z = np.random.uniform(cz - half_z, cz + half_z)
             
@@ -335,7 +421,7 @@ class CurriculumManagerRobot2(CurriculumManager):
 
         MAX_ATTEMPTS = 200
 
-        if self.phase == 4:
+        if self.phase in (4, self.FULL_BOARD_PHASE):
             wx_min, wx_max = self.PLATFORM_WORLD_X_MIN, self.PLATFORM_WORLD_X_MAX
             wz_min, wz_max = self.PLATFORM_WORLD_Z_MIN, self.PLATFORM_WORLD_Z_MAX
             
@@ -410,14 +496,14 @@ class SimulationClient:
         self.inference_mode           = 'normal'
         self.cycle_episodes_per_phase = 10
         self.fixed_phase              = 0
-        self._cycle_phase             = 0
+        self._cycle_phases            = list(range(len(CurriculumManager.PHASE_CONFIG)))
+        self._cycle_phase             = self._cycle_phases[0]
         self._cycle_count_in_phase    = 0
 
-        self._episode_log_dir  = Path("data")
-        self._episode_log_path = self._episode_log_dir / f"episode_log_r{robot_id}.csv"
-        self._episode_csv_lock = threading.Lock()
+        self._episode_log_dir = VR_DRL_DATA_DIR
+        self._episode_xlsx_path = None
+        self._episode_log_lock = threading.Lock()
         self._reset_episode_log_fields()
-        print(f"[CSV LOG R{robot_id}] Episode CSV → {self._episode_log_path.resolve()}")
 
         if real_robot:
             self.webots_bridge = None
@@ -428,8 +514,13 @@ class SimulationClient:
             self._init_real_robot_motion()
             self._init_robotiq_gripper()
         else:
-            # Setup Webots Simulation Bridge
             self.webots_bridge = WebotsBridge(simulation=False, robot_id=robot_id)
+            if self.webots_bridge.shared_robot is None:
+                raise RuntimeError(
+                    f"Webots not connected for robot {robot_id}. "
+                    "Open updated_world/worlds/Environmentnewww.wbt, press Play, then restart this client."
+                )
+            print(f"[STARTUP] Webots connected (robot {robot_id})")
 
             self.robot_controller, self.gripper_controller, self.motion_planner = \
                 create_robot_system(
@@ -462,18 +553,57 @@ class SimulationClient:
                     "(--robot-id 1) or Webots may not step the simulation."
                 )
 
+    def _episode_log_stem(self) -> str:
+        if self.mode == 'inference' and self.inference_mode == 'phase':
+            return f"episode_log_r{self.robot_id}_phase{self.fixed_phase}"
+        return f"episode_log_r{self.robot_id}"
+
+    def refresh_episode_log_paths(self):
+        """Set Excel log path under VR-DT-DRL/data (phase-specific name for --phase inference)."""
+        stem = self._episode_log_stem()
+        self._episode_xlsx_path = self._episode_log_dir / f"{stem}.xlsx"
+        print(f"[LOG R{self.robot_id}] XLSX → {self._episode_xlsx_path.resolve()}")
+
     def _reset_episode_log_fields(self):
         """Clears per-episode fields before a new grasp attempt."""
-        self._episode_log_fields = {col: '' for col in EPISODE_CSV_COLUMNS}
+        self._episode_log_fields = {col: '' for col in EPISODE_LOG_COLUMNS}
 
-    def _ensure_episode_csv_header(self, path: Path):
-        path.parent.mkdir(parents=True, exist_ok=True)
-        if not path.exists() or path.stat().st_size == 0:
-            with path.open('w', newline='', encoding='utf-8') as f:
-                csv.DictWriter(f, fieldnames=EPISODE_CSV_COLUMNS).writeheader()
+    def _refresh_xlsx_local_time_column(self, ws) -> None:
+        """Rewrite column B from UTC ISO in column A (12-hour local display)."""
+        for row_num in range(2, ws.max_row + 1):
+            utc_val = ws.cell(row_num, 1).value
+            local_dt = _iso_utc_to_local_naive(str(utc_val) if utc_val is not None else '')
+            cell = ws.cell(row_num, 2, local_dt if local_dt is not None else '')
+            cell.number_format = EPISODE_LOG_XLSX_LOCAL_TIME_FORMAT
 
-    def _append_episode_csv_row(self, success: bool):
-        """Writes one episode observation row to robot-specific CSV."""
+    def _ensure_xlsx_local_time_column(self, ws) -> None:
+        """Insert column B with timestamp_local if upgrading an older log file."""
+        if ws.max_row == 0:
+            return
+        if ws.cell(1, 2).value != EPISODE_LOG_TIMESTAMP_LOCAL_COL:
+            ws.insert_cols(2)
+            ws.cell(1, 2, EPISODE_LOG_TIMESTAMP_LOCAL_COL)
+            self._refresh_xlsx_local_time_column(ws)
+            return
+        sample = ws.cell(2, 2).value if ws.max_row >= 2 else None
+        if isinstance(sample, str) and sample.startswith('='):
+            self._refresh_xlsx_local_time_column(ws)
+
+    def _write_episode_xlsx_row(self, ws, row: dict) -> None:
+        """Write one data row: A=timestamp, B=local-time, C+=episode fields."""
+        row_num = ws.max_row + 1
+        rest_cols = [c for c in EPISODE_LOG_COLUMNS if c != 'timestamp']
+
+        utc_iso = row.get('timestamp', '')
+        ws.cell(row_num, 1, utc_iso)
+        local_dt = _iso_utc_to_local_naive(utc_iso)
+        local_cell = ws.cell(row_num, 2, local_dt if local_dt is not None else '')
+        local_cell.number_format = EPISODE_LOG_XLSX_LOCAL_TIME_FORMAT
+        for col_idx, col_name in enumerate(rest_cols, start=3):
+            ws.cell(row_num, col_idx, _xlsx_cell_value(col_name, row.get(col_name, '')))
+
+    def _append_episode_log_row(self, success: bool):
+        """Append one episode row to the Excel workbook in VR-DT-DRL/data."""
         row = dict(self._episode_log_fields)
         row['timestamp']        = datetime.now(timezone.utc).isoformat()
         row['robot_id']         = self.robot_id
@@ -485,15 +615,34 @@ class SimulationClient:
         if row.get('spawn_phase') == '':
             row['spawn_phase'] = self._spawn_phase_label()
 
-        path = self._episode_log_path
+        xlsx_path = self._episode_xlsx_path
         try:
-            with self._episode_csv_lock:
-                self._ensure_episode_csv_header(path)
-                with path.open('a', newline='', encoding='utf-8') as f:
-                    csv.DictWriter(f, fieldnames=EPISODE_CSV_COLUMNS).writerow(row)
-            print(f"[CSV LOG R{self.robot_id}] Appended episode {self.episode_count} → {path.resolve()}")
+            import openpyxl
+        except ImportError as e:
+            raise ImportError(
+                "Episode logging requires openpyxl. Install with: pip install openpyxl"
+            ) from e
+
+        try:
+            with self._episode_log_lock:
+                xlsx_path.parent.mkdir(parents=True, exist_ok=True)
+                if xlsx_path.exists():
+                    wb = openpyxl.load_workbook(xlsx_path)
+                    ws = wb.active
+                    self._ensure_xlsx_local_time_column(ws)
+                    for col_idx, header in enumerate(EPISODE_LOG_XLSX_HEADERS, start=1):
+                        ws.cell(1, col_idx, header)
+                else:
+                    wb = openpyxl.Workbook()
+                    ws = wb.active
+                    ws.title = "episodes"
+                    for col_idx, header in enumerate(EPISODE_LOG_XLSX_HEADERS, start=1):
+                        ws.cell(1, col_idx, header)
+                self._write_episode_xlsx_row(ws, row)
+                wb.save(xlsx_path)
+            print(f"[LOG R{self.robot_id}] Appended episode {self.episode_count} → {xlsx_path.resolve()}")
         except Exception as e:
-            rospy.logwarn(f"[CSV LOG R{self.robot_id}] Failed to write episode row: {e}")
+            rospy.logwarn(f"[LOG R{self.robot_id}] Failed to write episode row: {e}")
 
     def _spawn_phase_label(self) -> str:
         if self.mode != 'inference':
@@ -530,6 +679,24 @@ class SimulationClient:
             'cam_delta_yaw_deg':     f'{math.degrees(d_yaw):.4f}',
             'cam_delta_roll_deg':    f'{math.degrees(d_roll):.4f}',
         })
+
+    @staticmethod
+    def _fmt_log_float(value: Optional[float], decimals: int = 6) -> str:
+        if value is None:
+            return ''
+        return f'{float(value):.{decimals}f}'
+
+    @staticmethod
+    def _empty_platform_log() -> Dict[str, Any]:
+        return {'texture': '', 'color_r': None, 'color_g': None, 'color_b': None}
+
+    def _record_domain_rand_for_log(self, domain: Dict[str, Any]) -> None:
+        """Persist bed-support shading for this episode (R1 only; shared scene)."""
+        fields: Dict[str, str] = {
+            'support_shade_1': self._fmt_log_float(domain.get('support_shade_1')),
+            'support_shade_2': self._fmt_log_float(domain.get('support_shade_2')),
+        }
+        self._episode_log_fields.update(fields)
 
     def _record_grasp_for_log(self, *, grasp_mode: str, raw_pose: Optional[List[float]],
                               clamp_pose: Optional[List[float]], success: bool,
@@ -1108,8 +1275,12 @@ class SimulationClient:
         try:
             with open(config_path, 'r') as f:
                 return yaml.safe_load(f)
-        except:
-            return {'network': {'host_ip': '192.168.1.133', 'host_port': 8888}}
+        except Exception as e:
+            print(
+                f"[CONFIG] Failed to read {config_path}: {e}\n"
+                f"  Fix YAML indentation. Using fallback host 127.0.0.1:8888."
+            )
+            return {'network': {'host_ip': '127.0.0.1', 'host_port': 8888}}
 
     def _setup_ros_interface(self):
         """Binds ROS image and joint state topic subscribers."""
@@ -1140,6 +1311,12 @@ class SimulationClient:
             return True
         except Exception as e:
             self.connected = False
+            print(
+                f"[NETWORK R{self.robot_id}] Cannot reach GPU server at "
+                f"{host_ip}:{host_port} — {e}\n"
+                f"  Start gpu_server.py first. Check config/network_config.yaml "
+                f"(host_ip should be 127.0.0.1 for Windows Part 5)."
+            )
             return False
 
     def _send_camera_data_to_host(self):
@@ -1445,11 +1622,23 @@ class SimulationClient:
 
     def _end_episode_and_restart(self, success: bool):
         """Records episode results and issues environment resets."""
+        _agent_debug_log(
+            "simulation_client.py:_end_episode_and_restart:entry",
+            "episode_end_restart_begin",
+            {"robot_id": self.robot_id, "episode": self.episode_count, "success": success},
+            hypothesis_id="C",
+        )
         self.end_current_episode(success)
         self.robot_controller.home_position()
         self._flush_camera_buffers()
 
         print(f"[BARRIER R{self.robot_id}] Waiting for other robot to finish episode...")
+        _agent_debug_log(
+            "simulation_client.py:_end_episode_and_restart:pre_barrier",
+            "gpu_barrier_request",
+            {"robot_id": self.robot_id, "episode": self.episode_count},
+            hypothesis_id="D",
+        )
         response = self._send_message_to_host({
             'type':     'episode_end',
             'success':  success,
@@ -1459,9 +1648,24 @@ class SimulationClient:
             print(f"[BARRIER R{self.robot_id}] Barrier cleared — starting next episode")
         else:
             print(f"[BARRIER R{self.robot_id}] Unexpected barrier response: {response}")
+        _agent_debug_log(
+            "simulation_client.py:_end_episode_and_restart:post_barrier",
+            "gpu_barrier_response",
+            {"robot_id": self.robot_id, "response_type": (response or {}).get("type"), "connected": self.connected},
+            hypothesis_id="D",
+        )
 
         time.sleep(2.0)
-        self.start_new_episode()
+        try:
+            self._begin_next_episode_serialized()
+        except Exception as exc:
+            _agent_debug_log(
+                "simulation_client.py:_end_episode_and_restart:start_fail",
+                "start_new_episode_exception",
+                {"robot_id": self.robot_id, "error": repr(exc)},
+                hypothesis_id="C",
+            )
+            raise
         self._flush_camera_buffers(steps=20)
 
     def _reset_simulation_for_nan(self):
@@ -1471,7 +1675,7 @@ class SimulationClient:
         cx = CurriculumManagerRobot2.PLATFORM_CENTER_X if robot_id == 2 else CurriculumManager.PLATFORM_CENTER_X
         cz = CurriculumManagerRobot2.PLATFORM_CENTER_Z if robot_id == 2 else CurriculumManager.PLATFORM_CENTER_Z
         try:
-            print(f"[NaN GUARD R{robot_id}] 🔄 Re-spawning {object_def} at platform centre...")
+            print(f"[NaN GUARD R{robot_id}] Re-spawning {object_def} at platform centre...")
             supervisor = self.webots_bridge.supervisor
             if hasattr(supervisor, 'supervisor'):
                 supervisor = supervisor.supervisor
@@ -1484,9 +1688,9 @@ class SimulationClient:
                 if rotation_field:
                     rotation_field.setSFRotation([0.0, 1.0, 0.0, 0.0])
                 obj_node.resetPhysics()
-                print(f"[NaN GUARD R{robot_id}] ✅ {object_def} re-spawned at ({cx:.3f}, 0.461, {cz:.3f})")
+                print(f"[NaN GUARD R{robot_id}] OK {object_def} re-spawned at ({cx:.3f}, 0.461, {cz:.3f})")
             else:
-                print(f"[NaN GUARD R{robot_id}] ⚠️  {object_def} not found during NaN recovery.")
+                print(f"[NaN GUARD R{robot_id}] WARNING: {object_def} not found during NaN recovery.")
         except Exception as e:
             rospy.logerr(f"[NaN GUARD R{robot_id}] Reset failed: {e}")
 
@@ -1505,19 +1709,20 @@ class SimulationClient:
         )
  
     def _apply_platform_texture(self, supervisor, tex_node_def, transform_def,
-                                mat_node_def, tex_images, tex_chance=0.75):
-        """Integrates domain randomizations dynamically to standard platform nodes."""
-        import random, math
- 
+                                mat_node_def, tex_images, tex_chance=0.75) -> Dict[str, Any]:
+        """Apply platform texture or colour; return applied state for domain dict."""
+        import random, math, os
+
+        log = self._empty_platform_log()
         floor_tex     = supervisor.getFromDef(tex_node_def)
         tex_transform = supervisor.getFromDef(transform_def)
         platform_mat  = supervisor.getFromDef(mat_node_def)
- 
+
         if not floor_tex or not platform_mat:
-            return
- 
+            return log
+
         url_field = floor_tex.getField("url")
- 
+
         def _set_mat_color(node, r, g, b):
             t = node.getTypeName()
             if t == "Material":
@@ -1526,20 +1731,20 @@ class SimulationClient:
                 node.getField("baseColor").setSFColor([r, g, b])
                 node.getField("roughness").setSFFloat(random.uniform(0.1, 1.0))
                 node.getField("metalness").setSFFloat(random.uniform(0.0, 1.0))
- 
+
         if tex_images and random.random() < tex_chance:
             img_path = random.choice(tex_images)
             if url_field.getCount() == 0:
                 url_field.insertMFString(0, img_path)
             else:
                 url_field.setMFString(0, img_path)
- 
+
             if tex_transform:
                 rotations = [0.0, math.pi / 2, math.pi, 3 * math.pi / 2]
                 tex_transform.getField("rotation").setSFFloat(random.choice(rotations))
- 
+
             _set_mat_color(platform_mat, 1.0, 1.0, 1.0)
- 
+            log['texture'] = os.path.basename(img_path)
         else:
             if url_field.getCount() > 0:
                 url_field.removeMF(0)
@@ -1549,68 +1754,183 @@ class SimulationClient:
             pg = random.uniform(0.05, 0.95)
             pb = random.uniform(0.05, 0.95)
             _set_mat_color(platform_mat, pr, pg, pb)
- 
-    def _randomize_domain(self):
-        """Randomizes the visual properties of the simulator elements to close sim-to-real gap."""
-        import random, math, os
- 
+            log['texture'] = 'color_only'
+            log['color_r'], log['color_g'], log['color_b'] = pr, pg, pb
+        return log
+
+    @staticmethod
+    def _read_platform_texture_state(supervisor, tex_node_def,
+                                     mat_node_def) -> Dict[str, Any]:
+        """Read current platform texture/colour without changing the scene."""
+        import os
+
+        log = SimulationClient._empty_platform_log()
+        floor_tex = supervisor.getFromDef(tex_node_def)
+        platform_mat = supervisor.getFromDef(mat_node_def)
+        if not floor_tex or not platform_mat:
+            return log
+
+        url_field = floor_tex.getField("url")
+        if url_field.getCount() > 0:
+            url = url_field.getMFString(0)
+            log['texture'] = os.path.basename(url) if url else ''
+            return log
+
+        t = platform_mat.getTypeName()
+        try:
+            if t == "Material":
+                c = platform_mat.getField("diffuseColor").getSFColor()
+            elif t == "PBRAppearance":
+                c = platform_mat.getField("baseColor").getSFColor()
+            else:
+                return log
+            log['texture'] = 'color_only'
+            log['color_r'], log['color_g'], log['color_b'] = float(c[0]), float(c[1]), float(c[2])
+        except Exception:
+            pass
+        return log
+
+    @staticmethod
+    def _read_block_color(supervisor, obj_def: str) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+        node = supervisor.getFromDef(obj_def)
+        if not node:
+            return None, None, None
+        try:
+            c = node.getField("baseColor").getSFColor()
+            return float(c[0]), float(c[1]), float(c[2])
+        except Exception:
+            return None, None, None
+
+    def _capture_domain_state_from_scene(self) -> Dict[str, Any]:
+        """Snapshot domain-randomization state already present in Webots."""
+        domain = self._empty_domain_log()
         try:
             supervisor = self.webots_bridge.supervisor
             if hasattr(supervisor, 'supervisor'):
                 supervisor = supervisor.supervisor
- 
-            tex_dir = os.path.expanduser(
-                "~/catkin_ws/src/vm_simulation_system/Webots/protos/textures/Dataset"
-            )
+            if supervisor is None:
+                return domain
+
+            for obj_def in ("TARGET_OBJECT", "TARGET_OBJECT2"):
+                domain['block_colors'][obj_def] = self._read_block_color(supervisor, obj_def)
+
+            for support_def, key in (("BedSupports_1", "support_shade_1"),
+                                     ("BedSupports_2", "support_shade_2")):
+                support_node = supervisor.getFromDef(support_def)
+                if support_node:
+                    c = support_node.getField("baseColor").getSFColor()
+                    domain[key] = float(c[0])
+
+            domain['floor'] = self._read_platform_texture_state(
+                supervisor, "FLOOR_TEXTURE", "FLOOR_MATERIAL")
+            domain['platform'] = self._read_platform_texture_state(
+                supervisor, "PLATFORM_TEXTURE", "PLATFORM_MATERIAL")
+            domain['platform2'] = self._read_platform_texture_state(
+                supervisor, "PLATFORM_TEXTURE2", "PLATFORM_MATERIAL2")
+
+            light_node = supervisor.getFromDef("MAIN_LIGHT")
+            if light_node:
+                domain['light_intensity'] = float(
+                    light_node.getField("intensity").getSFFloat())
+            fill_light = supervisor.getFromDef("FILL_LIGHT")
+            if fill_light:
+                domain['fill_light_intensity'] = float(
+                    fill_light.getField("intensity").getSFFloat())
+        except Exception as e:
+            print(f"[DOMAIN RAND] Could not read scene state: {e}")
+        return domain
+
+    @staticmethod
+    def _empty_domain_log() -> Dict[str, Any]:
+        return {
+            'block_colors': {
+                'TARGET_OBJECT': (None, None, None),
+                'TARGET_OBJECT2': (None, None, None),
+            },
+            'support_shade_1': None,
+            'support_shade_2': None,
+            'light_intensity': None,
+            'fill_light_intensity': None,
+            'floor': SimulationClient._empty_platform_log(),
+            'platform': SimulationClient._empty_platform_log(),
+            'platform2': SimulationClient._empty_platform_log(),
+        }
+
+    def _randomize_domain(self) -> Dict[str, Any]:
+        """Randomize simulator visuals; return applied domain state."""
+        import random, math, os
+
+        domain = self._empty_domain_log()
+        _agent_debug_log(
+            "simulation_client.py:_randomize_domain:entry",
+            "domain_rand_begin",
+            {"robot_id": self.robot_id, "episode": self.episode_count},
+            hypothesis_id="B",
+        )
+        try:
+            supervisor = self.webots_bridge.supervisor
+            if hasattr(supervisor, 'supervisor'):
+                supervisor = supervisor.supervisor
+
+            _pkg_root = Path(__file__).resolve().parent.parent
+            _local_dataset = _pkg_root / "Webots" / "protos" / "textures" / "Dataset"
+            if _local_dataset.is_dir():
+                tex_dir = str(_local_dataset)
+            else:
+                tex_dir = os.path.expanduser(
+                    "~/catkin_ws/src/vm_simulation_system/Webots/protos/textures/Dataset"
+                )
             tex_images = self._discover_textures(tex_dir)
             if not tex_images:
                 print("[DOMAIN RAND] No texture images found — using colour-only randomisation")
- 
+
             for obj_def in ("TARGET_OBJECT", "TARGET_OBJECT2"):
                 node = supervisor.getFromDef(obj_def)
                 if node:
-                    node.getField("baseColor").setSFColor(
-                        [random.random(), random.random(), random.random()]
-                    )
+                    r, g, b = random.random(), random.random(), random.random()
+                    node.getField("baseColor").setSFColor([r, g, b])
+                    domain['block_colors'][obj_def] = (r, g, b)
 
-            for support_def in ("BedSupports_1", "BedSupports_2"):
+            for support_def, key in (("BedSupports_1", "support_shade_1"),
+                                     ("BedSupports_2", "support_shade_2")):
                 support_node = supervisor.getFromDef(support_def)
                 if support_node:
                     shade = random.uniform(0.02, 0.25)
                     support_node.getField("baseColor").setSFColor([shade, shade, shade])
-                   
+                    domain[key] = shade
                     support_node.getField("roughness").setSFFloat(random.uniform(0.4, 0.85))
                     support_node.getField("metalness").setSFFloat(random.uniform(0.7, 1.0))
- 
-            self._apply_platform_texture(
+
+            domain['floor'] = self._apply_platform_texture(
                 supervisor,
-                tex_node_def  = "FLOOR_TEXTURE",
-                transform_def = "FLOOR_TEX_TRANSFORM",
-                mat_node_def  = "FLOOR_MATERIAL",
-                tex_images    = tex_images,
-                tex_chance    = 0.90,
+                tex_node_def="FLOOR_TEXTURE",
+                transform_def="FLOOR_TEX_TRANSFORM",
+                mat_node_def="FLOOR_MATERIAL",
+                tex_images=tex_images,
+                tex_chance=0.90,
             )
- 
-            self._apply_platform_texture(
+            domain['platform'] = self._apply_platform_texture(
                 supervisor,
-                tex_node_def  = "PLATFORM_TEXTURE",
-                transform_def = "PLATFORM_TEX_TRANSFORM",
-                mat_node_def  = "PLATFORM_MATERIAL",
-                tex_images    = tex_images,
-                tex_chance    = 0.90,
+                tex_node_def="PLATFORM_TEXTURE",
+                transform_def="PLATFORM_TEX_TRANSFORM",
+                mat_node_def="PLATFORM_MATERIAL",
+                tex_images=tex_images,
+                tex_chance=0.90,
             )
-            self._apply_platform_texture(
+            domain['platform2'] = self._apply_platform_texture(
                 supervisor,
-                tex_node_def  = "PLATFORM_TEXTURE2",
-                transform_def = "PLATFORM_TEX_TRANSFORM2",
-                mat_node_def  = "PLATFORM_MATERIAL2",
-                tex_images    = tex_images,
-                tex_chance    = 0.90,
+                tex_node_def="PLATFORM_TEXTURE2",
+                transform_def="PLATFORM_TEX_TRANSFORM2",
+                mat_node_def="PLATFORM_MATERIAL2",
+                tex_images=tex_images,
+                tex_chance=0.90,
             )
- 
+
             light_node = supervisor.getFromDef("MAIN_LIGHT")
             if light_node:
-                light_node.getField("intensity").setSFFloat(random.uniform(0.2, 4.0))
+                intensity = random.uniform(0.2, 4.0)
+                light_node.getField("intensity").setSFFloat(intensity)
+                domain['light_intensity'] = intensity
                 light_node.getField("ambientIntensity").setSFFloat(random.uniform(0.05, 1.0))
                 light_node.getField("color").setSFColor([
                     random.uniform(0.7, 1.0),
@@ -1623,10 +1943,12 @@ class SimulationClient:
                         random.uniform(-1.0, -0.3),
                         random.uniform(-1.0, 1.0),
                     ])
- 
+
             fill_light = supervisor.getFromDef("FILL_LIGHT")
             if fill_light:
-                fill_light.getField("intensity").setSFFloat(random.uniform(0.0, 2.0))
+                fill_intensity = random.uniform(0.0, 2.0)
+                fill_light.getField("intensity").setSFFloat(fill_intensity)
+                domain['fill_light_intensity'] = fill_intensity
                 fill_light.getField("ambientIntensity").setSFFloat(random.uniform(0.0, 0.5))
                 fill_light.getField("color").setSFColor([
                     random.uniform(0.6, 1.0),
@@ -1641,37 +1963,125 @@ class SimulationClient:
                     ])
 
             camera_defs = [
-                "realsense_color1", 
-                "realsense_color2", 
-                "realsense_range1", 
-                "realsense_range2"
+                "realsense_color1",
+                "realsense_color2",
+                "realsense_range1",
+                "realsense_range2",
             ]
-            
             for cam_def in camera_defs:
                 cam_node = supervisor.getFromDef(cam_def)
                 if cam_node:
-                    noise_level = random.uniform(0.0, 0.03)
-                    cam_node.getField("noise").setSFFloat(noise_level) 
- 
+                    cam_node.getField("noise").setSFFloat(random.uniform(0.0, 0.03))
+
         except Exception as e:
             print(f"[DOMAIN RAND] Skipping randomization (nodes not found or error): {e}")
+            _agent_debug_log(
+                "simulation_client.py:_randomize_domain:error",
+                "domain_rand_exception",
+                {"robot_id": self.robot_id, "error": repr(e)},
+                hypothesis_id="B",
+            )
+        _agent_debug_log(
+            "simulation_client.py:_randomize_domain:exit",
+            "domain_rand_done",
+            {"robot_id": self.robot_id},
+            hypothesis_id="B",
+        )
+        return domain
 
     def start_new_episode(self):
+        _agent_debug_log(
+            "simulation_client.py:start_new_episode:entry",
+            "start_new_episode_begin",
+            {"robot_id": self.robot_id, "prev_episode": self.episode_count},
+            hypothesis_id="C",
+        )
         self._reset_episode_log_fields()
         self.episode_count  += 1
         self.episode_active  = True
         self.curriculum.update(self.episode_count)
 
-        if not self.real_robot and self.robot_id == 1:
-            self._randomize_domain()
+        if not self.real_robot:
+            if self.robot_id == 1:
+                domain_log = self._randomize_domain()
+                self._record_domain_rand_for_log(domain_log)
+            # R2: support-shade columns stay empty — R1 logs scene rand (avoids dual-supervisor read crash)
 
         if not self.real_robot:
             self._randomize_camera_poses()
 
         self._spawn_object_at_curriculum_position()
+        _agent_debug_log(
+            "simulation_client.py:start_new_episode:exit",
+            "start_new_episode_done",
+            {"robot_id": self.robot_id, "episode": self.episode_count},
+            hypothesis_id="C",
+        )
         self._send_message_to_host({'type': 'episode_start',
                                     'episode':  self.episode_count,
                                     'robot_id': self.robot_id})
+
+    def _begin_next_episode_serialized(self) -> None:
+        """
+        Dual-arm: R1 setup → R2 setup → both wait until all setup done before sim loop.
+        Single-arm (R1 only): no extra wait.
+        """
+        if self.real_robot:
+            self.start_new_episode()
+            return
+
+        if self.robot_id == 2:
+            print(f"[SETUP BARRIER R{self.robot_id}] Waiting for R1 world setup...")
+            _agent_debug_log(
+                "simulation_client.py:_begin_next_episode_serialized",
+                "setup_wait_request",
+                {"robot_id": self.robot_id},
+                hypothesis_id="D",
+            )
+            response = self._send_message_to_host({
+                'type':     'episode_setup_wait',
+                'robot_id': self.robot_id,
+            })
+            if not response or response.get('type') != 'proceed':
+                msg = (response or {}).get('message', response)
+                raise RuntimeError(f"Setup barrier failed for R2: {msg}")
+            print(f"[SETUP BARRIER R{self.robot_id}] R1 setup done — starting R2 episode setup")
+
+        self.start_new_episode()
+
+        if self.robot_id == 1:
+            print(f"[SETUP BARRIER R{self.robot_id}] World setup done — releasing R2")
+        _agent_debug_log(
+            "simulation_client.py:_begin_next_episode_serialized",
+            "setup_done_signal",
+            {"robot_id": self.robot_id, "episode": self.episode_count},
+            hypothesis_id="D",
+        )
+        self._send_message_to_host({
+            'type':     'episode_setup_done',
+            'robot_id': self.robot_id,
+        })
+
+        _agent_debug_log(
+            "simulation_client.py:_begin_next_episode_serialized",
+            "setup_all_wait_request",
+            {"robot_id": self.robot_id, "episode": self.episode_count},
+            hypothesis_id="D",
+        )
+        all_resp = self._send_message_to_host({
+            'type':     'episode_setup_all_wait',
+            'robot_id': self.robot_id,
+        })
+        if not all_resp or all_resp.get('type') != 'proceed':
+            msg = (all_resp or {}).get('message', all_resp)
+            raise RuntimeError(f"Setup all-wait failed for R{self.robot_id}: {msg}")
+
+        _agent_debug_log(
+            "simulation_client.py:_end_episode_and_restart:post_start",
+            "start_new_episode_ok",
+            {"robot_id": self.robot_id, "episode": self.episode_count, "episode_active": self.episode_active},
+            hypothesis_id="C",
+        )
 
     def _spawn_object_at_curriculum_position(self):
         robot_id   = self.robot_id
@@ -1714,9 +2124,13 @@ class SimulationClient:
             rospy.logerr(f"[CURRICULUM R{robot_id}] Spawn error: {e}")
 
     def _get_spawn_for_phase(self, phase_index: int) -> tuple:
-        """Returns bounds tailored exclusively to the curriculum configuration structure."""
+        """Inference spawn for a locked curriculum phase (--phase N)."""
         cfg = CurriculumManager.PHASE_CONFIG
         phase_index = max(0, min(phase_index, len(cfg) - 1))
+
+        if phase_index == CurriculumManager.FULL_BOARD_PHASE:
+            return self._sample_full_board_spawn()
+
         r_min, r_max, _, _, _ = cfg[phase_index]
 
         cx     = self.curriculum.PLATFORM_CENTER_X
@@ -1733,8 +2147,37 @@ class SimulationClient:
         sx = np.clip(cx + radius * np.cos(angle), cx - half_x, cx + half_x)
         sz = np.clip(cz + radius * np.sin(angle), cz - half_z, cz + half_z)
         print(f"[INFERENCE R{self.robot_id}] Phase {phase_index} spawn: ({sx:.3f}, {sz:.3f}) | "
-              f"radius {radius*100:.1f}cm (max {r_max*100:.1f}cm)")
+              f"radius {radius*100:.1f}cm (band {r_min*100:.1f}–{r_max*100:.1f}cm)")
         return (sx, sz, radius * 100.0)
+
+    def _sample_full_board_spawn(self) -> tuple:
+        """Uniform random spawn anywhere on the usable platform (phase 5 / full board)."""
+        cx = self.curriculum.PLATFORM_CENTER_X
+        cz = self.curriculum.PLATFORM_CENTER_Z
+        max_attempts = 200
+
+        if isinstance(self.curriculum, CurriculumManagerRobot2):
+            wx_min = self.curriculum.PLATFORM_WORLD_X_MIN
+            wx_max = self.curriculum.PLATFORM_WORLD_X_MAX
+            wz_min = self.curriculum.PLATFORM_WORLD_Z_MIN
+            wz_max = self.curriculum.PLATFORM_WORLD_Z_MAX
+            sx, sz = cx, cz
+            for _ in range(max_attempts):
+                candidate_x = np.random.uniform(wx_min, wx_max)
+                candidate_z = np.random.uniform(wz_min, wz_max)
+                if self.curriculum._in_spawn_area(candidate_x, candidate_z):
+                    sx, sz = candidate_x, candidate_z
+                    break
+        else:
+            half_x = self.curriculum.PLATFORM_HALF_SIZE_X
+            half_z = self.curriculum.PLATFORM_HALF_SIZE_Z
+            sx = np.random.uniform(cx - half_x, cx + half_x)
+            sz = np.random.uniform(cz - half_z, cz + half_z)
+
+        radius_cm = math.hypot(sx - cx, sz - cz) * 100.0
+        print(f"[INFERENCE R{self.robot_id}] Phase {CurriculumManager.FULL_BOARD_PHASE} "
+              f"(full board) spawn: ({sx:.3f}, {sz:.3f}) | radius {radius_cm:.1f}cm")
+        return (sx, sz, radius_cm)
 
     def end_current_episode(self, success: bool):
         self.episode_active = False
@@ -1756,11 +2199,12 @@ class SimulationClient:
             self._cycle_count_in_phase += 1
             if self._cycle_count_in_phase >= self.cycle_episodes_per_phase:
                 self._cycle_count_in_phase = 0
-                num_phases = len(CurriculumManager.PHASE_CONFIG)
-                self._cycle_phase = (self._cycle_phase + 1) % num_phases
+                idx = self._cycle_phases.index(self._cycle_phase)
+                idx = (idx + 1) % len(self._cycle_phases)
+                self._cycle_phase = self._cycle_phases[idx]
                 print(f"[INFERENCE R{robot_id}/cycle] Moving to Phase {self._cycle_phase}")
 
-        status = "✓" if success else "✗"
+        status = "OK" if success else "FAIL"
         if self.mode == 'inference':
             print(f"[INFERENCE R{robot_id}] {status} Episode {self.episode_count} complete")
         else:
@@ -1771,7 +2215,7 @@ class SimulationClient:
                   f"Phase {self.curriculum.phase} | "
                   f"AI: {ai_rate*100:.1f}% ({ai_attempts}/{ai_window}) | Mode: {mode}")
 
-        self._append_episode_csv_row(success)
+        self._append_episode_log_row(success)
 
     def _flush_camera_buffers(self, steps: int = 40):
         """
@@ -1781,8 +2225,15 @@ class SimulationClient:
         """
         if not self.webots_bridge:
             return
-        for _ in range(steps):
-            self.webots_bridge.step()
+        for i in range(steps):
+            if not self.webots_bridge.step():
+                _agent_debug_log(
+                    "simulation_client.py:_flush_camera_buffers",
+                    "flush_step_failed",
+                    {"robot_id": self.robot_id, "step_index": i, "total_steps": steps},
+                    hypothesis_id="A",
+                )
+                break
             self.camera_handler.update_from_webots()
             time.sleep(0.016)
         self.latest_rgb_image   = self.camera_handler.current_rgb_frame
@@ -1797,6 +2248,7 @@ class SimulationClient:
 
     def run_simulation_loop(self, max_episodes: int = None):
         if not self.connect_to_host():
+            print(f"[CLIENT R{self.robot_id}] Exiting — no GPU server connection.")
             return
 
         if not self.real_robot:
@@ -1811,7 +2263,7 @@ class SimulationClient:
                 'robot_id': self.robot_id
             })
             print(f"[BARRIER R{self.robot_id}] Startup barrier cleared")
-            self.start_new_episode()
+            self._begin_next_episode_serialized()
             self._flush_camera_buffers(steps=20)
         else:
             rospy.loginfo(f'[REAL R{self.robot_id}] Moving to home position before starting...')
@@ -1863,12 +2315,42 @@ class SimulationClient:
         else:
             rate = rospy.Rate(10)
             _cam_warn_at = 0.0
+            _loop_iter = 0
             while not rospy.is_shutdown():
                 if max_episodes is not None and self.episode_count > max_episodes:
                     print(f"[CLIENT R{self.robot_id}] Reached {max_episodes} episodes. Stopping.")
+                    _agent_debug_log(
+                        "simulation_client.py:run_simulation_loop:exit",
+                        "loop_exit_max_episodes",
+                        {"robot_id": self.robot_id, "max_episodes": max_episodes},
+                        hypothesis_id="E",
+                    )
                     break
 
-                self.webots_bridge.step()
+                step_ok = self.webots_bridge.step()
+                _loop_iter += 1
+                if not step_ok:
+                    _agent_debug_log(
+                        "simulation_client.py:run_simulation_loop:step_fail",
+                        "webots_step_returned_false",
+                        {"robot_id": self.robot_id, "episode": self.episode_count, "iter": _loop_iter},
+                        hypothesis_id="A",
+                    )
+                    print(f"[CLIENT R{self.robot_id}] Webots step failed — simulation disconnected?")
+                    break
+                if _loop_iter % 500 == 0:
+                    _agent_debug_log(
+                        "simulation_client.py:run_simulation_loop:heartbeat",
+                        "loop_alive",
+                        {
+                            "robot_id": self.robot_id,
+                            "episode": self.episode_count,
+                            "episode_active": self.episode_active,
+                            "connected": self.connected,
+                            "iter": _loop_iter,
+                        },
+                        hypothesis_id="E",
+                    )
                 self.camera_handler.update_from_webots()
                 self.latest_rgb_image   = self.camera_handler.current_rgb_frame
                 self.latest_depth_image = self.camera_handler.current_depth_frame
@@ -1884,6 +2366,12 @@ class SimulationClient:
                             "(Webots playing? both extern controllers running?)"
                         )
                 rate.sleep()
+            _agent_debug_log(
+                "simulation_client.py:run_simulation_loop:exit",
+                "loop_exit_shutdown",
+                {"robot_id": self.robot_id, "episode": self.episode_count, "connected": self.connected},
+                hypothesis_id="E",
+            )
 
 
 def main():
@@ -1917,16 +2405,21 @@ def main():
         'Only one may be used at a time.'
     )
     inf_group.add_argument('--cycle', type=int, default=None, metavar='N',
-                           help='Cycle through all curriculum phases, N episodes per phase.\n'
-                                'Example: --mode inference --cycle 20')
+                           help='Cycle through curriculum phases, N episodes per phase.\n'
+                                'Use --cycle-from / --cycle-to to limit the range.\n'
+                                'Example: --mode inference --cycle 20 --cycle-from 1 --cycle-to 4')
+    inf_group.add_argument('--cycle-from', type=int, default=0, metavar='N',
+                           help='First phase in --cycle rotation (default 0). Requires --cycle.')
+    inf_group.add_argument('--cycle-to', type=int, default=5, metavar='N',
+                           help='Last phase in --cycle rotation (default 5). Requires --cycle.')
     inf_group.add_argument('--free', action='store_true',
                            help='No automatic spawning. Place the object manually.\n'
                                 'The AI will attempt a grasp wherever you put it.\n'
                                 'Example: --mode inference --free')
     inf_group.add_argument('--phase', type=int, default=None, metavar='N',
-                           help='Lock to a specific curriculum phase (0–4).\n'
-                                'Object will always spawn with that phase\'s radius.\n'
-                                'Example: --mode inference --phase 2')
+                           help='Lock to a specific curriculum phase (0–5).\n'
+                                'Phases 0–4: spawn on a radius band; phase 5: full board.\n'
+                                'Example: --mode inference --phase 5')
 
     args = parser.parse_args()
 
@@ -1938,6 +2431,8 @@ def main():
         parser.error("Only one of --cycle, --free, --phase may be used at a time.")
     if any(inf_flags) and mode != 'inference':
         parser.error("--cycle / --free / --phase require --mode inference (or --real / --ros-camera).")
+    if args.cycle is None and (args.cycle_from != 0 or args.cycle_to != 5):
+        parser.error("--cycle-from / --cycle-to require --cycle.")
 
     robot_id = args.robot_id
     print(f"[STARTUP] Launching as Robot {robot_id}")
@@ -1947,15 +2442,38 @@ def main():
         os.environ["WEBOTS_ROBOT_NAME"] = webots_robot
         print(f"[STARTUP] WEBOTS_ROBOT_NAME={webots_robot}")
 
-    client = SimulationClient(mode=mode, real_robot=is_real, robot_id=robot_id,
-                              ros_camera=args.ros_camera)
+    if not is_real and not running_inside_webots():
+        print(
+            "[STARTUP] Note: launched outside Webots (e.g. PowerShell). "
+            "Phase 4/5 both work the same way; real cameras/motors need Webots Play."
+        )
+
+    try:
+        client = SimulationClient(mode=mode, real_robot=is_real, robot_id=robot_id,
+                                  ros_camera=args.ros_camera)
+    except Exception:
+        import traceback
+        print("[STARTUP] SimulationClient failed during initialization:")
+        traceback.print_exc()
+        raise
+
+    print(f"[STARTUP] SimulationClient ready (mode={mode})")
 
     if mode == 'inference':
         if args.cycle is not None:
+            max_phase = len(CurriculumManager.PHASE_CONFIG) - 1
+            if not 0 <= args.cycle_from <= max_phase:
+                parser.error(f"--cycle-from must be between 0 and {max_phase}.")
+            if not 0 <= args.cycle_to <= max_phase:
+                parser.error(f"--cycle-to must be between 0 and {max_phase}.")
+            if args.cycle_from > args.cycle_to:
+                parser.error("--cycle-from must be <= --cycle-to.")
             client.inference_mode           = 'cycle'
             client.cycle_episodes_per_phase = args.cycle
-            num_phases = len(CurriculumManager.PHASE_CONFIG)
-            print(f"[INFERENCE R{robot_id}] Mode: CYCLE | {args.cycle} episodes × {num_phases} phases")
+            client._cycle_phases            = list(range(args.cycle_from, args.cycle_to + 1))
+            client._cycle_phase             = client._cycle_phases[0]
+            print(f"[INFERENCE R{robot_id}] Mode: CYCLE | {args.cycle} episodes × "
+                  f"phases {args.cycle_from}–{args.cycle_to}")
         elif args.free:
             client.inference_mode = 'free'
             print(f"[INFERENCE R{robot_id}] Mode: FREE | Place the object manually each episode")
@@ -1966,13 +2484,40 @@ def main():
             client.inference_mode = 'phase'
             client.fixed_phase    = args.phase
             cfg = CurriculumManager.PHASE_CONFIG[args.phase]
-            print(f"[INFERENCE R{robot_id}] Mode: PHASE {args.phase} | "
-                  f"radius {cfg[0]*100:.1f}–{cfg[1]*100:.1f}cm")
+            if args.phase == CurriculumManager.FULL_BOARD_PHASE:
+                print(f"[INFERENCE R{robot_id}] Mode: PHASE {args.phase} | "
+                      f"uniform spawn on full usable platform")
+            else:
+                print(f"[INFERENCE R{robot_id}] Mode: PHASE {args.phase} | "
+                      f"radius {cfg[0]*100:.1f}–{cfg[1]*100:.1f}cm")
         else:
             client.inference_mode = 'normal'
             print(f"[INFERENCE R{robot_id}] Mode: NORMAL | Following curriculum as usual")
 
-    client.run_simulation_loop(max_episodes=None if args.real else args.episodes)
+    client.refresh_episode_log_paths()
+    _agent_debug_log(
+        "simulation_client.py:main",
+        "client_starting_loop",
+        {"robot_id": robot_id, "mode": mode},
+        hypothesis_id="E",
+    )
+    try:
+        client.run_simulation_loop(max_episodes=None if args.real else args.episodes)
+    except Exception as exc:
+        _agent_debug_log(
+            "simulation_client.py:main",
+            "client_loop_exception",
+            {"robot_id": robot_id, "error": repr(exc)},
+            hypothesis_id="C",
+        )
+        raise
+    finally:
+        _agent_debug_log(
+            "simulation_client.py:main",
+            "client_loop_finished",
+            {"robot_id": robot_id},
+            hypothesis_id="E",
+        )
 
 
 if __name__ == "__main__":

@@ -20,14 +20,15 @@ from math import pi, sin, cos, acos, atan2, sqrt
 try:
     import rospy
     import actionlib
-    from geometry_msgs.msg import Pose, JointState
+    from geometry_msgs.msg import Pose
+    from sensor_msgs.msg import JointState
     from control_msgs.msg import FollowJointTrajectoryAction, FollowJointTrajectoryGoal
     from trajectory_msgs.msg import JointTrajectory, JointTrajectoryPoint
     from std_msgs.msg import Bool
     ROS_AVAILABLE = True
 except ImportError:
     ROS_AVAILABLE = False
-    print("ROS not available, operating in standalone Simulation mode.")
+    print("ROS not installed — robot control will use Webots devices directly.")
 
 # --- Optional Scipy Imports ---
 try:

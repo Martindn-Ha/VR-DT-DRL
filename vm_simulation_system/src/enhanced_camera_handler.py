@@ -29,7 +29,7 @@ try:
     ROS_AVAILABLE = True
 except ImportError:
     ROS_AVAILABLE = False
-    print("ROS not available, operating in standalone simulation mode.")
+    print("ROS not installed — camera handler will use webots_bridge when provided.")
     class Image: pass
     class CameraInfo: pass
     class Header: pass
@@ -54,10 +54,14 @@ except ImportError:
 
 try:
     from integrator.srv import SimImageCameraService, SimDepthCameraService
-    WEBOTS_AVAILABLE = True
+    INTEGRATOR_SERVICES_AVAILABLE = True
 except ImportError:
-    WEBOTS_AVAILABLE = False
-    print("Webots integration not available.")
+    INTEGRATOR_SERVICES_AVAILABLE = False
+    # Optional ROS catkin package — not used when webots_bridge is passed in.
+    print(
+        "integrator ROS services not available "
+        "(OK on Windows Part 5 — cameras use webots_bridge directly)."
+    )
     class SimImageCameraService: pass
     class SimDepthCameraService: pass
 
@@ -173,7 +177,7 @@ class EnhancedCameraHandler:
         self.external_rgb_sub = rospy.Subscriber('/external_camera/rgb', Image, self._external_rgb_callback)
         self.external_depth_sub = rospy.Subscriber('/external_camera/depth', Image, self._external_depth_callback)
         
-        if WEBOTS_AVAILABLE:
+        if INTEGRATOR_SERVICES_AVAILABLE:
             try:
                 rospy.wait_for_service('/sim_image_camera_service', timeout=5.0)
                 rospy.wait_for_service('/sim_depth_camera_service', timeout=5.0)
@@ -298,7 +302,7 @@ class EnhancedCameraHandler:
         """
         WEBOTS_H, WEBOTS_W = 720, 1280
 
-        if not WEBOTS_AVAILABLE or not hasattr(self, 'sim_rgb_service'):
+        if not INTEGRATOR_SERVICES_AVAILABLE or not hasattr(self, 'sim_rgb_service'):
             # Fallback synthetic frames
             rgb_frame = np.random.randint(0, 255, (self.h, self.w, 3), dtype=np.uint8)
             depth_frame = np.random.uniform(0.5, 2.0, (self.h, self.w)).astype(np.float32)

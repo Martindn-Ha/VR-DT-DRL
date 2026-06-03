@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 GPU Inference Server for UR3 Grasping System
 
@@ -115,6 +115,12 @@ class GPUInferenceServer:
         self._barrier_ready_count = 0
         self._barrier_event       = threading.Event()
         self._barrier_lock        = threading.Lock()
+        # R2 waits here until R1 finishes domain randomization + spawn (dual-arm only).
+        self._setup_r1_event      = threading.Event()
+        self._setup_all_event     = threading.Event()
+        self._setup_ready_count   = 0
+        self._setup_lock          = threading.Lock()
+        self._setup_wait_timeout_s = 120.0
 
         # =========================================================================
         # NETWORKING & CONCURRENCY
@@ -484,7 +490,54 @@ class GPUInferenceServer:
             self._barrier_ready_count -= 1
             if self._barrier_ready_count == 0:
                 self._barrier_event.clear()
+                self._setup_r1_event.clear()
+                self._setup_all_event.clear()
+                with self._setup_lock:
+                    self._setup_ready_count = 0
 
+        return {'type': 'proceed'}
+
+    def _handle_episode_setup_done(self, robot_id: int) -> Dict:
+        """Report local episode setup finished; release peers when all robots are ready."""
+        with self._setup_lock:
+            self._setup_ready_count += 1
+            count = self._setup_ready_count
+            needed = self._barrier_num_robots
+
+        if robot_id == 1:
+            print("[SETUP BARRIER] R1 world setup complete — R2 may proceed")
+            self._setup_r1_event.set()
+
+        if count >= needed:
+            print(f"[SETUP BARRIER] All {needed} robot(s) setup complete — releasing to sim loop")
+            self._setup_all_event.set()
+
+        return {'type': 'proceed'}
+
+    def _handle_episode_setup_wait(self, robot_id: int) -> Dict:
+        """Robot 2 blocks until Robot 1 completes episode setup (dual-arm only)."""
+        if self._barrier_num_robots < 2 or robot_id != 2:
+            return {'type': 'proceed'}
+        print(f"[SETUP BARRIER] R{robot_id} waiting for R1 world setup...")
+        if not self._setup_r1_event.wait(timeout=self._setup_wait_timeout_s):
+            return {
+                'type': 'error',
+                'message': f'timeout ({self._setup_wait_timeout_s}s) waiting for R1 setup',
+            }
+        print(f"[SETUP BARRIER] R{robot_id} cleared — starting local setup")
+        return {'type': 'proceed'}
+
+    def _handle_episode_setup_all_wait(self, robot_id: int) -> Dict:
+        """Block until every robot has finished episode setup (dual-arm only)."""
+        if self._barrier_num_robots < 2:
+            return {'type': 'proceed'}
+        print(f"[SETUP BARRIER] R{robot_id} waiting for all robots to finish setup...")
+        if not self._setup_all_event.wait(timeout=self._setup_wait_timeout_s):
+            return {
+                'type': 'error',
+                'message': f'timeout ({self._setup_wait_timeout_s}s) waiting for all setup',
+            }
+        print(f"[SETUP BARRIER] R{robot_id} setup sync complete — resuming simulation")
         return {'type': 'proceed'}
 
     # =========================================================================
@@ -520,6 +573,18 @@ class GPUInferenceServer:
                     )
                 elif message['type'] == 'episode_end':
                     response = self._handle_episode_end(
+                        robot_id=int(message.get('robot_id', 1))
+                    )
+                elif message['type'] == 'episode_setup_done':
+                    response = self._handle_episode_setup_done(
+                        robot_id=int(message.get('robot_id', 1))
+                    )
+                elif message['type'] == 'episode_setup_wait':
+                    response = self._handle_episode_setup_wait(
+                        robot_id=int(message.get('robot_id', 2))
+                    )
+                elif message['type'] == 'episode_setup_all_wait':
+                    response = self._handle_episode_setup_all_wait(
                         robot_id=int(message.get('robot_id', 1))
                     )
                 else:

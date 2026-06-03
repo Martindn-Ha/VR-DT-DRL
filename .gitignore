@@ -1,8 +1,16 @@
 # Local session notes (not for version control)
 CHANGES_SUMMARY.md
+WEBOTS_PHASE*.txt
 
-# Runtime episode logs and debug captures (regenerated each run)
-data/
+# Runtime episode logs (regenerated each run; keep data/ folder via .gitkeep)
+data/*
+!data/.gitkeep
+vm_simulation_system/data/*
+!vm_simulation_system/data/.gitkeep
+
+# Curriculum state (written each run; do not commit)
+vm_simulation_system/config/curriculum_state.json
+vm_simulation_system/config/curriculum_state_robot2.json
 
 # Local analysis and exports (not for version control)
 docs/
@@ -26,10 +34,39 @@ host_gpu_system/models/*.pth
 # IDE / OS
 .vscode/
 .idea/
+.cursor/
 *.swdoc
 ~$*
 .DS_Store
 Thumbs.db
 
+# macOS resource forks (from USB / network copy)
+._*
+
+# Debug / session scratch
+debug-*.log
+**/client_vision_debug_*.jpg
+
+# Webots editor state and cache (regenerated)
+*.wbproj
+**/.wbproj
+**/*.cache
+
 # Webots / env extract scratch
 _env_extract/
+
+# Full Webots project from Box (too large; see README — not on GitHub)
+updated_world/
+
+# Local world copy with machine-specific paths (canonical world is updated_world/ from Box)
+vm_simulation_system/Webots/worlds/
+
+# Large Webots texture dataset — copy locally from VM or team share
+**/textures/Dataset/*.jpg
+**/textures/Dataset/*.jpeg
+**/textures/Dataset/*.png
+**/textures/Dataset/*.tar.gz
+**/textures/Dataset.zip
+**/textures/Dataset.tar.xz
+**/Environmentnewww.zip
+!**/textures/Dataset/Put images in this folder.txt

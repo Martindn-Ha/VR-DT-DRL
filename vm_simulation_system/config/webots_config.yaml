@@ -1,5 +1,6 @@
 webots:
-  world_file: "Environmentnewww.wbt"  # <--- UPDATED NAME
+  # Open in Webots GUI: updated_world/worlds/Environmentnewww.wbt (not loaded by Python)
+  world_file: "Environmentnewww.wbt"
   timestep: 32
   physics_timestep: 16
   supervisor_name: "supervisor"

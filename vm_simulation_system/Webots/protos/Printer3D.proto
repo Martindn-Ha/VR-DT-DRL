@@ -1,0 +1,59 @@
+#VRML_SIM R2021a utf8
+
+PROTO Printer3D [
+  field SFVec3f    translation 0 0 0
+  field SFRotation rotation    1 0 0 -1.5708
+  
+  field SFString   name        "3D printer"  # Added to prevent the 'name IS name' error
+  field SFFloat    mass        0.15
+  field SFVec3f    boxSize     0.0126 0.0333 0.0126
+  field SFVec3f    meshTranslation -0.00632 -0.01666 -0.00632
+  field SFVec3f    boxTranslation  0 0 0 
+  
+  field SFColor    baseColor       0 0 0
+]
+{
+  Solid {
+    translation IS translation
+    rotation IS rotation
+    name IS name
+    
+    # 1. VISUALS 
+    children [
+      Transform {
+        translation IS meshTranslation
+        scale 0.01 0.01 0.01
+        children [
+          Shape {
+            appearance PBRAppearance {
+              baseColor IS baseColor
+              roughness 0.0
+              metalness 0.0
+            }
+            geometry Mesh {
+              url [
+                "meshes/3DPrinter.stl" 
+              ]
+            }
+          }
+        ]
+      }
+    ]
+    
+    # 2. COLLISIONS
+    boundingObject Transform {
+      translation IS boxTranslation
+      children [
+        Box {
+          size IS boxSize
+        }
+      ]
+    }
+    
+    # 3. PHYSICS
+    physics Physics {
+      density -1
+      mass IS mass
+    }
+  }
+}
