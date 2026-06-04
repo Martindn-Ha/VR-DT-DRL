@@ -1,0 +1,2 @@
+# Episode spreadsheet logging (simulation_client.py)
+openpyxl>=3.1.0

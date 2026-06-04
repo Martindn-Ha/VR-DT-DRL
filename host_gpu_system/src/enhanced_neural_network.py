@@ -202,7 +202,7 @@ class BehaviorCloningModule(nn.Module):
           states              [B, 4, 224, 224]
           pose_labels         [B, 6]   -> teacher 6-DOF pose targets
           grasp_labels        [B]      -> grasp class integer
-          rewards             [B, 1]   -> mask determining pose loss weighting
+          rewards             [B, 1]   -> success mask for pose loss (1.0 = train, 0.0 = skip)
           aux_position_labels [B, 2]   -> spatial coordinates (X, Z)
         """
         states              = batch['states']
@@ -225,21 +225,14 @@ class BehaviorCloningModule(nn.Module):
                                  dtype=torch.float32,
                                  device=pose_preds.device)
 
-        # Pose loss conditioning based on success thresholds
-        success_mask  = (rewards >= 0.95).squeeze(1)
-        nearmiss_mask = ((rewards >= 0.4) & (rewards < 0.95)).squeeze(1)
+        # Success-only BC: imitate grasp poses only from successful demonstrations
+        success_mask = (rewards >= 0.95).squeeze(1)
 
         pose_loss = torch.tensor(0.0, device=pose_preds.device)
         if success_mask.any():
-            pose_loss = pose_loss + self.regression_loss(
+            pose_loss = self.regression_loss(
                 pose_preds[success_mask]  * POSE_MASK,
                 pose_labels[success_mask] * POSE_MASK
-            )
-            
-        if nearmiss_mask.any():
-            pose_loss = pose_loss + 0.3 * self.regression_loss(
-                pose_preds[nearmiss_mask] * POSE_MASK,
-                pose_labels[nearmiss_mask] * POSE_MASK
             )
 
         # Auxiliary loss conditioning

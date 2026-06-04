@@ -23,6 +23,8 @@ import struct
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
+
+from failure_taxonomy import classify_outcome, is_clamp_limited
 from collections import deque
 
 # Repo-root data/ (VR-DT-DRL/data), not vm_simulation_system/data
@@ -64,7 +66,8 @@ EPISODE_LOG_COLUMNS = [
     'grasp_mode',
     'ai_pose_0', 'ai_pose_1', 'ai_pose_2', 'ai_pose_3', 'ai_pose_4', 'ai_pose_5',
     'clamp_pose_0', 'clamp_pose_1', 'clamp_pose_2',
-    'success', 'lifted_m', 'closest_dist_m', 'finger_dist_m', 'reward', 'object_found',
+    'success', 'lifted_m', 'closest_dist_m', 'reward', 'object_found',
+    'outcome_class', 'clamp_limited',
     'support_shade_1', 'support_shade_2',
 ]
 
@@ -77,7 +80,7 @@ EPISODE_LOG_XLSX_HEADERS = (
 )
 
 EPISODE_LOG_XLSX_INT_COLS = frozenset({
-    'robot_id', 'episode', 'curriculum_phase', 'success', 'object_found',
+    'robot_id', 'episode', 'curriculum_phase', 'success', 'object_found', 'clamp_limited',
 })
 EPISODE_LOG_XLSX_FLOAT_COLS = frozenset({
     'spawn_x', 'spawn_y', 'spawn_z', 'spawn_radius_cm',
@@ -85,7 +88,7 @@ EPISODE_LOG_XLSX_FLOAT_COLS = frozenset({
     'cam_delta_pitch_deg', 'cam_delta_yaw_deg', 'cam_delta_roll_deg',
     'ai_pose_0', 'ai_pose_1', 'ai_pose_2', 'ai_pose_3', 'ai_pose_4', 'ai_pose_5',
     'clamp_pose_0', 'clamp_pose_1', 'clamp_pose_2',
-    'lifted_m', 'closest_dist_m', 'finger_dist_m', 'reward',
+    'lifted_m', 'closest_dist_m', 'reward',
     'support_shade_1', 'support_shade_2',
 })
 
@@ -702,16 +705,23 @@ class SimulationClient:
                               clamp_pose: Optional[List[float]], success: bool,
                               lift_delta: Optional[float], closest_dist: float,
                               reward: float, object_found: bool):
-        WRIST_OFFSET = 0.060
-        finger_dist  = max(0.0, closest_dist - WRIST_OFFSET)
+        outcome_class = classify_outcome(
+            success=success,
+            grasp_mode=grasp_mode,
+            object_found=object_found,
+            closest_dist_m=closest_dist,
+            lifted_m=lift_delta,
+        )
+        clamp_limited = int(is_clamp_limited(raw_pose, clamp_pose))
         fields = {
             'grasp_mode':      grasp_mode,
             'success':         int(bool(success)),
             'lifted_m':        '' if lift_delta is None else f'{lift_delta:.6f}',
             'closest_dist_m':  f'{closest_dist:.6f}',
-            'finger_dist_m':   f'{finger_dist:.6f}',
             'reward':          f'{reward:.6f}',
             'object_found':    int(bool(object_found)),
+            'outcome_class':   outcome_class,
+            'clamp_limited':   clamp_limited,
         }
         if raw_pose is not None:
             for i, val in enumerate(raw_pose[:6]):
@@ -1407,22 +1417,9 @@ class SimulationClient:
             return None
 
     def _calculate_shaped_reward(self, success: bool, closest_dist: float) -> float:
-        """Returns reinforcement shaping signals for model training."""
-        WRIST_OFFSET = 0.060
-        CUTOFF_DIST  = 0.20
-        DECAY        = 15.0
-
-        finger_dist = max(0.0, closest_dist - WRIST_OFFSET)
-
-        if success:
-            reward = 1.0
-        elif closest_dist > CUTOFF_DIST:
-            reward = 0.0
-        else:
-            reward = 0.8 * math.exp(-DECAY * finger_dist)
-
-        print(f"[REWARD] ClosestDist: {closest_dist:.4f}m | FingerDist: {finger_dist:.4f}m | "
-              f"Success: {success} | Reward: {reward:.4f}")
+        """Returns binary BC training signal: 1.0 on success, 0.0 otherwise."""
+        reward = 1.0 if success else 0.0
+        print(f"[REWARD] ClosestDist: {closest_dist:.4f}m | Success: {success} | Reward: {reward:.4f}")
         return float(reward)
 
     def _generate_guided_random_grasp(self) -> List[float]:

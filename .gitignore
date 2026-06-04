@@ -5,6 +5,7 @@ WEBOTS_PHASE*.txt
 # Runtime episode logs (regenerated each run; keep data/ folder via .gitkeep)
 data/*
 !data/.gitkeep
+!data/README.md
 vm_simulation_system/data/*
 !vm_simulation_system/data/.gitkeep
 
@@ -14,6 +15,7 @@ vm_simulation_system/config/curriculum_state_robot2.json
 
 # Local analysis and exports (not for version control)
 docs/
+analysis/output/
 
 # Python
 __pycache__/

@@ -111,7 +111,7 @@ class GPUInferenceServer:
         # =========================================================================
         # Ensures all active robots complete their current episode before triggering
         # global domain randomizations (e.g., lighting, floor textures).
-        self._barrier_num_robots  = 2          # Set to 1 for single-robot deployments
+        self._barrier_num_robots  = 1          # Set to 1 for single-robot deployments
         self._barrier_ready_count = 0
         self._barrier_event       = threading.Event()
         self._barrier_lock        = threading.Lock()
