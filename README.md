@@ -144,6 +144,12 @@ Episode logs for `--phase N` go to `data/episode_log_r1_phaseN.xlsx`.
 
 ---
 
+## Real UR3e arm (physical hardware)
+
+Webots is not required. Full bring-up, startup commands, and troubleshooting for **Ubuntu VM + Windows GPU** (network, UR driver, pendant, gripper, D455, inference client) are in **[docs/physical_arms.md](docs/physical_arms.md)**.
+
+---
+
 ## Run simulation (every session)
 
 **Order matters:** GPU server → Webots **Play** → client(s).
@@ -203,12 +209,74 @@ python src\simulation_client.py --mode inference --cycle 20 --cycle-from 1 --cyc
 
 ---
 
+## Targeted BC fine-tuning (70% weak / 30% normal)
+
+Fine-tune existing BC checkpoints on weak spawn regions while mixing in full-grid demos. Standard `--mode training` is unchanged.
+
+Config: [`host_gpu_system/config/fine_tune_config.yaml`](host_gpu_system/config/fine_tune_config.yaml)
+
+| Setting | Default | Purpose |
+|---------|---------|---------|
+| `sampling.weak_ratio` | `0.7` | Fraction of each training batch from weak-region buffer |
+| `sampling.normal_ratio` | `0.3` | Fraction from full-grid buffer |
+| `training.learning_rate` | `1e-4` | Lower than original BC (`5e-4`) |
+| `collection.weak_spawn_probability` | `0.7` | Episode spawn mix (weak cell vs full grid) |
+
+**Weak regions** (inference-style phase bands + quadrant):
+
+- **R1:** phase 4 band, quadrant IV
+- **R2:** phase 3 QIII/QIV; phase 4 QI/QIII/QIV
+
+### Terminal 1 — GPU server (fine-tune)
+
+```powershell
+cd host_gpu_system
+.\venv\Scripts\Activate.ps1
+python src\gpu_server.py --fine-tune
+```
+
+On first run, loads base weights from `models/ur3_live_model_r1.pth` / `ur3_live_model_r2.pth`. If you stop and restart `--fine-tune`, it automatically resumes from `models/R1_BC_targeted_70weak_30normal.pth` / `R2_BC_targeted_70weak_30normal.pth` when those files exist (every 100 training steps). Live base checkpoints are never overwritten. Explicit `--model` / `--model-r2` paths always take precedence.
+
+### Terminal 2 — Robot 1 fine-tune client
+
+```powershell
+cd vm_simulation_system
+python src\simulation_client.py --mode fine_tune --robot-id 1
+```
+
+Episode logs: `data/episode_log_r1_fine_tune.xlsx`
+
+### Evaluate after fine-tuning
+
+1. Start GPU server with the fine-tuned weights:
+
+```powershell
+python host_gpu_system\src\gpu_server.py --model host_gpu_system\models\R1_BC_targeted_70weak_30normal.pth
+```
+
+2. Run full-grid inference:
+
+```powershell
+python vm_simulation_system\src\simulation_client.py --mode inference --phase 5 --robot-id 1
+```
+
+3. Generate spatial report (success rates, failure taxonomy, quadrant breakdown):
+
+```powershell
+python analysis\spawn_spatial_report.py data\episode_log_r1_phase5.xlsx --spawn-phase 5 -o "data\episode report"
+```
+
+Outputs PDF under `data/episode report/`. See `data/README.md` for more options.
+
+---
+
 ## Episode logs
 
 Written under **`VR-DT-DRL/data/`** (repo root), e.g.:
 
 - `data/episode_log_r1.xlsx` (cycle / normal inference)
 - `data/episode_log_r1_phase4.xlsx` (when using `--phase 4`)
+- `data/episode_log_r1_fine_tune.xlsx` (targeted fine-tune collection)
 
 Column **timestamp_local** uses your Windows timezone in 12-hour format.
 

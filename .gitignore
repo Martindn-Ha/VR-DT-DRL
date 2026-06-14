@@ -48,6 +48,7 @@ Thumbs.db
 # Debug / session scratch
 debug-*.log
 **/client_vision_debug_*.jpg
+host_gpu_system/ai_vision_debug_*
 
 # Webots editor state and cache (regenerated)
 *.wbproj

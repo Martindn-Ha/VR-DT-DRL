@@ -25,6 +25,12 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 
 from failure_taxonomy import classify_outcome, is_clamp_limited
+from spawn_geometry import (
+    load_fine_tune_config,
+    pick_random_weak_cell,
+    quadrant_from_spawn,
+    sample_spawn_in_phase_quadrant,
+)
 from collections import deque
 
 # Repo-root data/ (VR-DT-DRL/data), not vm_simulation_system/data
@@ -69,6 +75,7 @@ EPISODE_LOG_COLUMNS = [
     'success', 'lifted_m', 'closest_dist_m', 'reward', 'object_found',
     'outcome_class', 'clamp_limited',
     'support_shade_1', 'support_shade_2',
+    'spawn_quadrant', 'demo_bucket', 'spawn_collection',
 ]
 
 # Excel-only: column B is local wall time derived from UTC ISO in column A.
@@ -503,6 +510,16 @@ class SimulationClient:
         self._cycle_phase             = self._cycle_phases[0]
         self._cycle_count_in_phase    = 0
 
+        self._fine_tune_cfg           = None
+        self._fine_tune_weak_regions  = {}
+        self._fine_tune_weak_spawn_p  = 0.7
+        self._fine_tune_demo_bucket   = ''
+        self._fine_tune_spawn_phase   = 0
+        self._fine_tune_spawn_collection = ''
+        self._fine_tune_spawn_quadrant = 0
+        if mode == 'fine_tune':
+            self._load_fine_tune_settings()
+
         self._episode_log_dir = VR_DRL_DATA_DIR
         self._episode_xlsx_path = None
         self._episode_log_lock = threading.Lock()
@@ -556,7 +573,23 @@ class SimulationClient:
                     "(--robot-id 1) or Webots may not step the simulation."
                 )
 
+    def _load_fine_tune_settings(self, config_path: Optional[str] = None):
+        path = config_path or str(
+            VR_DRL_DATA_DIR.parent / "host_gpu_system" / "config" / "fine_tune_config.yaml"
+        )
+        self._fine_tune_cfg = load_fine_tune_config(path)
+        self._fine_tune_weak_regions = self._fine_tune_cfg['_weak_regions_parsed']
+        self._fine_tune_weak_spawn_p = float(
+            self._fine_tune_cfg.get('collection', {}).get('weak_spawn_probability', 0.7)
+        )
+        print(
+            f"[FINE-TUNE R{self.robot_id}] weak_spawn_p={self._fine_tune_weak_spawn_p:.0%} | "
+            f"weak cells={self._fine_tune_weak_regions.get(self.robot_id, [])}"
+        )
+
     def _episode_log_stem(self) -> str:
+        if self.mode == 'fine_tune':
+            return f"episode_log_r{self.robot_id}_fine_tune"
         if self.mode == 'inference' and self.inference_mode == 'phase':
             return f"episode_log_r{self.robot_id}_phase{self.fixed_phase}"
         return f"episode_log_r{self.robot_id}"
@@ -648,6 +681,8 @@ class SimulationClient:
             rospy.logwarn(f"[LOG R{self.robot_id}] Failed to write episode row: {e}")
 
     def _spawn_phase_label(self) -> str:
+        if self.mode == 'fine_tune':
+            return str(self._fine_tune_spawn_phase)
         if self.mode != 'inference':
             return str(self.curriculum.phase)
         if self.inference_mode == 'free':
@@ -1037,6 +1072,56 @@ class SimulationClient:
 
         return True
 
+    GRIPPER_CTRL_REV = 2  # bump when gripper logic changes (check startup log on VM)
+
+    def _gripper_ns(self) -> str:
+        return '/ur3e_robot2' if self.robot_id == 2 else '/ur3e_robot1'
+
+    def _make_gripper_cmd(self, rACT=1, rGTO=1, rATR=0, rPR=0, rSP=255, rFR=150):
+        cmd = RobotiqOutput.Robotiq2FGripper_robot_output()
+        cmd.rACT = rACT
+        cmd.rGTO = rGTO
+        cmd.rATR = rATR
+        cmd.rPR  = rPR
+        cmd.rSP  = rSP
+        cmd.rFR  = rFR
+        return cmd
+
+    def _wait_gripper_subscriber(self, timeout: float = 5.0) -> bool:
+        """RTU node must be subscribed before Output messages take effect."""
+        if self._gripper_pub is None:
+            return False
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            if self._gripper_pub.get_num_connections() > 0:
+                return True
+            rospy.sleep(0.1)
+        return False
+
+    def _publish_gripper_cmd(self, rACT=1, rGTO=1, rATR=0, rPR=0, rSP=255, rFR=150,
+                             repeats: int = 15, period: float = 0.1):
+        """Stream gripper commands (Robotiq RTU needs repeated publishes, not a single msg)."""
+        if self._gripper_pub is None:
+            return
+        if not self._wait_gripper_subscriber(2.0):
+            rospy.logwarn(
+                f"[REAL] No subscriber on {self._gripper_ns()}/Robotiq2FGripperRobotOutput "
+                f"— is gripper_node running?"
+            )
+        for _ in range(repeats):
+            self._gripper_pub.publish(
+                self._make_gripper_cmd(rACT=rACT, rGTO=rGTO, rATR=rATR, rPR=rPR, rSP=rSP, rFR=rFR))
+            rospy.sleep(period)
+
+    def _log_gripper_status(self, label: str):
+        if self._gripper_status is None:
+            rospy.logwarn(f"[REAL] {label}: no gripper status (wrong namespace or node down?)")
+            return
+        s = self._gripper_status
+        rospy.loginfo(
+            f"[REAL] {label}: gSTA={s.gSTA} gFLT={s.gFLT} gOBJ={s.gOBJ} gPR={s.gPR} gPO={s.gPO}"
+        )
+
     def _init_robotiq_gripper(self):
         """Bootstraps Robotiq gripper communications over ROS."""
         self._gripper_ready  = False
@@ -1047,81 +1132,94 @@ class SimulationClient:
             rospy.logwarn("[REAL] Robotiq package not found — gripper stubbed.")
             return
 
-        ns = '/ur3_robot2' if self.robot_id == 2 else '/ur3_robot1'
-        
+        ns = self._gripper_ns()
+        out_topic = f'{ns}/Robotiq2FGripperRobotOutput'
+
         self._gripper_pub = rospy.Publisher(
-            f'{ns}/Robotiq2FGripperRobotOutput',
+            out_topic,
             RobotiqOutput.Robotiq2FGripper_robot_output,
             queue_size=10,
-            latch=True)   
+            latch=False)
 
         rospy.Subscriber(
             f'{ns}/Robotiq2FGripperRobotInput',
             RobotiqInput.Robotiq2FGripper_robot_input,
             self._gripper_status_cb)
 
+        rospy.loginfo(
+            f"[REAL] Gripper ctrl rev {self.GRIPPER_CTRL_REV} | pub {out_topic}"
+        )
+
         rospy.sleep(2.0)
-        rospy.loginfo("[REAL] Gripper publisher registered")
+        if not self._wait_gripper_subscriber(5.0):
+            rospy.logwarn("[REAL] gripper_node not subscribed yet — start it before grasping")
 
-        # Cycle Hardware Reset
-        rospy.loginfo("[REAL] Resetting gripper...")
-        cmd = RobotiqOutput.Robotiq2FGripper_robot_output()
-        cmd.rACT = 0
-        for _ in range(10):          
-            self._gripper_pub.publish(cmd)
-            rospy.sleep(0.1)
-        rospy.sleep(0.5)             
-
-        # Activate
-        rospy.loginfo("[REAL] Activating gripper...")
-        cmd.rACT = 1; cmd.rGTO = 1; cmd.rSP  = 255; cmd.rFR  = 150
-        for _ in range(10):          
-            self._gripper_pub.publish(cmd)
-            rospy.sleep(0.1)
-
-        # Confirm
-        deadline = time.time() + 8.0
-        while not self._gripper_ready and time.time() < deadline:
-            rospy.sleep(0.1)
-
-        if self._gripper_ready:
-            rospy.loginfo("[REAL] Robotiq 2F activated ✓")
-        else:
-            rospy.logwarn("[REAL] Gripper activation timed out.")
+        if self._gripper_status and self._gripper_status.gSTA == 3 and self._gripper_status.gFLT == 0:
             self._gripper_ready = True
+            rospy.loginfo("[REAL] Gripper already activated (gSTA=3)")
+            return
+
+        # Do not hardware-reset here — external gripper_node may already be active.
+        self._ensure_gripper_activated()
     
     def _gripper_status_cb(self, msg):
         """Updates internal status based on physical gripper feedback."""
         self._gripper_status = msg
-        if msg.gACT == 1 and msg.gSTA == 3:
+        if msg.gACT == 1 and msg.gSTA == 3 and msg.gFLT == 0:
             self._gripper_ready = True
+
+    def _ensure_gripper_activated(self):
+        """Re-activate if gSTA dropped below ready (common after e-stop or client restart)."""
+        if self._gripper_pub is None:
+            rospy.logwarn("[REAL] Gripper publisher missing — cannot activate")
+            return False
+        if self._gripper_status and self._gripper_status.gSTA == 3 and self._gripper_status.gFLT == 0:
+            self._gripper_ready = True
+            return True
+        rospy.loginfo("[REAL] Gripper not ready — streaming activate...")
+        self._publish_gripper_cmd(rACT=1, rGTO=1, rATR=0, rPR=0, rSP=255, rFR=150, repeats=30)
+        deadline = time.time() + 5.0
+        while time.time() < deadline:
+            if self._gripper_status and self._gripper_status.gSTA == 3 and self._gripper_status.gFLT == 0:
+                self._gripper_ready = True
+                rospy.loginfo("[REAL] Gripper activated ✓")
+                return True
+            rospy.sleep(0.1)
+        rospy.logwarn("[REAL] Gripper activate failed before grasp")
+        return False
 
     def _gripper_open(self):
         """Sends open command to the physical Robotiq gripper."""
-        if not getattr(self, '_gripper_ready', False) or self._gripper_pub is None:
+        if self._gripper_pub is None:
+            rospy.logwarn("[REAL] Gripper open skipped — no publisher")
             return
-        cmd = RobotiqOutput.Robotiq2FGripper_robot_output()
-        cmd.rACT = 1; cmd.rGTO = 1; cmd.rSP = 255; cmd.rFR = 150; cmd.rPR = 0
-        self._gripper_pub.publish(cmd)
-        rospy.sleep(1.0)
+        if not self._ensure_gripper_activated():
+            return
+        self._publish_gripper_cmd(rACT=1, rGTO=1, rATR=0, rPR=0, rSP=255, rFR=150, repeats=15)
+        rospy.sleep(0.5)
 
     def _gripper_close(self):
         """Sends close command to the physical Robotiq gripper."""
-        if not getattr(self, '_gripper_ready', False) or self._gripper_pub is None:
+        if self._gripper_pub is None:
+            rospy.logwarn("[REAL] Gripper close skipped — no publisher")
             return
-        cmd = RobotiqOutput.Robotiq2FGripper_robot_output()
-        cmd.rACT = 1; cmd.rGTO = 1; cmd.rSP = 255; cmd.rFR = 150; cmd.rPR = 255
-        self._gripper_pub.publish(cmd)
+        if not self._ensure_gripper_activated():
+            self._log_gripper_status("close aborted")
+            return
+        self._log_gripper_status("before close")
+        rospy.loginfo(
+            f"[REAL] Streaming close on {self._gripper_ns()}/Robotiq2FGripperRobotOutput "
+            f"(subs={self._gripper_pub.get_num_connections()})"
+        )
+        self._publish_gripper_cmd(rACT=1, rGTO=1, rATR=0, rPR=255, rSP=255, rFR=150, repeats=25)
         rospy.sleep(1.5)
+        self._log_gripper_status("after close")
 
     def _gripper_reactivate(self):
         """Ensures gripper logic is synced to physical state per episode."""
-        if not getattr(self, '_gripper_ready', False) or self._gripper_pub is None:
+        if self._gripper_pub is None:
             return
-        cmd = RobotiqOutput.Robotiq2FGripper_robot_output()
-        cmd.rACT = 1; cmd.rGTO = 1; cmd.rSP = 255; cmd.rFR = 150
-        self._gripper_pub.publish(cmd)
-        rospy.sleep(0.5)
+        self._ensure_gripper_activated()
 
     def _gripper_grasped(self) -> bool:
         """Determines grasp success from physical gripper feedback."""
@@ -1257,10 +1355,11 @@ class SimulationClient:
         self._send_real_joints(j_grasp_comp, duration_for(j_hover_comp, j_grasp_comp))
         rospy.sleep(0.5)
 
-        # Step 4: Actuate Gripper
+        # Step 4: Actuate Gripper (re-activate after long arm moves)
+        self._ensure_gripper_activated()
         rospy.loginfo("[REAL] → Closing gripper")
         self._gripper_close()
-        rospy.sleep(1.0)   
+        rospy.sleep(1.0)
 
         success = self._gripper_grasped()
         rospy.loginfo(f"[REAL] Grasp {'SUCCESS ✓' if success else 'FAIL ✗'}")
@@ -1597,19 +1696,32 @@ class SimulationClient:
                     dp = duck_node.getPosition()
                     obj_pos = [float(dp[0]), float(dp[2])]
 
+                train_payload = {
+                    'state':      current_state,
+                    'action':     network_action,
+                    'reward':     reward,
+                    'next_state': next_state,
+                    'done':       True,
+                    'mode':       mode,
+                    'object_pos': obj_pos,
+                }
+                if self.mode == 'fine_tune':
+                    spawn_x_log = self._episode_log_fields.get('spawn_x', '')
+                    spawn_z_log = self._episode_log_fields.get('spawn_z', '')
+                    train_payload.update({
+                        'spawn_phase':      self._fine_tune_spawn_phase,
+                        'spawn_x':          float(spawn_x_log) if spawn_x_log != '' else 0.0,
+                        'spawn_z':          float(spawn_z_log) if spawn_z_log != '' else 0.0,
+                        'quadrant':         self._fine_tune_spawn_quadrant,
+                        'demo_bucket':      self._fine_tune_demo_bucket,
+                        'spawn_collection': self._fine_tune_spawn_collection,
+                    })
+
                 self._send_message_to_host({
                     'type':     'training_data',
                     'source':   'simulation',
                     'robot_id': robot_id,
-                    'data': {
-                        'state':      current_state,
-                        'action':     network_action,
-                        'reward':     reward,
-                        'next_state': next_state,
-                        'done':       True,
-                        'mode':       mode,
-                        'object_pos': obj_pos,
-                    }
+                    'data':     train_payload,
                 })
 
             self._end_episode_and_restart(success)
@@ -2080,6 +2192,42 @@ class SimulationClient:
             hypothesis_id="C",
         )
 
+    def _spawn_fine_tune_position(self) -> Tuple[float, float, float, Optional[float]]:
+        """Spawn for targeted fine-tune: weak cell or full-grid normal demo."""
+        robot_id = self.robot_id
+        cx = self.curriculum.PLATFORM_CENTER_X
+        cz = self.curriculum.PLATFORM_CENTER_Z
+        half_x = getattr(self.curriculum, 'PLATFORM_HALF_SIZE_X', 0.143675)
+        half_z = getattr(self.curriculum, 'PLATFORM_HALF_SIZE_Z', 0.083675)
+        in_spawn = getattr(self.curriculum, '_in_spawn_area', None)
+
+        if np.random.random() < self._fine_tune_weak_spawn_p:
+            cell = pick_random_weak_cell(robot_id, self._fine_tune_weak_regions)
+            sx, sz, radius_m = sample_spawn_in_phase_quadrant(
+                cell['phase'], cell['quadrant'], cx, cz, half_x, half_z, in_spawn,
+            )
+            self._fine_tune_demo_bucket = 'weak'
+            self._fine_tune_spawn_phase = int(cell['phase'])
+            self._fine_tune_spawn_collection = 'weak_cell'
+            self._fine_tune_spawn_quadrant = quadrant_from_spawn(sx, sz, cx, cz)
+            print(
+                f"[FINE-TUNE R{robot_id}] WEAK spawn band={cell['phase']} "
+                f"Q{self._fine_tune_spawn_quadrant} ({sx:.3f}, {sz:.3f}) "
+                f"r={radius_m * 100:.1f}cm"
+            )
+            return sx, sz, radius_m * 100.0
+
+        sx, sz, radius_cm = self._sample_full_board_spawn()
+        self._fine_tune_demo_bucket = 'normal'
+        self._fine_tune_spawn_phase = CurriculumManager.FULL_BOARD_PHASE
+        self._fine_tune_spawn_collection = 'full_grid'
+        self._fine_tune_spawn_quadrant = quadrant_from_spawn(sx, sz, cx, cz)
+        print(
+            f"[FINE-TUNE R{robot_id}] NORMAL full-grid ({sx:.3f}, {sz:.3f}) "
+            f"Q{self._fine_tune_spawn_quadrant}"
+        )
+        return sx, sz, radius_cm
+
     def _spawn_object_at_curriculum_position(self):
         robot_id   = self.robot_id
         object_def = "TARGET_OBJECT2" if robot_id == 2 else "TARGET_OBJECT"
@@ -2100,7 +2248,12 @@ class SimulationClient:
                 return
 
             spawn_radius_cm = None
-            if self.mode == 'inference' and self.inference_mode == 'cycle':
+            if self.mode == 'fine_tune':
+                spawn_x, spawn_z, spawn_radius_cm = self._spawn_fine_tune_position()
+                self._episode_log_fields['spawn_quadrant'] = str(self._fine_tune_spawn_quadrant)
+                self._episode_log_fields['demo_bucket'] = self._fine_tune_demo_bucket
+                self._episode_log_fields['spawn_collection'] = self._fine_tune_spawn_collection
+            elif self.mode == 'inference' and self.inference_mode == 'cycle':
                 spawn_x, spawn_z, spawn_radius_cm = self._get_spawn_for_phase(self._cycle_phase)
             elif self.mode == 'inference' and self.inference_mode == 'phase':
                 spawn_x, spawn_z, spawn_radius_cm = self._get_spawn_for_phase(self.fixed_phase)
@@ -2108,6 +2261,9 @@ class SimulationClient:
                 spawn_x, _, spawn_z = self.curriculum.get_spawn_position()
 
             spawn_y = 0.461
+            if self.mode == 'fine_tune':
+                self._episode_log_fields['spawn_phase'] = str(self._fine_tune_spawn_phase)
+
             position_field = obj_node.getField("translation")
             if position_field:
                 position_field.setSFVec3f([spawn_x, spawn_y, spawn_z])
@@ -2181,7 +2337,7 @@ class SimulationClient:
         mode     = getattr(self, 'last_grasp_mode', 'explore')
         robot_id = self.robot_id
 
-        if self.mode != 'inference':
+        if self.mode == 'training':
             self.curriculum.record_result(success, mode)
             advanced = self.curriculum.check_phase_advance()
             if advanced:
@@ -2204,6 +2360,13 @@ class SimulationClient:
         status = "OK" if success else "FAIL"
         if self.mode == 'inference':
             print(f"[INFERENCE R{robot_id}] {status} Episode {self.episode_count} complete")
+        elif self.mode == 'fine_tune':
+            print(
+                f"[FINE-TUNE R{robot_id}] {status} Ep {self.episode_count} | "
+                f"bucket={self._fine_tune_demo_bucket} | "
+                f"band={self._fine_tune_spawn_phase} Q{self._fine_tune_spawn_quadrant} | "
+                f"grasp={mode}"
+            )
         else:
             ai_rate     = self.curriculum.get_ai_success_rate()
             ai_attempts = len(self.curriculum.ai_recent_results)
@@ -2377,7 +2540,9 @@ def main():
         formatter_class=argparse.RawTextHelpFormatter
     )
     parser.add_argument('--mode', type=str, default='training',
-                        help='training | inference')
+                        help='training | fine_tune | inference')
+    parser.add_argument('--fine-tune-config', type=str, default=None,
+                        help='Path to fine_tune_config.yaml (fine_tune mode only)')
     parser.add_argument('--episodes', type=int, default=None,
                         help='Max episodes to run (training). Omit for infinite.')
     parser.add_argument('--real', action='store_true',
@@ -2423,16 +2588,24 @@ def main():
     is_real = args.real or args.ros_camera
     mode = 'inference' if is_real else args.mode
 
+    if mode not in ('training', 'fine_tune', 'inference'):
+        parser.error("--mode must be training, fine_tune, or inference.")
+
     inf_flags = [args.cycle is not None, args.free, args.phase is not None]
     if sum(inf_flags) > 1:
         parser.error("Only one of --cycle, --free, --phase may be used at a time.")
     if any(inf_flags) and mode != 'inference':
         parser.error("--cycle / --free / --phase require --mode inference (or --real / --ros-camera).")
+    if mode == 'fine_tune' and any(inf_flags):
+        parser.error("fine_tune mode does not support --cycle / --free / --phase.")
     if args.cycle is None and (args.cycle_from != 0 or args.cycle_to != 5):
         parser.error("--cycle-from / --cycle-to require --cycle.")
 
     robot_id = args.robot_id
     print(f"[STARTUP] Launching as Robot {robot_id}")
+    if is_real:
+        print(f"[STARTUP] Gripper ctrl rev {SimulationClient.GRIPPER_CTRL_REV} "
+              f"(must match updated simulation_client.py on this machine)")
 
     if not is_real:
         webots_robot = "ur3e_robot2" if robot_id == 2 else "ur3e_robot"
@@ -2455,6 +2628,18 @@ def main():
         raise
 
     print(f"[STARTUP] SimulationClient ready (mode={mode})")
+
+    if mode == 'fine_tune' and args.fine_tune_config:
+        client._load_fine_tune_settings(args.fine_tune_config)
+
+    if mode == 'fine_tune':
+        cfg = client._fine_tune_cfg or {}
+        wr = cfg.get('sampling', {}).get('weak_ratio', 0.7)
+        nr = cfg.get('sampling', {}).get('normal_ratio', 0.3)
+        print(
+            f"[FINE-TUNE R{robot_id}] Targeted BC collection | "
+            f"batch mix {wr:.0%} weak / {nr:.0%} normal"
+        )
 
     if mode == 'inference':
         if args.cycle is not None:

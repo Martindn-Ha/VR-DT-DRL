@@ -1,5 +1,5 @@
 network:
-  host_ip: "127.0.0.1"   # GPU server on same PC (Part 5 Windows)
+  host_ip: "192.168.241.1"   # GPU server on same PC (Part 5 Windows)
   host_port: 8888
   vm_ip: "192.168.241.128"
   timeout: 30

@@ -13,16 +13,25 @@ import numpy as np
 import cv2
 import socket
 import json
+import sys
 import threading
 import time
 import yaml
 import base64
 import argparse
+import random
+import os
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 from collections import deque
 
 from enhanced_neural_network import UR3GraspCNN_Enhanced, BehaviorCloningModule, create_model, ImageProcessor
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent.parent
+sys.path.insert(0, str(_REPO_ROOT / "vm_simulation_system" / "src"))
+from spawn_geometry import load_fine_tune_config, classify_demo_bucket  # noqa: E402
+
+_PLATFORM_CENTER = {1: (-0.646, 0.841), 2: (-1.365, 0.850)}
 
 
 class GPUInferenceServer:
@@ -30,15 +39,54 @@ class GPUInferenceServer:
     Centralized inference and training server for multi-robot reinforcement 
     and behavior cloning systems.
     """
-    def __init__(self, config_path: str = "config/network_config.yaml", model_path: str = None):
+    def __init__(self, config_path: str = "config/network_config.yaml", model_path: str = None,
+                 model_path_r2: str = None, fine_tune: bool = False,
+                 fine_tune_config_path: str = None):
         self.config     = self._load_config(config_path)
         self.model_path = model_path
+        self.model_path_r2 = model_path_r2
+        self.fine_tune  = fine_tune
+        self.fine_tune_cfg: Dict = {}
+        self._weak_regions: Dict = {}
+        self._weak_ratio = 0.7
+        self._checkpoint_every = 100
+        self._save_path_r1 = "ur3_live_model_r1.pth"
+        self._save_path_r2 = "ur3_live_model_r2.pth"
+
+        if fine_tune:
+            ft_path = fine_tune_config_path or str(
+                Path(__file__).resolve().parent.parent / "config" / "fine_tune_config.yaml"
+            )
+            self.fine_tune_cfg = load_fine_tune_config(ft_path)
+            self._weak_regions = self.fine_tune_cfg['_weak_regions_parsed']
+            self._weak_ratio = float(self.fine_tune_cfg['sampling']['weak_ratio'])
+            self._checkpoint_every = int(
+                self.fine_tune_cfg.get('training', {}).get('checkpoint_every_steps', 100)
+            )
+            ckpt_cfg = self.fine_tune_cfg.get('checkpoints', {})
+            ft_root = Path(__file__).resolve().parent.parent
+            save_r1 = ckpt_cfg.get('save_r1', 'models/R1_BC_targeted_70weak_30normal.pth')
+            save_r2 = ckpt_cfg.get('save_r2', 'models/R2_BC_targeted_70weak_30normal.pth')
+            base_r1 = ckpt_cfg.get('base_r1', 'models/ur3_live_model_r1.pth')
+            base_r2 = ckpt_cfg.get('base_r2', 'models/ur3_live_model_r2.pth')
+            if not self.model_path:
+                self.model_path = self._resolve_fine_tune_load_path(
+                    ft_root, save_r1, base_r1, 'R1')
+            if not self.model_path_r2:
+                self.model_path_r2 = self._resolve_fine_tune_load_path(
+                    ft_root, save_r2, base_r2, 'R2')
+            self._save_path_r1 = Path(save_r1).name
+            self._save_path_r2 = Path(save_r2).name
 
         # =========================================================================
         # DEVICE & MODEL SETUP
         # =========================================================================
         self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
         model_config = self._load_model_config()
+        if fine_tune:
+            model_config['learning_rate'] = float(
+                self.fine_tune_cfg.get('training', {}).get('learning_rate', 1e-4)
+            )
 
         # Robot 1 — Intel D455 (Wider FOV)
         self.model,  self.bc_module,  self.image_processor  = create_model(model_config)
@@ -53,9 +101,17 @@ class GPUInferenceServer:
         # =========================================================================
         # TRAINING BUFFER & SCHEDULING
         # =========================================================================
-        self.batch_size           = 16
+        if fine_tune:
+            self.batch_size = int(self.fine_tune_cfg.get('training', {}).get('batch_size', 16))
+        else:
+            self.batch_size = 16
+
         self.data_buffer          = deque(maxlen=10000)   # Robot 1 Buffer
         self.data_buffer2         = deque(maxlen=10000)   # Robot 2 Buffer
+        self.weak_buffer          = deque(maxlen=10000)
+        self.normal_buffer        = deque(maxlen=10000)
+        self.weak_buffer2         = deque(maxlen=10000)
+        self.normal_buffer2       = deque(maxlen=10000)
         self.training_step_count  = 0
         self.training_step_count2 = 0
 
@@ -111,7 +167,7 @@ class GPUInferenceServer:
         # =========================================================================
         # Ensures all active robots complete their current episode before triggering
         # global domain randomizations (e.g., lighting, floor textures).
-        self._barrier_num_robots  = 1          # Set to 1 for single-robot deployments
+        self._barrier_num_robots  = 2          # Set to 1 for single-robot deployments
         self._barrier_ready_count = 0
         self._barrier_event       = threading.Event()
         self._barrier_lock        = threading.Lock()
@@ -151,6 +207,25 @@ class GPUInferenceServer:
             'weight_decay':      8e-4
         }
 
+    @staticmethod
+    def _resolve_fine_tune_load_path(
+        ft_root: Path, save_rel: str, base_rel: str, label: str
+    ) -> str:
+        """Prefer fine-tune checkpoint on restart; fall back to base BC weights on first run."""
+        save_path = ft_root / save_rel
+        base_path = ft_root / base_rel
+        if save_path.exists():
+            print(
+                f"[FINE-TUNE {label}] Resuming from {save_path.name} "
+                f"(training step restores from checkpoint)"
+            )
+            return save_rel
+        print(
+            f"[FINE-TUNE {label}] No fine-tune checkpoint yet — "
+            f"starting from base weights ({base_path.name})"
+        )
+        return base_rel
+
     def _load_model_weights(self):
         """Locates and restores checkpoint weights, handling partial mismatches."""
         script_dir = Path(__file__).resolve().parent
@@ -159,7 +234,7 @@ class GPUInferenceServer:
             if path_override:
                 path = Path(path_override)
                 if not path.is_absolute():
-                    path = script_dir / path
+                    path = script_dir.parent / path
             else:
                 path = script_dir.parent / "models" / default_name
                 if not path.exists():
@@ -197,7 +272,55 @@ class GPUInferenceServer:
         self.training_step_count  = _load(
             self.model,  self.bc_module,  self.model_path,  "ur3_live_model_r1.pth", None)
         self.training_step_count2 = _load(
-            self.model2, self.bc_module2, None,             "ur3_live_model_r2.pth", None)
+            self.model2, self.bc_module2, self.model_path_r2, "ur3_live_model_r2.pth", None)
+
+    def _sample_mixed_batch(self, weak_buf: deque, normal_buf: deque,
+                            batch_size: int, weak_ratio: float) -> Optional[List[Dict]]:
+        """Sample ~weak_ratio from weak_buf and remainder from normal_buf."""
+        if not weak_buf and not normal_buf:
+            return None
+
+        n_weak = int(round(batch_size * weak_ratio))
+        n_weak = max(0, min(n_weak, batch_size))
+        n_normal = batch_size - n_weak
+
+        weak_list = list(weak_buf)
+        normal_list = list(normal_buf)
+
+        batch: List[Dict] = []
+        if n_weak > 0 and weak_list:
+            batch.extend(random.choices(weak_list, k=n_weak))
+        elif n_weak > 0 and normal_list:
+            batch.extend(random.choices(normal_list, k=n_weak))
+
+        if n_normal > 0 and normal_list:
+            batch.extend(random.choices(normal_list, k=n_normal))
+        elif n_normal > 0 and weak_list:
+            batch.extend(random.choices(weak_list, k=n_normal))
+
+        if not batch:
+            return None
+        return batch
+
+    def _resolve_demo_bucket(self, training_data: Dict, robot_id: int) -> str:
+        bucket = training_data.get('demo_bucket')
+        if bucket in ('weak', 'normal'):
+            return bucket
+
+        spawn_x = float(training_data.get('spawn_x', 0.0))
+        spawn_z = float(training_data.get('spawn_z', 0.0))
+        spawn_phase = int(training_data.get('spawn_phase', 0))
+        spawn_collection = training_data.get('spawn_collection')
+        cx, cz = _PLATFORM_CENTER.get(robot_id, _PLATFORM_CENTER[1])
+        return classify_demo_bucket(
+            robot_id, spawn_phase, spawn_x, spawn_z, cx, cz,
+            self._weak_regions, spawn_collection=spawn_collection,
+        )
+
+    def _fine_tune_buffers_ready(self, robot_id: int) -> bool:
+        if robot_id == 2:
+            return (len(self.weak_buffer2) + len(self.normal_buffer2)) >= self.batch_size
+        return (len(self.weak_buffer) + len(self.normal_buffer)) >= self.batch_size
 
     # =========================================================================
     # DATA PROCESSING UTILITIES
@@ -319,7 +442,7 @@ class GPUInferenceServer:
             client_mode = full_message.get('mode', 'inference')
             robot_id    = int(full_message.get('robot_id', 1))
 
-            if client_mode == 'training':
+            if client_mode in ('training', 'fine_tune'):
                 return {
                     'type':      'grasp_prediction',
                     'mode':      'explore',
@@ -393,6 +516,28 @@ class GPUInferenceServer:
                 'robot_id':   robot_id,
             }
 
+            if self.fine_tune:
+                bucket = self._resolve_demo_bucket(training_data, robot_id)
+                sample['demo_bucket'] = bucket
+                if robot_id == 2:
+                    target = self.weak_buffer2 if bucket == 'weak' else self.normal_buffer2
+                else:
+                    target = self.weak_buffer if bucket == 'weak' else self.normal_buffer
+                target.append(sample)
+                if self._fine_tune_buffers_ready(robot_id):
+                    threading.Thread(
+                        target=self._run_training_step, args=(robot_id,), daemon=True
+                    ).start()
+                weak_n = len(self.weak_buffer2 if robot_id == 2 else self.weak_buffer)
+                normal_n = len(self.normal_buffer2 if robot_id == 2 else self.normal_buffer)
+                return {
+                    'type': 'training_ack',
+                    'buffer_len': weak_n + normal_n,
+                    'weak_len': weak_n,
+                    'normal_len': normal_n,
+                    'demo_bucket': bucket,
+                }
+
             if robot_id == 2:
                 self.data_buffer2.append(sample)
                 if len(self.data_buffer2) >= self.batch_size:
@@ -418,23 +563,34 @@ class GPUInferenceServer:
 
         with lock:
             try:
-                import random, os
                 if robot_id == 2:
                     bc_mod    = self.bc_module2
                     model     = self.model2
                     buf       = self.data_buffer2
+                    weak_buf  = self.weak_buffer2
+                    normal_buf = self.normal_buffer2
                     sched     = self.lr_scheduler2
                     step_attr = 'training_step_count2'
-                    save_name = "ur3_live_model_r2.pth"
+                    save_name = self._save_path_r2 if self.fine_tune else "ur3_live_model_r2.pth"
                 else:
                     bc_mod    = self.bc_module
                     model     = self.model
                     buf       = self.data_buffer
+                    weak_buf  = self.weak_buffer
+                    normal_buf = self.normal_buffer
                     sched     = self.lr_scheduler
                     step_attr = 'training_step_count'
-                    save_name = "ur3_live_model_r1.pth"
+                    save_name = self._save_path_r1 if self.fine_tune else "ur3_live_model_r1.pth"
 
-                batch_raw   = random.sample(list(buf), self.batch_size)
+                if self.fine_tune:
+                    batch_raw = self._sample_mixed_batch(
+                        weak_buf, normal_buf, self.batch_size, self._weak_ratio
+                    )
+                    if not batch_raw:
+                        return
+                else:
+                    batch_raw = random.sample(list(buf), self.batch_size)
+
                 torch_batch = self.format_batch_for_torch(batch_raw)
                 losses      = bc_mod.update_networks(torch_batch)
                 sched.step(losses['pose'])
@@ -443,6 +599,11 @@ class GPUInferenceServer:
                 setattr(self, step_attr, step)
 
                 if step % 5 == 0:
+                    buf_info = ""
+                    if self.fine_tune:
+                        buf_info = (
+                            f" | Buffers weak:{len(weak_buf)} normal:{len(normal_buf)}"
+                        )
                     print(
                         f"🔥 R{robot_id} Step {step:4d} | "
                         f"Loss: {losses['total']:.4f} "
@@ -450,9 +611,11 @@ class GPUInferenceServer:
                         f"Aux:{losses['aux']:.4f} "
                         f"Grasp:{losses['grasp']:.4f}[monitor only]) | "
                         f"GradNorm: {losses['grad_norm']:.3f}"
+                        f"{buf_info}"
                     )
 
-                if step % 100 == 0:
+                ckpt_every = self._checkpoint_every if self.fine_tune else 100
+                if step % ckpt_every == 0:
                     base_dir  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
                     save_dir  = os.path.join(base_dir, "models")
                     os.makedirs(save_dir, exist_ok=True)
@@ -462,6 +625,7 @@ class GPUInferenceServer:
                         'model_state_dict':     model.state_dict(),
                         'optimizer_state_dict': bc_mod.optimizer.state_dict(),
                         'training_step':        step,
+                        'fine_tune':            self.fine_tune,
                     }, full_path)
                     print(f"💾 R{robot_id} SAVED MODEL TO: {full_path}")
 
@@ -608,7 +772,14 @@ class GPUInferenceServer:
         
         self.server_socket.bind((host, port))
         self.server_socket.listen(5)
-        print(f"🚀 BC Server listening on {host}:{port} (behavior cloning mode)")
+        mode_label = "targeted fine-tune" if self.fine_tune else "behavior cloning"
+        print(f"🚀 BC Server listening on {host}:{port} ({mode_label} mode)")
+        if self.fine_tune:
+            print(
+                f"   Fine-tune sampling: {self._weak_ratio:.0%} weak / "
+                f"{1 - self._weak_ratio:.0%} normal | LR="
+                f"{self.fine_tune_cfg.get('training', {}).get('learning_rate', 1e-4)}"
+            )
         
         while True:
             conn, addr = self.server_socket.accept()
@@ -619,8 +790,20 @@ class GPUInferenceServer:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument('--model', type=str, default=None)
+    parser.add_argument('--model', type=str, default=None,
+                        help='Checkpoint path for R1 (base weights in fine-tune mode)')
+    parser.add_argument('--model-r2', type=str, default=None,
+                        help='Checkpoint path for R2 (base weights in fine-tune mode)')
+    parser.add_argument('--fine-tune', action='store_true',
+                        help='Targeted BC fine-tune with mixed weak/normal batch sampling')
+    parser.add_argument('--fine-tune-config', type=str, default=None,
+                        help='Path to fine_tune_config.yaml')
     args   = parser.parse_args()
     
-    server = GPUInferenceServer(model_path=args.model)
+    server = GPUInferenceServer(
+        model_path=args.model,
+        model_path_r2=args.model_r2,
+        fine_tune=args.fine_tune,
+        fine_tune_config_path=args.fine_tune_config,
+    )
     server.start_server()
