@@ -21,17 +21,30 @@ import base64
 import argparse
 import random
 import os
+import math
+import csv
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Tuple, Optional
 from collections import deque
 
-from enhanced_neural_network import UR3GraspCNN_Enhanced, BehaviorCloningModule, create_model, ImageProcessor
+from enhanced_neural_network import (
+    UR3GraspCNN_Enhanced, BehaviorCloningModule, LocalizationModule, TD3Module,
+    create_model, create_td3_module, ImageProcessor,
+)
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "vm_simulation_system" / "src"))
-from spawn_geometry import load_fine_tune_config, classify_demo_bucket  # noqa: E402
+from spawn_geometry import load_fine_tune_config, load_locator_train_config, classify_demo_bucket  # noqa: E402
+from rl_reward import load_rl_train_config, get_robot_rl_config, exploration_noise_scale  # noqa: E402
+from grasp_geometry import compute_grasp_pose_from_object_world, local_xz_to_world, DEFAULT_OBJECT_Y_M  # noqa: E402
 
 _PLATFORM_CENTER = {1: (-0.646, 0.841), 2: (-1.365, 0.850)}
+
+LOCATOR_STEP_CSV_FIELDS = [
+    'timestamp_utc', 'robot_id', 'loc_step', 'aux_loss', 'grad_norm',
+    'buffer_weak', 'buffer_normal', 'batch_weak', 'batch_normal', 'checkpoint_saved',
+]
 
 
 class GPUInferenceServer:
@@ -41,17 +54,47 @@ class GPUInferenceServer:
     """
     def __init__(self, config_path: str = "config/network_config.yaml", model_path: str = None,
                  model_path_r2: str = None, fine_tune: bool = False,
-                 fine_tune_config_path: str = None):
+                 fine_tune_config_path: str = None,
+                 locator_train: bool = False,
+                 locator_config_path: str = None,
+                 geo_grasp: bool = False,
+                 rl_train: bool = False, rl_train_config_path: str = None,
+                 rl_residual_r1: str = None, rl_residual_r2: str = None):
         self.config     = self._load_config(config_path)
         self.model_path = model_path
         self.model_path_r2 = model_path_r2
         self.fine_tune  = fine_tune
+        self.locator_train = locator_train
+        self.geo_grasp  = geo_grasp
+        self.rl_train   = rl_train
         self.fine_tune_cfg: Dict = {}
+        self.locator_cfg: Dict = {}
+        self.rl_cfg: Dict = {}
+        self._rl_robot_cfg: Dict[int, Dict] = {1: {}, 2: {}}
+        self.td3_module: Optional[TD3Module] = None
+        self.td3_module2: Optional[TD3Module] = None
         self._weak_regions: Dict = {}
         self._weak_ratio = 0.7
         self._checkpoint_every = 100
         self._save_path_r1 = "ur3_live_model_r1.pth"
         self._save_path_r2 = "ur3_live_model_r2.pth"
+        self._save_path_r1_rl = "R1_RL_residual.pth"
+        self._save_path_r2_rl = "R2_RL_residual.pth"
+        self._rl_checkpoint_every = 100
+
+        if rl_train:
+            rl_path = rl_train_config_path or str(
+                Path(__file__).resolve().parent.parent / "config" / "rl_train_config.yaml"
+            )
+            self.rl_cfg = load_rl_train_config(rl_path)
+            self._rl_robot_cfg[1] = get_robot_rl_config(self.rl_cfg, 1)
+            self._rl_robot_cfg[2] = get_robot_rl_config(self.rl_cfg, 2)
+            self._rl_checkpoint_every = int(
+                self.rl_cfg.get('training', {}).get('checkpoint_every_steps', 100)
+            )
+            ckpt = self.rl_cfg.get('checkpoints', {})
+            self._save_path_r1_rl = Path(ckpt.get('save_r1', self._save_path_r1_rl)).name
+            self._save_path_r2_rl = Path(ckpt.get('save_r2', self._save_path_r2_rl)).name
 
         if fine_tune:
             ft_path = fine_tune_config_path or str(
@@ -78,6 +121,37 @@ class GPUInferenceServer:
             self._save_path_r1 = Path(save_r1).name
             self._save_path_r2 = Path(save_r2).name
 
+        if locator_train:
+            loc_path = locator_config_path or str(
+                Path(__file__).resolve().parent.parent / "config" / "locator_train_config.yaml"
+            )
+            self.locator_cfg = load_locator_train_config(loc_path)
+            self._weak_regions = self.locator_cfg['_weak_regions_parsed']
+            self._weak_ratio = float(self.locator_cfg['sampling']['weak_ratio'])
+            self._checkpoint_every = int(
+                self.locator_cfg.get('training', {}).get('checkpoint_every_steps', 100)
+            )
+            ckpt_cfg = self.locator_cfg.get('checkpoints', {})
+            loc_root = Path(__file__).resolve().parent.parent
+            save_r1 = ckpt_cfg.get('save_r1', 'models/R1_locator.pth')
+            save_r2 = ckpt_cfg.get('save_r2', 'models/R2_locator.pth')
+            base_r1 = ckpt_cfg.get('base_r1', 'models/ur3_live_model_r1.pth')
+            base_r2 = ckpt_cfg.get('base_r2', 'models/ur3_live_model_r2.pth')
+            if not self.model_path:
+                self.model_path = self._resolve_fine_tune_load_path(
+                    loc_root, save_r1, base_r1, 'R1 locator')
+            if not self.model_path_r2:
+                self.model_path_r2 = self._resolve_fine_tune_load_path(
+                    loc_root, save_r2, base_r2, 'R2 locator')
+            self._save_path_r1 = Path(save_r1).name
+            self._save_path_r2 = Path(save_r2).name
+
+        if geo_grasp and not locator_train and not fine_tune and not rl_train:
+            if not self.model_path:
+                self.model_path = "models/R1_locator.pth"
+            if not self.model_path_r2:
+                self.model_path_r2 = "models/R2_locator.pth"
+
         # =========================================================================
         # DEVICE & MODEL SETUP
         # =========================================================================
@@ -86,6 +160,10 @@ class GPUInferenceServer:
         if fine_tune:
             model_config['learning_rate'] = float(
                 self.fine_tune_cfg.get('training', {}).get('learning_rate', 1e-4)
+            )
+        if locator_train:
+            model_config['learning_rate'] = float(
+                self.locator_cfg.get('training', {}).get('learning_rate', 1e-4)
             )
 
         # Robot 1 — Intel D455 (Wider FOV)
@@ -103,11 +181,21 @@ class GPUInferenceServer:
         # =========================================================================
         if fine_tune:
             self.batch_size = int(self.fine_tune_cfg.get('training', {}).get('batch_size', 16))
+        elif locator_train:
+            self.batch_size = int(self.locator_cfg.get('training', {}).get('batch_size', 16))
+        elif rl_train:
+            self.batch_size = int(self.rl_cfg.get('training', {}).get('batch_size', 16))
         else:
             self.batch_size = 16
 
-        self.data_buffer          = deque(maxlen=10000)   # Robot 1 Buffer
-        self.data_buffer2         = deque(maxlen=10000)   # Robot 2 Buffer
+        buf_cap = 10000
+        if rl_train:
+            buf_cap = int(self.rl_cfg.get('training', {}).get('buffer_capacity', 10000))
+
+        self.data_buffer          = deque(maxlen=buf_cap)   # Robot 1 Buffer
+        self.data_buffer2         = deque(maxlen=buf_cap)   # Robot 2 Buffer
+        self.rl_buffer            = deque(maxlen=buf_cap)
+        self.rl_buffer2           = deque(maxlen=buf_cap)
         self.weak_buffer          = deque(maxlen=10000)
         self.normal_buffer        = deque(maxlen=10000)
         self.weak_buffer2         = deque(maxlen=10000)
@@ -117,6 +205,33 @@ class GPUInferenceServer:
 
         self._load_model_weights()
 
+        self.loc_module: Optional[LocalizationModule] = None
+        self.loc_module2: Optional[LocalizationModule] = None
+        if locator_train:
+            loc_lr = float(self.locator_cfg.get('training', {}).get('learning_rate', 1e-4))
+            loc_wd = float(model_config.get('weight_decay', 8e-4))
+            self.loc_module = LocalizationModule(
+                self.model, learning_rate=loc_lr, weight_decay=loc_wd,
+            ).to(self.device)
+            self.loc_module2 = LocalizationModule(
+                self.model2, learning_rate=loc_lr, weight_decay=loc_wd,
+            ).to(self.device)
+            self._load_locator_optimizer_state()
+
+        if rl_train or rl_residual_r1 or rl_residual_r2:
+            if not self.rl_cfg:
+                self._load_rl_config(rl_train_config_path)
+            lr = float(self._rl_robot_cfg[1].get('td3', {}).get('learning_rate', 3e-4))
+            self.td3_module = create_td3_module(
+                self.model, self._rl_robot_cfg[1], learning_rate=lr,
+            ).to(self.device)
+            self.td3_module2 = create_td3_module(
+                self.model2, self._rl_robot_cfg[2], learning_rate=lr,
+            ).to(self.device)
+            self.rl_training_step_count  = 0
+            self.rl_training_step_count2 = 0
+            self._load_rl_weights(rl_residual_r1, rl_residual_r2)
+
         self.lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
             self.bc_module.optimizer,
             mode='min', factor=0.5, patience=50, min_lr=1e-5
@@ -125,6 +240,17 @@ class GPUInferenceServer:
             self.bc_module2.optimizer,
             mode='min', factor=0.5, patience=50, min_lr=1e-5
         )
+        self.loc_lr_scheduler = None
+        self.loc_lr_scheduler2 = None
+        if locator_train and self.loc_module is not None:
+            self.loc_lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                self.loc_module.optimizer,
+                mode='min', factor=0.5, patience=50, min_lr=1e-5
+            )
+            self.loc_lr_scheduler2 = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                self.loc_module2.optimizer,
+                mode='min', factor=0.5, patience=50, min_lr=1e-5
+            )
 
         # =========================================================================
         # VISION PREPROCESSING CONFIGURATION
@@ -186,6 +312,7 @@ class GPUInferenceServer:
         self.client_connections = []
         self.train_lock         = threading.Lock()
         self.train_lock2        = threading.Lock()
+        self._locator_step_log_lock = threading.Lock()
 
     def _load_config(self, config_path: str) -> Dict:
         """Loads server network configuration."""
@@ -226,19 +353,45 @@ class GPUInferenceServer:
         )
         return base_rel
 
+    @staticmethod
+    def _resolve_checkpoint_path(path_override: Optional[str], default_name: str) -> Path:
+        """
+        Resolve a checkpoint path relative to host_gpu_system/, repo root, or cwd.
+
+        Accepts ``models/R1_locator.pth`` (under host_gpu_system) or
+        ``host_gpu_system/models/...`` when launched from the repo root.
+        """
+        host_root = Path(__file__).resolve().parent.parent
+        repo_root = host_root.parent
+
+        if path_override:
+            raw = Path(path_override)
+            if raw.is_absolute():
+                return raw
+            candidates: List[Path] = []
+            if raw.exists():
+                candidates.append(raw.resolve())
+            parts = raw.parts
+            if parts and parts[0].lower() == "host_gpu_system":
+                candidates.append(host_root.joinpath(*parts[1:]))
+            candidates.append(host_root / raw)
+            candidates.append(repo_root / raw)
+            for candidate in candidates:
+                if candidate.exists():
+                    return candidate.resolve()
+            return (host_root / raw).resolve()
+
+        for name in (default_name, "ur3_model.pth"):
+            path = host_root / "models" / name
+            if path.exists():
+                return path.resolve()
+        return (host_root / "models" / default_name).resolve()
+
     def _load_model_weights(self):
         """Locates and restores checkpoint weights, handling partial mismatches."""
-        script_dir = Path(__file__).resolve().parent
 
         def _load(model, bc_module, path_override, default_name, step_attr):
-            if path_override:
-                path = Path(path_override)
-                if not path.is_absolute():
-                    path = script_dir.parent / path
-            else:
-                path = script_dir.parent / "models" / default_name
-                if not path.exists():
-                    path = script_dir.parent / "models" / "ur3_model.pth"
+            path = self._resolve_checkpoint_path(path_override, default_name)
 
             print(f"🔍 Looking for weights at: {path.resolve()}")
             if path.exists():
@@ -273,6 +426,252 @@ class GPUInferenceServer:
             self.model,  self.bc_module,  self.model_path,  "ur3_live_model_r1.pth", None)
         self.training_step_count2 = _load(
             self.model2, self.bc_module2, self.model_path_r2, "ur3_live_model_r2.pth", None)
+
+    def _load_locator_optimizer_state(self):
+        """Restore locator optimizers from the same checkpoint paths as the model."""
+
+        def _load_one(loc_mod, path_override, default_name):
+            if not loc_mod:
+                return
+            path = self._resolve_checkpoint_path(path_override, default_name)
+            if path.exists():
+                try:
+                    loc_mod.load_model(str(path))
+                except Exception as e:
+                    print(f"   ↳ Locator optimizer not restored from {path.name}: {e}")
+
+        _load_one(self.loc_module, self.model_path, "R1_locator.pth")
+        _load_one(self.loc_module2, self.model_path_r2, "R2_locator.pth")
+
+    def _load_rl_config(self, rl_train_config_path: Optional[str] = None):
+        rl_path = rl_train_config_path or str(
+            Path(__file__).resolve().parent.parent / "config" / "rl_train_config.yaml"
+        )
+        self.rl_cfg = load_rl_train_config(rl_path)
+        self._rl_robot_cfg[1] = get_robot_rl_config(self.rl_cfg, 1)
+        self._rl_robot_cfg[2] = get_robot_rl_config(self.rl_cfg, 2)
+
+    def _load_rl_weights(self, path_r1: Optional[str] = None, path_r2: Optional[str] = None):
+        """Load TD3 residual checkpoints (separate from BC weights)."""
+        models_dir = Path(__file__).resolve().parent.parent / "models"
+
+        def _resolve(path_override: Optional[str], default_name: str) -> Path:
+            if path_override:
+                p = Path(path_override)
+                if not p.is_absolute():
+                    p = models_dir / p
+                return p
+            return models_dir / default_name
+
+        def _load_one(td3: Optional[TD3Module], path: Path, step_attr: str):
+            if td3 is None:
+                return
+            print(f"🔍 Looking for RL residual at: {path.resolve()}")
+            if path.exists():
+                step = td3.load_model(str(path))
+                setattr(self, step_attr, step)
+                print(f"✅ Loaded RL residual: {path.name}  (step {step})")
+            elif self.rl_train:
+                print(f"   ↳ No RL checkpoint yet — starting fresh residual (TD3)")
+
+        _load_one(self.td3_module, _resolve(path_r1, self._save_path_r1_rl), 'rl_training_step_count')
+        _load_one(self.td3_module2, _resolve(path_r2, self._save_path_r2_rl), 'rl_training_step_count2')
+
+    def _predict_grasp_pose(self, full_message: Dict) -> Dict:
+        """BC pose + optional residual delta (RL train or inference with use_residual)."""
+        client_mode = full_message.get('mode', 'inference')
+        robot_id    = int(full_message.get('robot_id', 1))
+        use_residual = bool(full_message.get('use_residual', False))
+        add_exploration = (client_mode == 'rl_train')
+
+        is_sim      = full_message.get('source', 'real') == 'simulation'
+        camera_data = full_message['data']
+        rgbd_tensor = self.preprocess_rgbd_data(
+            camera_data, is_simulation=is_sim, robot_id=robot_id
+        )
+
+        active_model = self.model2 if robot_id == 2 else self.model
+        td3_mod      = self.td3_module2 if robot_id == 2 else self.td3_module
+        active_model.eval()
+
+        with torch.no_grad():
+            prediction = active_model(rgbd_tensor)
+            grasp_pose = prediction['pose_6dof'].cpu().numpy()[0].copy()
+
+        base_x = self._robot2_base_x if robot_id == 2 else self._robot1_base_x
+        bc_pose = grasp_pose.copy()
+        bc_pose[0] += base_x
+        bc_pose[2] += self._robot_base_z
+        bc_pose[3] = 3.14
+        bc_pose[4] = 0.0
+
+        delta = [0.0, 0.0, 0.0]
+        apply_residual = td3_mod is not None and (
+            add_exploration or use_residual
+        )
+        if apply_residual:
+            expl_noise = None
+            if add_exploration:
+                rcfg = self._rl_robot_cfg.get(robot_id, {})
+                td3_cfg = rcfg.get('td3', {})
+                session_ep = max(1, int(full_message.get('session_episode', 1)))
+                noise_scale = exploration_noise_scale(td3_cfg, session_ep)
+                limits = td3_mod.max_delta.to(self.device)
+                expl_noise = torch.randn(1, 3, device=self.device) * noise_scale * limits
+            with torch.no_grad():
+                delta_t = td3_mod.select_delta(rgbd_tensor, exploration_noise=expl_noise)
+            delta = delta_t.detach().cpu().numpy()[0].tolist()
+
+        final_pose = bc_pose.copy()
+        final_pose[0] += delta[0]
+        final_pose[2] += delta[1]
+        final_pose[5] += delta[2]
+
+        return {
+            'type':       'grasp_prediction',
+            'pose':       final_pose.tolist(),
+            'bc_pose':    bc_pose.tolist(),
+            'delta':      delta,
+            'mode':       'exploit',
+            'confidence': 1.0,
+            'timestamp':  time.time(),
+        }
+
+    def _predict_object_xz(self, state: Dict, robot_id: int, is_sim: bool,
+                           label_xz: Optional[List[float]] = None) -> Dict:
+        """CNN aux_position -> world X/Z (optional error vs label)."""
+        rgbd_tensor = self.preprocess_rgbd_data(state, is_simulation=is_sim, robot_id=robot_id)
+        active_model = self.model2 if robot_id == 2 else self.model
+        was_training = active_model.training
+        active_model.eval()
+        try:
+            with torch.no_grad():
+                local_xz = active_model(rgbd_tensor)['aux_position'].cpu().numpy()[0]
+        finally:
+            if was_training:
+                active_model.train()
+
+        world_x, _, world_z = local_xz_to_world(
+            float(local_xz[0]), float(local_xz[1]), robot_id,
+            obj_y=DEFAULT_OBJECT_Y_M,
+        )
+        result = {
+            'pred_obj_x':   float(world_x),
+            'pred_obj_z':   float(world_z),
+            'pred_local_x': float(local_xz[0]),
+            'pred_local_z': float(local_xz[1]),
+        }
+        if label_xz is not None and len(label_xz) >= 2:
+            result['locator_err_m'] = math.hypot(
+                world_x - float(label_xz[0]), world_z - float(label_xz[1]),
+            )
+        return result
+
+    def _append_locator_step_log(self, robot_id: int, row: Dict) -> None:
+        path = _REPO_ROOT / "data" / f"locator_train_steps_r{robot_id}.csv"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with self._locator_step_log_lock:
+            write_header = not path.exists()
+            with open(path, 'a', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=LOCATOR_STEP_CSV_FIELDS)
+                if write_header:
+                    writer.writeheader()
+                writer.writerow({k: row.get(k, '') for k in LOCATOR_STEP_CSV_FIELDS})
+
+    def _predict_geo_grasp_pose(self, full_message: Dict) -> Dict:
+        """CNN aux_position -> analytic grasp geometry (no supervisor)."""
+        robot_id    = int(full_message.get('robot_id', 1))
+        is_sim      = full_message.get('source', 'real') == 'simulation'
+        camera_data = full_message['data']
+
+        pred = self._predict_object_xz(camera_data, robot_id, is_sim)
+        grasp_pose = compute_grasp_pose_from_object_world(
+            pred['pred_obj_x'], DEFAULT_OBJECT_Y_M, pred['pred_obj_z'],
+            robot_id, add_jitter=False,
+        )
+
+        return {
+            'type':        'grasp_prediction',
+            'pose':        grasp_pose,
+            'mode':        'exploit_geo',
+            'pred_obj_x':  pred['pred_obj_x'],
+            'pred_obj_z':  pred['pred_obj_z'],
+            'pred_local_x': pred['pred_local_x'],
+            'pred_local_z': pred['pred_local_z'],
+            'confidence':  1.0,
+            'timestamp':   time.time(),
+        }
+
+    def format_rl_batch_for_torch(self, batch: List[Dict], robot_id: int) -> Dict[str, torch.Tensor]:
+        states_list  = []
+        actions_list = []
+        rewards_list = []
+        dones_list   = []
+
+        for exp in batch:
+            is_sim = exp.get('source', 'real') == 'simulation'
+            states_list.append(
+                self.preprocess_rgbd_data(exp['state'], is_simulation=is_sim, robot_id=robot_id)
+            )
+            d_raw = exp.get('delta', exp.get('action', [0.0, 0.0, 0.0]))
+            actions_list.append(torch.tensor(d_raw[:3], dtype=torch.float32))
+            rewards_list.append(torch.tensor(float(exp['reward']), dtype=torch.float32))
+            dones_list.append(torch.tensor(1.0, dtype=torch.float32))
+
+        return {
+            'states':  torch.cat(states_list).to(self.device),
+            'actions': torch.stack(actions_list).to(self.device),
+            'rewards': torch.stack(rewards_list).to(self.device),
+            'dones':   torch.stack(dones_list).to(self.device),
+        }
+
+    def _run_rl_training_step(self, robot_id: int = 1):
+        lock = self.train_lock if robot_id == 1 else self.train_lock2
+        if lock.locked():
+            return
+
+        with lock:
+            try:
+                if robot_id == 2:
+                    td3_mod   = self.td3_module2
+                    buf       = self.rl_buffer2
+                    step_attr = 'rl_training_step_count2'
+                    save_name = self._save_path_r2_rl
+                else:
+                    td3_mod   = self.td3_module
+                    buf       = self.rl_buffer
+                    step_attr = 'rl_training_step_count'
+                    save_name = self._save_path_r1_rl
+
+                if td3_mod is None or len(buf) < self.batch_size:
+                    return
+
+                batch_raw   = random.sample(list(buf), self.batch_size)
+                torch_batch = self.format_rl_batch_for_torch(batch_raw, robot_id)
+                losses      = td3_mod.update_networks(torch_batch)
+
+                step = getattr(self, step_attr, 0) + 1
+                setattr(self, step_attr, step)
+
+                if step % 5 == 0:
+                    print(
+                        f"🎯 R{robot_id} RL Step {step:4d} | "
+                        f"Loss: {losses['total']:.4f} "
+                        f"(Critic:{losses['critic']:.4f} Actor:{losses['actor']:.4f}) | "
+                        f"Buffer:{len(buf)}"
+                    )
+
+                if step % self._rl_checkpoint_every == 0:
+                    base_dir = Path(__file__).resolve().parent.parent / "models"
+                    base_dir.mkdir(parents=True, exist_ok=True)
+                    full_path = base_dir / save_name
+                    td3_mod.save_model(str(full_path), training_step=step)
+                    print(f"💾 R{robot_id} SAVED RL RESIDUAL TO: {full_path}")
+
+            except Exception as e:
+                print(f"❌ CRITICAL RL TRAINING ERROR (R{robot_id}): {e}")
+                import traceback
+                traceback.print_exc()
 
     def _sample_mixed_batch(self, weak_buf: deque, normal_buf: deque,
                             batch_size: int, weak_ratio: float) -> Optional[List[Dict]]:
@@ -442,13 +841,26 @@ class GPUInferenceServer:
             client_mode = full_message.get('mode', 'inference')
             robot_id    = int(full_message.get('robot_id', 1))
 
-            if client_mode in ('training', 'fine_tune'):
+            if client_mode in ('training', 'fine_tune', 'locator_train'):
                 return {
                     'type':      'grasp_prediction',
                     'mode':      'explore',
-                    'pose':      [0.0] * 6,   
+                    'pose':      [0.0] * 6,
                     'timestamp': time.time()
                 }
+
+            use_geo = self.geo_grasp or bool(full_message.get('use_geo_grasp', False))
+            if use_geo:
+                return self._predict_geo_grasp_pose(full_message)
+
+            use_residual = bool(full_message.get('use_residual', False))
+            if client_mode == 'rl_train' or use_residual:
+                if self.td3_module is None and self.td3_module2 is None:
+                    return {
+                        'type': 'error',
+                        'message': 'RL residual not loaded — start gpu_server with --rl-train or --rl-residual-r1/r2',
+                    }
+                return self._predict_grasp_pose(full_message)
 
             is_sim      = full_message.get('source', 'real') == 'simulation'
             camera_data = full_message['data']
@@ -462,12 +874,9 @@ class GPUInferenceServer:
                 prediction = active_model(rgbd_tensor)
                 grasp_pose = prediction['pose_6dof'].cpu().numpy()[0]
 
-            # Convert local-frame prediction back to world coordinates
             base_x = self._robot2_base_x if robot_id == 2 else self._robot1_base_x
             grasp_pose[0] += base_x
             grasp_pose[2] += self._robot_base_z
-
-            # Force tool-down orientation
             grasp_pose[3] = 3.14
             grasp_pose[4] = 0.0
 
@@ -516,7 +925,39 @@ class GPUInferenceServer:
                 'robot_id':   robot_id,
             }
 
-            if self.fine_tune:
+            if self.rl_train:
+                sample['delta'] = training_data.get(
+                    'delta', training_data.get('residual_delta', [0.0, 0.0, 0.0])
+                )
+                skip_clamp = bool(
+                    self.rl_cfg.get('training', {}).get('skip_buffer_when_clamp_limited', False)
+                )
+                clamp_limited = bool(training_data.get('clamp_limited', False))
+                if skip_clamp and clamp_limited:
+                    target_buf = self.rl_buffer2 if robot_id == 2 else self.rl_buffer
+                    print(
+                        f"[RL R{robot_id}] Skip replay (clamp_limited) | "
+                        f"buffer={len(target_buf)} session_ep={training_data.get('session_episode', '?')}"
+                    )
+                    return {
+                        'type': 'training_ack',
+                        'buffer_len': len(target_buf),
+                        'rl': True,
+                        'skipped': True,
+                    }
+                target_buf = self.rl_buffer2 if robot_id == 2 else self.rl_buffer
+                target_buf.append(sample)
+                if len(target_buf) >= self.batch_size:
+                    threading.Thread(
+                        target=self._run_rl_training_step, args=(robot_id,), daemon=True
+                    ).start()
+                return {
+                    'type': 'training_ack',
+                    'buffer_len': len(target_buf),
+                    'rl': True,
+                }
+
+            if self.fine_tune or self.locator_train:
                 bucket = self._resolve_demo_bucket(training_data, robot_id)
                 sample['demo_bucket'] = bucket
                 if robot_id == 2:
@@ -530,13 +971,26 @@ class GPUInferenceServer:
                     ).start()
                 weak_n = len(self.weak_buffer2 if robot_id == 2 else self.weak_buffer)
                 normal_n = len(self.normal_buffer2 if robot_id == 2 else self.normal_buffer)
-                return {
+                ack = {
                     'type': 'training_ack',
                     'buffer_len': weak_n + normal_n,
                     'weak_len': weak_n,
                     'normal_len': normal_n,
                     'demo_bucket': bucket,
+                    'locator': self.locator_train,
                 }
+                if self.locator_train:
+                    obj_pos = training_data.get('object_pos', [0.0, 0.0])
+                    loc_step = (
+                        self.training_step_count2 if robot_id == 2 else self.training_step_count
+                    )
+                    pred_info = self._predict_object_xz(
+                        training_data['state'], robot_id, source == 'simulation',
+                        label_xz=obj_pos,
+                    )
+                    ack.update(pred_info)
+                    ack['loc_step'] = loc_step
+                return ack
 
             if robot_id == 2:
                 self.data_buffer2.append(sample)
@@ -565,24 +1019,38 @@ class GPUInferenceServer:
             try:
                 if robot_id == 2:
                     bc_mod    = self.bc_module2
+                    loc_mod   = self.loc_module2
                     model     = self.model2
                     buf       = self.data_buffer2
                     weak_buf  = self.weak_buffer2
                     normal_buf = self.normal_buffer2
-                    sched     = self.lr_scheduler2
+                    sched     = self.loc_lr_scheduler2 if self.locator_train else self.lr_scheduler2
                     step_attr = 'training_step_count2'
-                    save_name = self._save_path_r2 if self.fine_tune else "ur3_live_model_r2.pth"
+                    if self.locator_train:
+                        save_name = self._save_path_r2
+                    elif self.fine_tune:
+                        save_name = self._save_path_r2
+                    else:
+                        save_name = "ur3_live_model_r2.pth"
                 else:
                     bc_mod    = self.bc_module
+                    loc_mod   = self.loc_module
                     model     = self.model
                     buf       = self.data_buffer
                     weak_buf  = self.weak_buffer
                     normal_buf = self.normal_buffer
-                    sched     = self.lr_scheduler
+                    sched     = self.loc_lr_scheduler if self.locator_train else self.lr_scheduler
                     step_attr = 'training_step_count'
-                    save_name = self._save_path_r1 if self.fine_tune else "ur3_live_model_r1.pth"
+                    if self.locator_train:
+                        save_name = self._save_path_r1
+                    elif self.fine_tune:
+                        save_name = self._save_path_r1
+                    else:
+                        save_name = "ur3_live_model_r1.pth"
 
-                if self.fine_tune:
+                train_mod = loc_mod if self.locator_train else bc_mod
+
+                if self.fine_tune or self.locator_train:
                     batch_raw = self._sample_mixed_batch(
                         weak_buf, normal_buf, self.batch_size, self._weak_ratio
                     )
@@ -592,20 +1060,41 @@ class GPUInferenceServer:
                     batch_raw = random.sample(list(buf), self.batch_size)
 
                 torch_batch = self.format_batch_for_torch(batch_raw)
-                losses      = bc_mod.update_networks(torch_batch)
-                sched.step(losses['pose'])
+                losses      = train_mod.update_networks(torch_batch)
+                sched_metric = losses['aux'] if self.locator_train else losses['pose']
+                sched.step(sched_metric)
                 
                 step = getattr(self, step_attr) + 1
                 setattr(self, step_attr, step)
 
+                ckpt_every = self._checkpoint_every if (self.fine_tune or self.locator_train) else 100
+                checkpoint_saved = int(step % ckpt_every == 0)
+
+                if self.locator_train:
+                    batch_weak = sum(1 for s in batch_raw if s.get('demo_bucket') == 'weak')
+                    batch_normal = len(batch_raw) - batch_weak
+                    self._append_locator_step_log(robot_id, {
+                        'timestamp_utc': datetime.now(timezone.utc).isoformat(),
+                        'robot_id': robot_id,
+                        'loc_step': step,
+                        'aux_loss': losses['aux'],
+                        'grad_norm': losses['grad_norm'],
+                        'buffer_weak': len(weak_buf),
+                        'buffer_normal': len(normal_buf),
+                        'batch_weak': batch_weak,
+                        'batch_normal': batch_normal,
+                        'checkpoint_saved': checkpoint_saved,
+                    })
+
                 if step % 5 == 0:
                     buf_info = ""
-                    if self.fine_tune:
+                    if self.fine_tune or self.locator_train:
                         buf_info = (
                             f" | Buffers weak:{len(weak_buf)} normal:{len(normal_buf)}"
                         )
+                    tag = "LOC" if self.locator_train else "BC"
                     print(
-                        f"🔥 R{robot_id} Step {step:4d} | "
+                        f"🔥 R{robot_id} {tag} Step {step:4d} | "
                         f"Loss: {losses['total']:.4f} "
                         f"(Pose:{losses['pose']:.4f} "
                         f"Aux:{losses['aux']:.4f} "
@@ -614,19 +1103,23 @@ class GPUInferenceServer:
                         f"{buf_info}"
                     )
 
-                ckpt_every = self._checkpoint_every if self.fine_tune else 100
-                if step % ckpt_every == 0:
+                if checkpoint_saved:
                     base_dir  = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
                     save_dir  = os.path.join(base_dir, "models")
                     os.makedirs(save_dir, exist_ok=True)
                     full_path = os.path.join(save_dir, save_name)
                     
-                    torch.save({
+                    ckpt = {
                         'model_state_dict':     model.state_dict(),
-                        'optimizer_state_dict': bc_mod.optimizer.state_dict(),
                         'training_step':        step,
                         'fine_tune':            self.fine_tune,
-                    }, full_path)
+                        'locator_train':        self.locator_train,
+                    }
+                    if self.locator_train:
+                        ckpt['optimizer_state_dict'] = loc_mod.optimizer.state_dict()
+                    else:
+                        ckpt['optimizer_state_dict'] = bc_mod.optimizer.state_dict()
+                    torch.save(ckpt, full_path)
                     print(f"💾 R{robot_id} SAVED MODEL TO: {full_path}")
 
             except Exception as e:
@@ -772,13 +1265,33 @@ class GPUInferenceServer:
         
         self.server_socket.bind((host, port))
         self.server_socket.listen(5)
-        mode_label = "targeted fine-tune" if self.fine_tune else "behavior cloning"
+        mode_label = "residual RL" if self.rl_train else (
+            "locator train" if self.locator_train else (
+                "targeted fine-tune" if self.fine_tune else "behavior cloning"
+            )
+        )
         print(f"🚀 BC Server listening on {host}:{port} ({mode_label} mode)")
+        if self.geo_grasp and not self.locator_train:
+            print(f"   Geo-grasp inference enabled (aux_position → grasp geometry)")
+        if self.rl_train:
+            lr = float(self._rl_robot_cfg[1].get('td3', {}).get('learning_rate', 1e-4))
+            print(
+                f"   RL TD3 minimal-dynamics | batch={self.batch_size} | LR={lr:g} | "
+                f"noise anneal | align gate | skip clamp buffer | "
+                f"checkpoints: {self._save_path_r1_rl}, {self._save_path_r2_rl}"
+            )
         if self.fine_tune:
             print(
                 f"   Fine-tune sampling: {self._weak_ratio:.0%} weak / "
                 f"{1 - self._weak_ratio:.0%} normal | LR="
                 f"{self.fine_tune_cfg.get('training', {}).get('learning_rate', 1e-4)}"
+            )
+        if self.locator_train:
+            print(
+                f"   Locator sampling: {self._weak_ratio:.0%} weak / "
+                f"{1 - self._weak_ratio:.0%} normal | aux-only loss | LR="
+                f"{self.locator_cfg.get('training', {}).get('learning_rate', 1e-4)} | "
+                f"checkpoints: {self._save_path_r1}, {self._save_path_r2}"
             )
         
         while True:
@@ -798,12 +1311,42 @@ if __name__ == "__main__":
                         help='Targeted BC fine-tune with mixed weak/normal batch sampling')
     parser.add_argument('--fine-tune-config', type=str, default=None,
                         help='Path to fine_tune_config.yaml')
+    parser.add_argument('--locator-train', action='store_true',
+                        help='Supervised aux_position training for geo-grasp pipeline')
+    parser.add_argument('--locator-config', type=str, default=None,
+                        help='Path to locator_train_config.yaml')
+    parser.add_argument('--geo-grasp', action='store_true',
+                        help='Inference: aux_position → analytic grasp geometry (not pose_6dof)')
+    parser.add_argument('--rl-train', action='store_true',
+                        help='TD3 residual RL fine-tune (BC frozen; separate RL checkpoints)')
+    parser.add_argument('--rl-train-config', type=str, default=None,
+                        help='Path to rl_train_config.yaml')
+    parser.add_argument('--rl-residual-r1', type=str, default=None,
+                        help='RL residual checkpoint for R1 (inference with --use-residual on client)')
+    parser.add_argument('--rl-residual-r2', type=str, default=None,
+                        help='RL residual checkpoint for R2')
     args   = parser.parse_args()
-    
+
+    if args.rl_train and args.fine_tune:
+        parser.error('Use either --rl-train or --fine-tune, not both.')
+    if args.rl_train and args.locator_train:
+        parser.error('Use either --rl-train or --locator-train, not both.')
+    if args.fine_tune and args.locator_train:
+        parser.error('Use either --fine-tune or --locator-train, not both.')
+    if args.geo_grasp and args.locator_train:
+        parser.error('--geo-grasp is for inference only; omit when --locator-train.')
+
     server = GPUInferenceServer(
         model_path=args.model,
         model_path_r2=args.model_r2,
         fine_tune=args.fine_tune,
         fine_tune_config_path=args.fine_tune_config,
+        locator_train=args.locator_train,
+        locator_config_path=args.locator_config,
+        geo_grasp=args.geo_grasp,
+        rl_train=args.rl_train,
+        rl_train_config_path=args.rl_train_config,
+        rl_residual_r1=args.rl_residual_r1,
+        rl_residual_r2=args.rl_residual_r2,
     )
     server.start_server()

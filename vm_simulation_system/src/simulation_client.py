@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 VM Simulation Client for UR3e System
 
@@ -25,11 +25,17 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 
 from failure_taxonomy import classify_outcome, is_clamp_limited
+from rl_reward import load_rl_train_config, get_robot_rl_config, calculate_rl_reward
 from spawn_geometry import (
     load_fine_tune_config,
+    load_locator_train_config,
     pick_random_weak_cell,
     quadrant_from_spawn,
     sample_spawn_in_phase_quadrant,
+)
+from grasp_geometry import (
+    compute_grasp_pose_from_object_world,
+    fallback_grasp_pose,
 )
 from collections import deque
 
@@ -64,7 +70,7 @@ def running_inside_webots() -> bool:
 
 
 EPISODE_LOG_COLUMNS = [
-    'timestamp', 'robot_id', 'episode', 'run_mode', 'inference_mode',
+    'timestamp', 'robot_id', 'episode', 'session_episode', 'run_mode', 'inference_mode',
     'curriculum_phase', 'spawn_phase',
     'spawn_x', 'spawn_y', 'spawn_z', 'spawn_radius_cm',
     'cam_delta_x_cm', 'cam_delta_y_cm', 'cam_delta_z_cm',
@@ -72,9 +78,26 @@ EPISODE_LOG_COLUMNS = [
     'grasp_mode',
     'ai_pose_0', 'ai_pose_1', 'ai_pose_2', 'ai_pose_3', 'ai_pose_4', 'ai_pose_5',
     'clamp_pose_0', 'clamp_pose_1', 'clamp_pose_2',
-    'success', 'lifted_m', 'closest_dist_m', 'reward', 'object_found',
+    'success', 'lifted_m', 'closest_dist_m',
+    'lateral_aim_err_m', 'lateral_aim_bc_err_m', 'lateral_improve_m',
+    'reward', 'object_found',
     'outcome_class', 'clamp_limited',
+    'residual_dx', 'residual_dz', 'residual_dyaw',
+    'pred_obj_x_m', 'pred_obj_z_m', 'locator_err_m',
     'support_shade_1', 'support_shade_2',
+    'spawn_quadrant', 'demo_bucket', 'spawn_collection',
+]
+
+LOCATOR_EPISODE_LOG_COLUMNS = [
+    'timestamp', 'robot_id', 'episode', 'session_episode', 'run_mode',
+    'spawn_phase',
+    'spawn_x', 'spawn_y', 'spawn_z', 'spawn_radius_cm',
+    'cam_delta_x_cm', 'cam_delta_y_cm', 'cam_delta_z_cm',
+    'cam_delta_pitch_deg', 'cam_delta_yaw_deg', 'cam_delta_roll_deg',
+    'grasp_mode',
+    'label_x_m', 'label_z_m', 'label_source',
+    'demo_sent', 'demo_ok', 'object_found',
+    'pred_obj_x_m', 'pred_obj_z_m', 'locator_err_m', 'loc_step_at_pred',
     'spawn_quadrant', 'demo_bucket', 'spawn_collection',
 ]
 
@@ -87,7 +110,7 @@ EPISODE_LOG_XLSX_HEADERS = (
 )
 
 EPISODE_LOG_XLSX_INT_COLS = frozenset({
-    'robot_id', 'episode', 'curriculum_phase', 'success', 'object_found', 'clamp_limited',
+    'robot_id', 'episode', 'session_episode', 'curriculum_phase', 'success', 'object_found', 'clamp_limited',
 })
 EPISODE_LOG_XLSX_FLOAT_COLS = frozenset({
     'spawn_x', 'spawn_y', 'spawn_z', 'spawn_radius_cm',
@@ -95,8 +118,23 @@ EPISODE_LOG_XLSX_FLOAT_COLS = frozenset({
     'cam_delta_pitch_deg', 'cam_delta_yaw_deg', 'cam_delta_roll_deg',
     'ai_pose_0', 'ai_pose_1', 'ai_pose_2', 'ai_pose_3', 'ai_pose_4', 'ai_pose_5',
     'clamp_pose_0', 'clamp_pose_1', 'clamp_pose_2',
-    'lifted_m', 'closest_dist_m', 'reward',
+    'lifted_m', 'closest_dist_m',
+    'lateral_aim_err_m', 'lateral_aim_bc_err_m', 'lateral_improve_m',
+    'reward',
+    'residual_dx', 'residual_dz', 'residual_dyaw',
+    'pred_obj_x_m', 'pred_obj_z_m', 'locator_err_m',
     'support_shade_1', 'support_shade_2',
+})
+LOCATOR_EPISODE_LOG_XLSX_INT_COLS = frozenset({
+    'robot_id', 'episode', 'session_episode', 'object_found', 'demo_sent', 'demo_ok',
+    'loc_step_at_pred',
+})
+LOCATOR_EPISODE_LOG_XLSX_FLOAT_COLS = frozenset({
+    'spawn_x', 'spawn_y', 'spawn_z', 'spawn_radius_cm',
+    'cam_delta_x_cm', 'cam_delta_y_cm', 'cam_delta_z_cm',
+    'cam_delta_pitch_deg', 'cam_delta_yaw_deg', 'cam_delta_roll_deg',
+    'label_x_m', 'label_z_m',
+    'pred_obj_x_m', 'pred_obj_z_m', 'locator_err_m',
 })
 
 
@@ -118,12 +156,12 @@ def _xlsx_cell_value(col_name: str, value: Any) -> Any:
     """Coerce numeric log fields to int/float so Excel does not store them as text."""
     if value == '' or value is None:
         return ''
-    if col_name in EPISODE_LOG_XLSX_INT_COLS:
+    if col_name in EPISODE_LOG_XLSX_INT_COLS or col_name in LOCATOR_EPISODE_LOG_XLSX_INT_COLS:
         try:
             return int(float(value))
         except (TypeError, ValueError):
             return value
-    if col_name in EPISODE_LOG_XLSX_FLOAT_COLS:
+    if col_name in EPISODE_LOG_XLSX_FLOAT_COLS or col_name in LOCATOR_EPISODE_LOG_XLSX_FLOAT_COLS:
         try:
             return float(value)
         except (TypeError, ValueError):
@@ -250,6 +288,8 @@ class CurriculumManager:
 
     def _load_state(self):
         """Restores curriculum state from disk."""
+        ai_window = self.PHASE_CONFIG[self.phase][4]
+        self.ai_recent_results = deque(maxlen=ai_window)
         if self.state_file.exists():
             try:
                 import json
@@ -261,8 +301,11 @@ class CurriculumManager:
                 self.episode = state.get('episode', 0)
                 
                 ai_window = self.PHASE_CONFIG[self.phase][4]
-                self.ai_recent_results = deque(state.get('ai_recent_results', []), maxlen=ai_window)
-                print(f"[CURRICULUM] Resumed from Phase {self.phase}, Episode {self.episode}")
+                self.ai_recent_results = deque(maxlen=ai_window)
+                print(
+                    f"[CURRICULUM] Resumed Phase {self.phase}, Episode {self.episode} "
+                    f"| AI window reset for this session (0/{ai_window})"
+                )
             except Exception as e:
                 print(f"[CURRICULUM] WARNING: Could not load state: {e}")
 
@@ -471,12 +514,19 @@ class SimulationClient:
 
     def __init__(self, config_path: str = "config/network_config.yaml",
                  mode: str = 'inference', real_robot: bool = False,
-                 robot_id: int = 1, ros_camera: bool = False):
+                 robot_id: int = 1, ros_camera: bool = False,
+                 use_residual: bool = False, use_geo_grasp: bool = False,
+                 no_workspace_clamp: bool = False,
+                 rl_train_config_path: Optional[str] = None):
         
         self.mode       = mode
         self.real_robot = real_robot
         self.robot_id   = robot_id   
         self.ros_camera = ros_camera 
+        self.use_residual = use_residual
+        self.use_geo_grasp = use_geo_grasp
+        self.no_workspace_clamp = no_workspace_clamp
+        self._rl_reward_cfg: Dict[str, Any] = {}
         self.config     = self._load_config(config_path)
 
         if ROS_AVAILABLE:
@@ -498,6 +548,7 @@ class SimulationClient:
         self.curriculum = CurriculumManagerRobot2() if robot_id == 2 else CurriculumManager()
 
         self.episode_count        = self.curriculum.episode
+        self.session_episode_count = 0
         self.episode_active       = False
         self.last_grasp_mode      = 'explore'
         self._nan_reset_pending   = False
@@ -519,6 +570,10 @@ class SimulationClient:
         self._fine_tune_spawn_quadrant = 0
         if mode == 'fine_tune':
             self._load_fine_tune_settings()
+        if mode == 'locator_train':
+            self._load_locator_train_settings()
+        if mode == 'rl_train':
+            self._load_rl_train_settings(rl_train_config_path)
 
         self._episode_log_dir = VR_DRL_DATA_DIR
         self._episode_xlsx_path = None
@@ -587,9 +642,41 @@ class SimulationClient:
             f"weak cells={self._fine_tune_weak_regions.get(self.robot_id, [])}"
         )
 
+    def _load_locator_train_settings(self, config_path: Optional[str] = None):
+        path = config_path or str(
+            VR_DRL_DATA_DIR.parent / "host_gpu_system" / "config" / "locator_train_config.yaml"
+        )
+        cfg = load_locator_train_config(path)
+        self._fine_tune_cfg = cfg
+        self._fine_tune_weak_regions = cfg['_weak_regions_parsed']
+        self._fine_tune_weak_spawn_p = float(
+            cfg.get('collection', {}).get('weak_spawn_probability', 0.7)
+        )
+        print(
+            f"[LOCATOR-TRAIN R{self.robot_id}] weak_spawn_p={self._fine_tune_weak_spawn_p:.0%} | "
+            f"weak cells={self._fine_tune_weak_regions.get(self.robot_id, [])}"
+        )
+
+    def _load_rl_train_settings(self, config_path: Optional[str] = None):
+        path = config_path or str(
+            VR_DRL_DATA_DIR.parent / "host_gpu_system" / "config" / "rl_train_config.yaml"
+        )
+        rl_cfg = load_rl_train_config(path)
+        self._rl_reward_cfg = get_robot_rl_config(rl_cfg, self.robot_id)
+        rw = self._rl_reward_cfg.get('reward', {})
+        print(
+            f"[RL-TRAIN R{self.robot_id}] reward weights loaded from {path} | "
+            f"w_dist={rw.get('w_dist')} w_lift={rw.get('w_lift')} "
+            f"w_miss={rw.get('w_miss')} w_corr={rw.get('w_corr')}"
+        )
+
     def _episode_log_stem(self) -> str:
+        if self.mode == 'rl_train':
+            return f"episode_log_r{self.robot_id}_rl_train"
         if self.mode == 'fine_tune':
             return f"episode_log_r{self.robot_id}_fine_tune"
+        if self.mode == 'locator_train':
+            return f"episode_log_r{self.robot_id}_locator_train"
         if self.mode == 'inference' and self.inference_mode == 'phase':
             return f"episode_log_r{self.robot_id}_phase{self.fixed_phase}"
         return f"episode_log_r{self.robot_id}"
@@ -600,9 +687,21 @@ class SimulationClient:
         self._episode_xlsx_path = self._episode_log_dir / f"{stem}.xlsx"
         print(f"[LOG R{self.robot_id}] XLSX → {self._episode_xlsx_path.resolve()}")
 
+    def _episode_log_columns(self) -> List[str]:
+        if self.mode == 'locator_train':
+            return LOCATOR_EPISODE_LOG_COLUMNS
+        return EPISODE_LOG_COLUMNS
+
+    def _episode_log_xlsx_headers(self) -> List[str]:
+        cols = self._episode_log_columns()
+        return (
+            ['timestamp', EPISODE_LOG_TIMESTAMP_LOCAL_COL]
+            + [c for c in cols if c != 'timestamp']
+        )
+
     def _reset_episode_log_fields(self):
         """Clears per-episode fields before a new grasp attempt."""
-        self._episode_log_fields = {col: '' for col in EPISODE_LOG_COLUMNS}
+        self._episode_log_fields = {col: '' for col in self._episode_log_columns()}
 
     def _refresh_xlsx_local_time_column(self, ws) -> None:
         """Rewrite column B from UTC ISO in column A (12-hour local display)."""
@@ -628,7 +727,7 @@ class SimulationClient:
     def _write_episode_xlsx_row(self, ws, row: dict) -> None:
         """Write one data row: A=timestamp, B=local-time, C+=episode fields."""
         row_num = ws.max_row + 1
-        rest_cols = [c for c in EPISODE_LOG_COLUMNS if c != 'timestamp']
+        rest_cols = [c for c in self._episode_log_columns() if c != 'timestamp']
 
         utc_iso = row.get('timestamp', '')
         ws.cell(row_num, 1, utc_iso)
@@ -644,14 +743,20 @@ class SimulationClient:
         row['timestamp']        = datetime.now(timezone.utc).isoformat()
         row['robot_id']         = self.robot_id
         row['episode']          = self.episode_count
+        row['session_episode']  = self.session_episode_count
         row['run_mode']         = self.mode
-        row['inference_mode']   = self.inference_mode if self.mode == 'inference' else ''
-        row['curriculum_phase'] = self.curriculum.phase
-        row['success']          = int(bool(success))
+        if self.mode == 'locator_train':
+            if row.get('demo_ok') == '':
+                row['demo_ok'] = int(bool(success))
+        else:
+            row['inference_mode']   = self.inference_mode if self.mode == 'inference' else ''
+            row['curriculum_phase'] = self.curriculum.phase
+            row['success']          = int(bool(success))
         if row.get('spawn_phase') == '':
             row['spawn_phase'] = self._spawn_phase_label()
 
         xlsx_path = self._episode_xlsx_path
+        headers = self._episode_log_xlsx_headers()
         try:
             import openpyxl
         except ImportError as e:
@@ -666,13 +771,13 @@ class SimulationClient:
                     wb = openpyxl.load_workbook(xlsx_path)
                     ws = wb.active
                     self._ensure_xlsx_local_time_column(ws)
-                    for col_idx, header in enumerate(EPISODE_LOG_XLSX_HEADERS, start=1):
+                    for col_idx, header in enumerate(headers, start=1):
                         ws.cell(1, col_idx, header)
                 else:
                     wb = openpyxl.Workbook()
                     ws = wb.active
                     ws.title = "episodes"
-                    for col_idx, header in enumerate(EPISODE_LOG_XLSX_HEADERS, start=1):
+                    for col_idx, header in enumerate(headers, start=1):
                         ws.cell(1, col_idx, header)
                 self._write_episode_xlsx_row(ws, row)
                 wb.save(xlsx_path)
@@ -682,6 +787,8 @@ class SimulationClient:
 
     def _spawn_phase_label(self) -> str:
         if self.mode == 'fine_tune':
+            return str(self._fine_tune_spawn_phase)
+        if self.mode == 'locator_train':
             return str(self._fine_tune_spawn_phase)
         if self.mode != 'inference':
             return str(self.curriculum.phase)
@@ -736,10 +843,128 @@ class SimulationClient:
         }
         self._episode_log_fields.update(fields)
 
+    def _spawn_block_xz(self) -> Optional[Tuple[float, float]]:
+        """Spawn-time block center (world X-Z) for aim metrics — avoids post-grasp drift."""
+        sx = self._episode_log_fields.get('spawn_x', '')
+        sz = self._episode_log_fields.get('spawn_z', '')
+        if sx == '' or sz == '':
+            return None
+        try:
+            return float(sx), float(sz)
+        except (TypeError, ValueError):
+            return None
+
+    def _object_pos_for_locator_label(self, duck_node) -> List[float]:
+        """World X,Z for aux training — spawn-first, pre-grasp fallback."""
+        xz = self._spawn_block_xz()
+        if xz is not None:
+            return [xz[0], xz[1]]
+        if duck_node:
+            p = duck_node.getPosition()
+            return [float(p[0]), float(p[2])]
+        return [0.0, 0.0]
+
+    def _collect_locator_training_demo(self, current_state: Dict, duck_node, node_found: bool):
+        """Spawn-aligned RGB-D demo for locator_train (no teacher grasp)."""
+        robot_id = self.robot_id
+        self.last_grasp_mode = 'locator_collect'
+        spawn_xz = self._spawn_block_xz()
+        label_source = 'spawn' if spawn_xz is not None else 'pre_grasp'
+        obj_pos = self._object_pos_for_locator_label(duck_node)
+        print(
+            f"[LOCATOR-COLLECT R{robot_id}] label=({obj_pos[0]:.3f}, {obj_pos[1]:.3f}) "
+            f"| source={label_source} | bucket={self._fine_tune_demo_bucket}"
+        )
+
+        demo_sent = 0
+        demo_ok = 0
+        response = None
+
+        if current_state.get('rgb') and self.mode != 'inference':
+            spawn_x_log = self._episode_log_fields.get('spawn_x', '')
+            spawn_z_log = self._episode_log_fields.get('spawn_z', '')
+            train_payload = {
+                'state':      current_state,
+                'action':     [0.0] * 6,
+                'reward':     0.0,
+                'next_state': current_state,
+                'done':       True,
+                'mode':       'locator_collect',
+                'object_pos': obj_pos,
+                'spawn_phase':      self._fine_tune_spawn_phase,
+                'spawn_x':          float(spawn_x_log) if spawn_x_log != '' else 0.0,
+                'spawn_z':          float(spawn_z_log) if spawn_z_log != '' else 0.0,
+                'quadrant':         self._fine_tune_spawn_quadrant,
+                'demo_bucket':      self._fine_tune_demo_bucket,
+                'spawn_collection': self._fine_tune_spawn_collection,
+            }
+            response = self._send_message_to_host({
+                'type':     'training_data',
+                'source':   'simulation',
+                'robot_id': robot_id,
+                'data':     train_payload,
+            })
+            if response and response.get('type') == 'training_ack':
+                demo_sent = 1
+                demo_ok = 1
+
+        locator_fields: Dict[str, Any] = {
+            'grasp_mode':   'locator_collect',
+            'label_x_m':    self._fmt_log_float(obj_pos[0]),
+            'label_z_m':    self._fmt_log_float(obj_pos[1]),
+            'label_source': label_source,
+            'object_found': int(bool(node_found)),
+            'demo_sent':    demo_sent,
+            'demo_ok':      demo_ok,
+        }
+        if response and response.get('type') == 'training_ack':
+            pred_x = response.get('pred_obj_x')
+            pred_z = response.get('pred_obj_z')
+            if pred_x is not None and pred_z is not None:
+                locator_fields['pred_obj_x_m'] = self._fmt_log_float(pred_x)
+                locator_fields['pred_obj_z_m'] = self._fmt_log_float(pred_z)
+            err = response.get('locator_err_m')
+            if err is not None:
+                locator_fields['locator_err_m'] = self._fmt_log_float(err)
+            loc_step = response.get('loc_step')
+            if loc_step is not None:
+                locator_fields['loc_step_at_pred'] = int(loc_step)
+
+        self._episode_log_fields.update(locator_fields)
+        self._end_episode_and_restart(success=bool(demo_ok))
+
+    def _compute_lateral_aim_metrics(
+        self,
+        block_node,
+        clamp_pose: Optional[List[float]],
+        bc_pose: Optional[List[float]] = None,
+        block_xz: Optional[Tuple[float, float]] = None,
+    ):
+        """Oracle horizontal aim error (world X-Z) vs block center — sim only."""
+        if clamp_pose is None:
+            return None, None, None
+        if block_xz is not None:
+            bx, bz = block_xz
+        elif block_node is not None:
+            bp = block_node.getPosition()
+            bx, bz = float(bp[0]), float(bp[2])
+        else:
+            return None, None, None
+        aim_err = math.hypot(float(clamp_pose[0]) - bx, float(clamp_pose[2]) - bz)
+        bc_err = None
+        improve = None
+        if bc_pose is not None and len(bc_pose) >= 3:
+            bc_err = math.hypot(float(bc_pose[0]) - bx, float(bc_pose[2]) - bz)
+            improve = bc_err - aim_err
+        return aim_err, bc_err, improve
+
     def _record_grasp_for_log(self, *, grasp_mode: str, raw_pose: Optional[List[float]],
                               clamp_pose: Optional[List[float]], success: bool,
                               lift_delta: Optional[float], closest_dist: float,
-                              reward: float, object_found: bool):
+                              reward: float, object_found: bool,
+                              lateral_aim_err: Optional[float] = None,
+                              lateral_aim_bc_err: Optional[float] = None,
+                              lateral_improve: Optional[float] = None):
         outcome_class = classify_outcome(
             success=success,
             grasp_mode=grasp_mode,
@@ -758,6 +983,12 @@ class SimulationClient:
             'outcome_class':   outcome_class,
             'clamp_limited':   clamp_limited,
         }
+        if lateral_aim_err is not None:
+            fields['lateral_aim_err_m'] = f'{float(lateral_aim_err):.6f}'
+        if lateral_aim_bc_err is not None:
+            fields['lateral_aim_bc_err_m'] = f'{float(lateral_aim_bc_err):.6f}'
+        if lateral_improve is not None:
+            fields['lateral_improve_m'] = f'{float(lateral_improve):.6f}'
         if raw_pose is not None:
             for i, val in enumerate(raw_pose[:6]):
                 fields[f'ai_pose_{i}'] = f'{float(val):.6f}'
@@ -765,6 +996,14 @@ class SimulationClient:
             for i, val in enumerate(clamp_pose[:3]):
                 fields[f'clamp_pose_{i}'] = f'{float(val):.6f}'
         self._episode_log_fields.update(fields)
+
+    def _record_residual_for_log(self, delta: List[float]):
+        if len(delta) >= 3:
+            self._episode_log_fields.update({
+                'residual_dx':   f'{float(delta[0]):.6f}',
+                'residual_dz':   f'{float(delta[1]):.6f}',
+                'residual_dyaw': f'{float(delta[2]):.6f}',
+            })
 
     def _cache_camera_base_poses(self):
         """
@@ -1456,6 +1695,9 @@ class SimulationClient:
                 'mode':     self.mode,
                 'source':   'real' if self.real_robot else 'simulation',
                 'robot_id': self.robot_id,
+                'use_residual': self.use_residual,
+                'use_geo_grasp': self.use_geo_grasp,
+                'session_episode': self.session_episode_count,
             }
             
             response = self._send_message_to_host(payload)
@@ -1521,19 +1763,52 @@ class SimulationClient:
         print(f"[REWARD] ClosestDist: {closest_dist:.4f}m | Success: {success} | Reward: {reward:.4f}")
         return float(reward)
 
+    def _calculate_episode_reward(
+        self,
+        success: bool,
+        closest_dist: float,
+        lift_delta: Optional[float],
+        delta: List[float],
+        clamp_limited: bool,
+        object_found: bool,
+        lateral_improve: Optional[float] = None,
+    ) -> float:
+        if self.mode == 'rl_train':
+            reward_cfg = self._rl_reward_cfg.get('reward', self._rl_reward_cfg)
+            reward = calculate_rl_reward(
+                robot_id=self.robot_id,
+                success=success,
+                closest_dist=closest_dist,
+                lifted_m=lift_delta,
+                delta_x=float(delta[0]),
+                delta_z=float(delta[1]),
+                delta_yaw=float(delta[2]),
+                clamp_limited=bool(clamp_limited),
+                object_found=object_found,
+                reward_cfg=reward_cfg,
+                max_delta=(
+                    float(self._rl_reward_cfg.get('max_delta_x_m', 0.03)),
+                    float(self._rl_reward_cfg.get('max_delta_z_m', 0.03)),
+                    float(self._rl_reward_cfg.get('max_delta_yaw_rad', 0.17)),
+                ),
+                lateral_improve_m=lateral_improve,
+            )
+            align_note = (
+                f" align={lateral_improve:+.4f}m"
+                if lateral_improve is not None else ""
+            )
+            print(
+                f"[RL REWARD R{self.robot_id}] dist={closest_dist:.4f} lift={lift_delta} "
+                f"delta={delta} clamp={clamp_limited}{align_note} → {reward:.4f}"
+            )
+            return reward
+        return self._calculate_shaped_reward(success, closest_dist)
+
     def _generate_guided_random_grasp(self) -> List[float]:
         """Provides an algorithmic teacher path for the 'explore' policy block."""
         robot_id = self.robot_id
-        if robot_id == 2:
-            object_def   = "TARGET_OBJECT2"
-            ROBOT_BASE_X = -1.226
-            ROBOT_BASE_Z =  0.47235
-            fallback     = [-1.365, 0.44, 0.905, 3.14, 0.0, 0.0]
-        else:
-            object_def   = "TARGET_OBJECT"
-            ROBOT_BASE_X = -0.685
-            ROBOT_BASE_Z =  0.47235
-            fallback     = [-0.685, 0.44, 0.55, 3.14, 0.0, 0.0]
+        object_def = "TARGET_OBJECT2" if robot_id == 2 else "TARGET_OBJECT"
+        fallback = fallback_grasp_pose(robot_id)
 
         try:
             supervisor = self.webots_bridge.supervisor
@@ -1554,30 +1829,15 @@ class SimulationClient:
                     self._reset_simulation_for_nan()
                 return fallback
 
-            dx = d_pos[0] - ROBOT_BASE_X
-            dz = d_pos[2] - ROBOT_BASE_Z
-
-            dist_to_obj  = np.sqrt(dx**2 + dz**2)
-            angle_to_obj = np.arctan2(dz, dx)
-
-            REACH_OFFSET  = -0.095
-            SHIFT_OFFSET  =  0.1
-            HEIGHT_OFFSET =  0.02
-
-            final_dist = dist_to_obj + REACH_OFFSET
-
-            target_x = ROBOT_BASE_X + (final_dist * np.cos(angle_to_obj)) - (SHIFT_OFFSET * np.sin(angle_to_obj))
-            target_z = ROBOT_BASE_Z + (final_dist * np.sin(angle_to_obj)) + (SHIFT_OFFSET * np.cos(angle_to_obj))
-            target_y = d_pos[1] + HEIGHT_OFFSET
-
-            x = target_x + np.random.uniform(-0.005, 0.005)  #Teacher Grasp Variance for increased robustness (if object was in the same position the teach hover spot will change slightly)
-            y = target_y  
-            z = target_z + np.random.uniform(-0.005, 0.005)  #Teacher Grasp Variance for increased robustness
-
-            yaw = angle_to_obj
-
-            print(f"[CLIENT R{robot_id}] Target: {x:.3f}, {y:.3f}, {z:.3f} | Reach Adj: {REACH_OFFSET}")
-            return [float(x), float(y), float(z), 3.14, 0.0, float(yaw)]
+            pose = compute_grasp_pose_from_object_world(
+                float(d_pos[0]), float(d_pos[1]), float(d_pos[2]),
+                robot_id, add_jitter=True,
+            )
+            print(
+                f"[CLIENT R{robot_id}] Target: {pose[0]:.3f}, {pose[1]:.3f}, {pose[2]:.3f} | "
+                f"geo teacher"
+            )
+            return pose
 
         except Exception as e:
             rospy.logerr(f"Guided Random Error (R{robot_id}): {e}")
@@ -1628,22 +1888,51 @@ class SimulationClient:
             current_state = {'rgb': self.latest_rgb_b64, 'depth': self.latest_depth_b64}
             mode = prediction.get('mode', 'unknown')
 
+            if self.mode == 'locator_train':
+                self._collect_locator_training_demo(current_state, duck_node, node_found)
+                return
+
+            residual_delta = [0.0, 0.0, 0.0]
             if mode == 'explore':
                 pose = self._generate_guided_random_grasp()
                 raw_pose = None
             else:
                 raw_pose = list(prediction['pose'])
-                print(f"[AI PREDICTION R{robot_id}] Network output: {raw_pose}")
+                residual_delta = list(prediction.get('delta', [0.0, 0.0, 0.0]))
+                if mode == 'exploit_geo':
+                    pred_x = prediction.get('pred_obj_x')
+                    pred_z = prediction.get('pred_obj_z')
+                    print(
+                        f"[GEO GRASP R{robot_id}] pred_obj=({pred_x:.3f}, {pred_z:.3f}) "
+                        f"→ grasp={raw_pose[:3]}…"
+                    )
+                elif prediction.get('bc_pose'):
+                    print(
+                        f"[AI R{robot_id}] BC={prediction['bc_pose'][:3]}… "
+                        f"Δ={residual_delta} → final={raw_pose[:3]}…"
+                    )
+                else:
+                    print(f"[AI PREDICTION R{robot_id}] Network output: {raw_pose}")
                 pose = raw_pose.copy()
-                pose[0] = float(np.clip(pose[0], CLAMP_X[0], CLAMP_X[1]))
-                pose[1] = float(np.clip(pose[1], 0.483, 0.490))
-                pose[2] = float(np.clip(pose[2], CLAMP_Z[0], CLAMP_Z[1]))
-                
-                if raw_pose[0] != pose[0] or raw_pose[1] != pose[1] or raw_pose[2] != pose[2]:
-                    print(f"[AI CLAMP R{robot_id}] [{raw_pose[0]:.3f},{raw_pose[1]:.3f},{raw_pose[2]:.3f}]"
-                          f" → [{pose[0]:.3f},{pose[1]:.3f},{pose[2]:.3f}]")
+                if self.no_workspace_clamp:
+                    print(
+                        f"[NO CLAMP R{robot_id}] Using raw pose (diagnostic): "
+                        f"[{pose[0]:.3f},{pose[1]:.3f},{pose[2]:.3f}]"
+                    )
+                else:
+                    pose[0] = float(np.clip(pose[0], CLAMP_X[0], CLAMP_X[1]))
+                    pose[1] = float(np.clip(pose[1], 0.483, 0.490))
+                    pose[2] = float(np.clip(pose[2], CLAMP_Z[0], CLAMP_Z[1]))
+
+                    if raw_pose[0] != pose[0] or raw_pose[1] != pose[1] or raw_pose[2] != pose[2]:
+                        print(f"[AI CLAMP R{robot_id}] [{raw_pose[0]:.3f},{raw_pose[1]:.3f},{raw_pose[2]:.3f}]"
+                              f" → [{pose[0]:.3f},{pose[1]:.3f},{pose[2]:.3f}]")
 
             clamp_xyz = [pose[0], pose[1], pose[2]]
+            clamp_limited_flag = bool(
+                raw_pose is not None and is_clamp_limited(raw_pose, clamp_xyz)
+            )
+            self._record_residual_for_log(residual_delta)
 
             self.robot_controller._closest_approach_dist = 9999.0
             self.robot_controller.execute_grasp(pose)
@@ -1664,12 +1953,46 @@ class SimulationClient:
             else:
                 print(f"[RESULT R{robot_id}] FAIL. Object not found.")
 
-            reward = self._calculate_shaped_reward(success, closest_dist)
+            block_xz = self._spawn_block_xz()
+            lateral_aim_err, lateral_bc_err, lateral_improve = self._compute_lateral_aim_metrics(
+                duck_node, clamp_xyz, prediction.get('bc_pose'), block_xz=block_xz,
+            )
+
+            reward = self._calculate_episode_reward(
+                success, closest_dist, lift_delta, residual_delta,
+                clamp_limited_flag, node_found,
+                lateral_improve=lateral_improve,
+            )
 
             self._record_grasp_for_log(
                 grasp_mode=mode, raw_pose=raw_pose, clamp_pose=clamp_xyz,
                 success=success, lift_delta=lift_delta, closest_dist=closest_dist,
-                reward=reward, object_found=node_found)
+                reward=reward, object_found=node_found,
+                lateral_aim_err=lateral_aim_err,
+                lateral_aim_bc_err=lateral_bc_err,
+                lateral_improve=lateral_improve,
+            )
+            if mode == 'exploit_geo':
+                pred_x = prediction.get('pred_obj_x')
+                pred_z = prediction.get('pred_obj_z')
+                if pred_x is not None and pred_z is not None:
+                    self._episode_log_fields['pred_obj_x_m'] = f'{float(pred_x):.6f}'
+                    self._episode_log_fields['pred_obj_z_m'] = f'{float(pred_z):.6f}'
+                    spawn_x_log = self._episode_log_fields.get('spawn_x', '')
+                    spawn_z_log = self._episode_log_fields.get('spawn_z', '')
+                    if spawn_x_log != '' and spawn_z_log != '':
+                        locator_err = math.hypot(
+                            float(pred_x) - float(spawn_x_log),
+                            float(pred_z) - float(spawn_z_log),
+                        )
+                        self._episode_log_fields['locator_err_m'] = f'{locator_err:.6f}'
+                        print(f"[LOCATOR R{robot_id}] err vs spawn center: {locator_err:.4f}m")
+            if lateral_aim_err is not None:
+                print(
+                    f"[AIM R{robot_id}] lateral_err={lateral_aim_err:.4f}m"
+                    + (f" bc_err={lateral_bc_err:.4f}m improve={lateral_improve:+.4f}m"
+                       if lateral_bc_err is not None else "")
+                )
 
             self.webots_bridge.step()
             self.camera_handler.update_from_webots()
@@ -1705,7 +2028,15 @@ class SimulationClient:
                     'mode':       mode,
                     'object_pos': obj_pos,
                 }
-                if self.mode == 'fine_tune':
+                if self.mode == 'rl_train':
+                    train_payload.update({
+                        'delta':           residual_delta,
+                        'residual_delta':  residual_delta,
+                        'bc_pose':         prediction.get('bc_pose'),
+                        'session_episode': self.session_episode_count,
+                        'clamp_limited':   int(clamp_limited_flag),
+                    })
+                if self.mode == 'fine_tune' or self.mode == 'locator_train':
                     spawn_x_log = self._episode_log_fields.get('spawn_x', '')
                     spawn_z_log = self._episode_log_fields.get('spawn_z', '')
                     train_payload.update({
@@ -1738,8 +2069,10 @@ class SimulationClient:
             hypothesis_id="C",
         )
         self.end_current_episode(success)
-        self.robot_controller.home_position()
-        self._flush_camera_buffers()
+        if self.mode != 'locator_train':
+            self.robot_controller.home_position()
+        flush_steps = 20 if self.mode == 'locator_train' else 40
+        self._flush_camera_buffers(steps=flush_steps)
 
         print(f"[BARRIER R{self.robot_id}] Waiting for other robot to finish episode...")
         _agent_debug_log(
@@ -1765,6 +2098,12 @@ class SimulationClient:
         )
 
         time.sleep(2.0)
+        if self._episode_limit_reached(getattr(self, '_max_episodes', None)):
+            label = 'session' if self.mode == 'inference' else 'total'
+            print(
+                f"[CLIENT R{self.robot_id}] Reached {self._max_episodes} {label} episodes. Stopping."
+            )
+            return
         try:
             self._begin_next_episode_serialized()
         except Exception as exc:
@@ -2106,8 +2445,9 @@ class SimulationClient:
             hypothesis_id="C",
         )
         self._reset_episode_log_fields()
-        self.episode_count  += 1
-        self.episode_active  = True
+        self.episode_count += 1
+        self.session_episode_count += 1
+        self.episode_active = True
         self.curriculum.update(self.episode_count)
 
         if not self.real_robot:
@@ -2166,10 +2506,13 @@ class SimulationClient:
             {"robot_id": self.robot_id, "episode": self.episode_count},
             hypothesis_id="D",
         )
-        self._send_message_to_host({
+        done_resp = self._send_message_to_host({
             'type':     'episode_setup_done',
             'robot_id': self.robot_id,
         })
+        if not done_resp or done_resp.get('type') != 'proceed':
+            msg = (done_resp or {}).get('message', done_resp)
+            raise RuntimeError(f"Setup done signal failed for R{self.robot_id}: {msg}")
 
         _agent_debug_log(
             "simulation_client.py:_begin_next_episode_serialized",
@@ -2248,7 +2591,7 @@ class SimulationClient:
                 return
 
             spawn_radius_cm = None
-            if self.mode == 'fine_tune':
+            if self.mode in ('fine_tune', 'locator_train'):
                 spawn_x, spawn_z, spawn_radius_cm = self._spawn_fine_tune_position()
                 self._episode_log_fields['spawn_quadrant'] = str(self._fine_tune_spawn_quadrant)
                 self._episode_log_fields['demo_bucket'] = self._fine_tune_demo_bucket
@@ -2261,7 +2604,7 @@ class SimulationClient:
                 spawn_x, _, spawn_z = self.curriculum.get_spawn_position()
 
             spawn_y = 0.461
-            if self.mode == 'fine_tune':
+            if self.mode in ('fine_tune', 'locator_train'):
                 self._episode_log_fields['spawn_phase'] = str(self._fine_tune_spawn_phase)
 
             position_field = obj_node.getField("translation")
@@ -2337,7 +2680,7 @@ class SimulationClient:
         mode     = getattr(self, 'last_grasp_mode', 'explore')
         robot_id = self.robot_id
 
-        if self.mode == 'training':
+        if self.mode in ('training', 'rl_train'):
             self.curriculum.record_result(success, mode)
             advanced = self.curriculum.check_phase_advance()
             if advanced:
@@ -2359,13 +2702,25 @@ class SimulationClient:
 
         status = "OK" if success else "FAIL"
         if self.mode == 'inference':
-            print(f"[INFERENCE R{robot_id}] {status} Episode {self.episode_count} complete")
+            print(f"[INFERENCE R{robot_id}] {status} Episode {self.episode_count} (session {self.session_episode_count}) complete")
         elif self.mode == 'fine_tune':
             print(
-                f"[FINE-TUNE R{robot_id}] {status} Ep {self.episode_count} | "
+                f"[FINE-TUNE R{robot_id}] {status} Ep {self.episode_count} (session {self.session_episode_count}) | "
                 f"bucket={self._fine_tune_demo_bucket} | "
                 f"band={self._fine_tune_spawn_phase} Q{self._fine_tune_spawn_quadrant} | "
                 f"grasp={mode}"
+            )
+        elif self.mode == 'locator_train':
+            print(
+                f"[LOCATOR-TRAIN R{robot_id}] {status} Ep {self.episode_count} (session {self.session_episode_count}) | "
+                f"bucket={self._fine_tune_demo_bucket} | "
+                f"band={self._fine_tune_spawn_phase} Q{self._fine_tune_spawn_quadrant} | "
+                f"grasp={mode}"
+            )
+        elif self.mode == 'rl_train':
+            print(
+                f"[RL-TRAIN R{robot_id}] {status} Ep {self.episode_count} (session {self.session_episode_count}) | "
+                f"Phase {self.curriculum.phase} | reward logged | grasp={mode}"
             )
         else:
             ai_rate     = self.curriculum.get_ai_success_rate()
@@ -2406,7 +2761,16 @@ class SimulationClient:
                 "Webots playing? Both extern controllers running?"
             )
 
+    def _episode_limit_reached(self, max_episodes: Optional[int]) -> bool:
+        """Inference: session episode count. Training: global curriculum episode."""
+        if max_episodes is None:
+            return False
+        if self.mode == 'inference':
+            return self.session_episode_count >= max_episodes
+        return self.episode_count > max_episodes
+
     def run_simulation_loop(self, max_episodes: int = None):
+        self._max_episodes = max_episodes
         if not self.connect_to_host():
             print(f"[CLIENT R{self.robot_id}] Exiting — no GPU server connection.")
             return
@@ -2445,8 +2809,9 @@ class SimulationClient:
             SETTLE_SLEEP   = 1.0  
 
             while not rospy.is_shutdown():
-                if max_episodes is not None and self.episode_count > max_episodes:
-                    print(f"[REAL R{self.robot_id}] Reached {max_episodes} episodes. Stopping.")
+                if self._episode_limit_reached(max_episodes):
+                    label = 'session' if self.mode == 'inference' else 'total'
+                    print(f"[REAL R{self.robot_id}] Reached {max_episodes} {label} episodes. Stopping.")
                     break
 
                 if not self.connected:
@@ -2477,8 +2842,9 @@ class SimulationClient:
             _cam_warn_at = 0.0
             _loop_iter = 0
             while not rospy.is_shutdown():
-                if max_episodes is not None and self.episode_count > max_episodes:
-                    print(f"[CLIENT R{self.robot_id}] Reached {max_episodes} episodes. Stopping.")
+                if self._episode_limit_reached(max_episodes):
+                    label = 'session' if self.mode == 'inference' else 'total'
+                    print(f"[CLIENT R{self.robot_id}] Reached {max_episodes} {label} episodes. Stopping.")
                     _agent_debug_log(
                         "simulation_client.py:run_simulation_loop:exit",
                         "loop_exit_max_episodes",
@@ -2540,11 +2906,23 @@ def main():
         formatter_class=argparse.RawTextHelpFormatter
     )
     parser.add_argument('--mode', type=str, default='training',
-                        help='training | fine_tune | inference')
+                        help='training | fine_tune | locator_train | rl_train | inference')
     parser.add_argument('--fine-tune-config', type=str, default=None,
                         help='Path to fine_tune_config.yaml (fine_tune mode only)')
+    parser.add_argument('--locator-config', type=str, default=None,
+                        help='Path to locator_train_config.yaml (locator_train mode only)')
+    parser.add_argument('--rl-train-config', type=str, default=None,
+                        help='Path to rl_train_config.yaml (rl_train mode only)')
+    parser.add_argument('--use-residual', action='store_true',
+                        help='Inference: apply trained RL residual (requires gpu_server --rl-residual-r1/r2)')
+    parser.add_argument('--use-geo-grasp', action='store_true',
+                        help='Inference: CNN aux_position → analytic grasp geometry (requires gpu_server --geo-grasp)')
+    parser.add_argument('--no-workspace-clamp', action='store_true',
+                        help='Inference: skip X/Y/Z workspace clip on exploit/exploit_geo poses (diagnostic; teacher explore unchanged)')
     parser.add_argument('--episodes', type=int, default=None,
-                        help='Max episodes to run (training). Omit for infinite.')
+                        help='Episode cap for this process. Inference: session episodes (resets each launch).\n'
+                             'Training: global curriculum episode total (resumes from curriculum_state.json).\n'
+                             'Omit for infinite.')
     parser.add_argument('--real', action='store_true',
                         help='Run on real UR3e. Forces inference mode.')
     parser.add_argument('--robot-id', type=int, default=1, choices=[1, 2],
@@ -2588,8 +2966,20 @@ def main():
     is_real = args.real or args.ros_camera
     mode = 'inference' if is_real else args.mode
 
-    if mode not in ('training', 'fine_tune', 'inference'):
-        parser.error("--mode must be training, fine_tune, or inference.")
+    if mode not in ('training', 'fine_tune', 'locator_train', 'rl_train', 'inference'):
+        parser.error("--mode must be training, fine_tune, locator_train, rl_train, or inference.")
+
+    if mode == 'rl_train' and is_real:
+        parser.error("rl_train mode is simulation-only (omit --real).")
+
+    if args.use_residual and mode != 'inference':
+        parser.error("--use-residual requires --mode inference.")
+    if args.use_geo_grasp and mode != 'inference':
+        parser.error("--use-geo-grasp requires --mode inference.")
+    if args.use_residual and args.use_geo_grasp:
+        parser.error("Use either --use-residual or --use-geo-grasp, not both.")
+    if args.no_workspace_clamp and mode != 'inference':
+        parser.error("--no-workspace-clamp requires --mode inference (or --real).")
 
     inf_flags = [args.cycle is not None, args.free, args.phase is not None]
     if sum(inf_flags) > 1:
@@ -2598,6 +2988,10 @@ def main():
         parser.error("--cycle / --free / --phase require --mode inference (or --real / --ros-camera).")
     if mode == 'fine_tune' and any(inf_flags):
         parser.error("fine_tune mode does not support --cycle / --free / --phase.")
+    if mode == 'locator_train' and any(inf_flags):
+        parser.error("locator_train mode does not support --cycle / --free / --phase.")
+    if mode == 'rl_train' and any(inf_flags):
+        parser.error("rl_train mode does not support --cycle / --free / --phase.")
     if args.cycle is None and (args.cycle_from != 0 or args.cycle_to != 5):
         parser.error("--cycle-from / --cycle-to require --cycle.")
 
@@ -2619,8 +3013,14 @@ def main():
         )
 
     try:
-        client = SimulationClient(mode=mode, real_robot=is_real, robot_id=robot_id,
-                                  ros_camera=args.ros_camera)
+        client = SimulationClient(
+            mode=mode, real_robot=is_real, robot_id=robot_id,
+            ros_camera=args.ros_camera,
+            use_residual=args.use_residual,
+            use_geo_grasp=args.use_geo_grasp,
+            no_workspace_clamp=args.no_workspace_clamp,
+            rl_train_config_path=args.rl_train_config,
+        )
     except Exception:
         import traceback
         print("[STARTUP] SimulationClient failed during initialization:")
@@ -2632,6 +3032,9 @@ def main():
     if mode == 'fine_tune' and args.fine_tune_config:
         client._load_fine_tune_settings(args.fine_tune_config)
 
+    if mode == 'locator_train' and args.locator_config:
+        client._load_locator_train_settings(args.locator_config)
+
     if mode == 'fine_tune':
         cfg = client._fine_tune_cfg or {}
         wr = cfg.get('sampling', {}).get('weak_ratio', 0.7)
@@ -2640,6 +3043,36 @@ def main():
             f"[FINE-TUNE R{robot_id}] Targeted BC collection | "
             f"batch mix {wr:.0%} weak / {nr:.0%} normal"
         )
+
+    if mode == 'locator_train':
+        cfg = client._fine_tune_cfg or {}
+        wr = cfg.get('sampling', {}).get('weak_ratio', 0.7)
+        nr = cfg.get('sampling', {}).get('normal_ratio', 0.3)
+        print(
+            f"[LOCATOR-TRAIN R{robot_id}] Supervised (X,Z) collection | "
+            f"batch mix {wr:.0%} weak / {nr:.0%} normal | "
+            f"start gpu_server.py with --locator-train"
+        )
+
+    if mode == 'rl_train':
+        print(
+            f"[RL-TRAIN R{robot_id}] TD3 residual collection | "
+            f"start gpu_server.py with --rl-train and BC checkpoints"
+        )
+        if args.rl_train_config:
+            client._load_rl_train_settings(args.rl_train_config)
+
+    if mode == 'inference' and args.use_geo_grasp:
+        print(f"[INFERENCE R{robot_id}] Geo grasp (--use-geo-grasp) | aux_position → geometry")
+
+    if mode == 'inference' and args.no_workspace_clamp:
+        print(f"[INFERENCE R{robot_id}] Workspace clamp DISABLED (--no-workspace-clamp)")
+
+    if mode == 'inference' and args.use_residual:
+        print(f"[INFERENCE R{robot_id}] BC + RL residual (--use-residual)")
+
+    if mode == 'inference' and args.episodes is not None:
+        print(f"[INFERENCE R{robot_id}] Session episode cap: {args.episodes}")
 
     if mode == 'inference':
         if args.cycle is not None:

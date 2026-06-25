@@ -1,4 +1,4 @@
-﻿#!/usr/bin/env python3
+#!/usr/bin/env python3
 """
 Enhanced Neural Network Architecture for UR3 Grasping System
 
@@ -12,6 +12,8 @@ import torch.nn.functional as F
 import torchvision.models as models
 from torchvision.models import MobileNet_V2_Weights
 import numpy as np
+import copy
+import math
 from typing import Tuple, Optional, Dict, List
 import logging
 
@@ -126,13 +128,16 @@ class UR3GraspCNN_Enhanced(nn.Module):
                         if layer.bias is not None:
                             nn.init.constant_(layer.bias, 0)
 
-    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+    def encode_features(self, x: torch.Tensor) -> torch.Tensor:
+        """Pooled backbone features for residual RL / critics."""
         features = self.backbone(x)
         if self.use_attention:
             features = self.attention(features)
-
         features = F.adaptive_avg_pool2d(features, (1, 1))
-        features = torch.flatten(features, 1)
+        return torch.flatten(features, 1)
+
+    def forward(self, x: torch.Tensor) -> Dict[str, torch.Tensor]:
+        features = self.encode_features(x)
 
         outputs = {}
         outputs['grasp_class']  = self.grasp_classifier(features)
@@ -282,6 +287,306 @@ class BehaviorCloningModule(nn.Module):
                 print(f"   ↳ Optimizer state not restored (architecture changed): {e}")
 
 
+class LocalizationModule(nn.Module):
+    """Supervised object (X,Z) localization for geo-grasp pipeline."""
+
+    def __init__(self,
+                 grasp_net: UR3GraspCNN_Enhanced,
+                 learning_rate: float = 1e-4,
+                 weight_decay: float = 8e-4):
+        super(LocalizationModule, self).__init__()
+
+        self.grasp_net = grasp_net
+
+        if grasp_net.output_6dof and hasattr(grasp_net, 'pose_regressor'):
+            for param in grasp_net.pose_regressor.parameters():
+                param.requires_grad = False
+        for param in grasp_net.grasp_classifier.parameters():
+            param.requires_grad = False
+        for param in grasp_net.quality_predictor.parameters():
+            param.requires_grad = False
+
+        trainable = [p for p in grasp_net.parameters() if p.requires_grad]
+        self.optimizer = torch.optim.Adam(
+            trainable,
+            lr=learning_rate,
+            weight_decay=weight_decay,
+        )
+
+        self.regression_loss = nn.SmoothL1Loss()
+
+    def to(self, device):
+        super().to(device)
+        return self
+
+    def update_networks(self, batch: Dict) -> Dict[str, float]:
+        states = batch['states']
+        aux_position_labels = batch.get('aux_position_labels')
+
+        self.grasp_net.train()
+        outputs = self.grasp_net(states)
+        aux_pos_preds = outputs['aux_position']
+
+        aux_loss = torch.tensor(0.0, device=aux_pos_preds.device)
+        if aux_position_labels is not None:
+            valid_mask = (aux_position_labels.abs().sum(dim=1) > 0.001)
+            if valid_mask.any():
+                aux_loss = self.regression_loss(
+                    aux_pos_preds[valid_mask],
+                    aux_position_labels[valid_mask],
+                )
+
+        self.optimizer.zero_grad()
+        aux_loss.backward()
+        grad_norm = torch.nn.utils.clip_grad_norm_(
+            [p for p in self.grasp_net.parameters() if p.requires_grad], 5.0
+        )
+        self.optimizer.step()
+
+        return {
+            'total':     aux_loss.item(),
+            'pose':      0.0,
+            'grasp':     0.0,
+            'aux':       aux_loss.item(),
+            'grad_norm': grad_norm.item(),
+        }
+
+    def save_model(self, filepath: str):
+        torch.save({
+            'model_state_dict':     self.grasp_net.state_dict(),
+            'optimizer_state_dict': self.optimizer.state_dict(),
+        }, filepath)
+
+    def load_model(self, filepath: str):
+        checkpoint = torch.load(filepath)
+        self.grasp_net.load_state_dict(checkpoint['model_state_dict'], strict=False)
+        if 'optimizer_state_dict' in checkpoint:
+            try:
+                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            except Exception as e:
+                print(f"   ↳ Optimizer state not restored (architecture changed): {e}")
+
+
+class ResidualCorrectionHead(nn.Module):
+    """Bounded residual corrections on BC pose: delta_x, delta_z, delta_yaw."""
+
+    def __init__(self,
+                 feature_size: int = 1280,
+                 hidden: int = 256,
+                 max_delta_x: float = 0.03,
+                 max_delta_z: float = 0.03,
+                 max_delta_yaw: float = 0.17):
+        super().__init__()
+        self.max_delta_x   = max_delta_x
+        self.max_delta_z   = max_delta_z
+        self.max_delta_yaw = max_delta_yaw
+        self.mlp = nn.Sequential(
+            nn.Linear(feature_size, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, 3),
+        )
+        for layer in self.mlp.modules():
+            if isinstance(layer, nn.Linear):
+                nn.init.normal_(layer.weight, 0, 0.01)
+                if layer.bias is not None:
+                    nn.init.constant_(layer.bias, 0)
+
+    def forward(self, features: torch.Tensor) -> torch.Tensor:
+        raw = torch.tanh(self.mlp(features))
+        return torch.stack([
+            raw[:, 0] * self.max_delta_x,
+            raw[:, 1] * self.max_delta_z,
+            raw[:, 2] * self.max_delta_yaw,
+        ], dim=1)
+
+
+class QNetwork(nn.Module):
+    """Twin critic Q(s, delta) on frozen visual features + residual action."""
+
+    def __init__(self, feature_size: int = 1280, action_dim: int = 3, hidden: int = 512):
+        super().__init__()
+        in_dim = feature_size + action_dim
+        self.net = nn.Sequential(
+            nn.Linear(in_dim, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, hidden),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden, 1),
+        )
+
+    def forward(self, features: torch.Tensor, actions: torch.Tensor) -> torch.Tensor:
+        x = torch.cat([features, actions], dim=1)
+        return self.net(x)
+
+
+class TD3Module(nn.Module):
+    """TD3 fine-tuning on frozen BC backbone + residual correction head."""
+
+    def __init__(self,
+                 grasp_net: UR3GraspCNN_Enhanced,
+                 robot_cfg: Dict,
+                 learning_rate: float = 3e-4,
+                 gamma: float = 0.99,
+                 tau: float = 0.005,
+                 policy_noise: float = 0.05,
+                 noise_clip: float = 0.12,
+                 policy_delay: int = 2):
+        super().__init__()
+        self.grasp_net = grasp_net
+        for param in self.grasp_net.parameters():
+            param.requires_grad = False
+
+        max_dx   = float(robot_cfg.get('max_delta_x_m', 0.03))
+        max_dz   = float(robot_cfg.get('max_delta_z_m', 0.03))
+        max_dyaw = float(robot_cfg.get('max_delta_yaw_rad', 0.17))
+        feature_size = grasp_net.feature_size
+
+        self.actor = ResidualCorrectionHead(
+            feature_size=feature_size,
+            max_delta_x=max_dx,
+            max_delta_z=max_dz,
+            max_delta_yaw=max_dyaw,
+        )
+        self.actor_target = copy.deepcopy(self.actor)
+        self.critic1 = QNetwork(feature_size)
+        self.critic2 = QNetwork(feature_size)
+        self.critic1_target = copy.deepcopy(self.critic1)
+        self.critic2_target = copy.deepcopy(self.critic2)
+
+        self.gamma        = gamma
+        self.tau          = tau
+        self.policy_noise = policy_noise
+        self.noise_clip   = noise_clip
+        self.policy_delay = policy_delay
+        self.max_delta    = torch.tensor([max_dx, max_dz, max_dyaw])
+        self._update_step = 0
+
+        trainable = (
+            list(self.actor.parameters())
+            + list(self.critic1.parameters())
+            + list(self.critic2.parameters())
+        )
+        self.optimizer = torch.optim.Adam(trainable, lr=learning_rate)
+
+    def to(self, device):
+        super().to(device)
+        self.max_delta = self.max_delta.to(device)
+        return self
+
+    @torch.no_grad()
+    def encode_features(self, states: torch.Tensor) -> torch.Tensor:
+        self.grasp_net.eval()
+        return self.grasp_net.encode_features(states)
+
+    @torch.no_grad()
+    def select_delta(self, states: torch.Tensor,
+                     exploration_noise: Optional[torch.Tensor] = None) -> torch.Tensor:
+        features = self.encode_features(states)
+        self.actor.eval()
+        delta = self.actor(features)
+        if exploration_noise is not None:
+            delta = delta + exploration_noise
+        return self._clamp_delta(delta)
+
+    def _clamp_delta(self, delta: torch.Tensor) -> torch.Tensor:
+        limits = self.max_delta.to(delta.device)
+        return torch.stack([
+            delta[:, 0].clamp(-limits[0], limits[0]),
+            delta[:, 1].clamp(-limits[1], limits[1]),
+            delta[:, 2].clamp(-limits[2], limits[2]),
+        ], dim=1)
+
+    def update_networks(self, batch: Dict) -> Dict[str, float]:
+        states  = batch['states']
+        actions = batch['actions']
+        rewards = batch['rewards'].view(-1, 1)
+        dones   = batch['dones'].view(-1, 1)
+
+        features = self.encode_features(states)
+
+        with torch.no_grad():
+            next_actions = self.actor_target(features)
+            noise = torch.randn_like(next_actions) * self.policy_noise
+            noise = noise.clamp(-self.noise_clip, self.noise_clip)
+            next_actions = self._clamp_delta(next_actions + noise)
+            target_q = torch.min(
+                self.critic1_target(features, next_actions),
+                self.critic2_target(features, next_actions),
+            )
+            y = rewards + (1.0 - dones) * self.gamma * target_q
+
+        q1 = self.critic1(features, actions)
+        q2 = self.critic2(features, actions)
+        critic_loss = F.mse_loss(q1, y) + F.mse_loss(q2, y)
+
+        self.optimizer.zero_grad()
+        critic_loss.backward()
+        nn.utils.clip_grad_norm_(
+            list(self.critic1.parameters()) + list(self.critic2.parameters()), 5.0
+        )
+        self.optimizer.step()
+
+        actor_loss_val = 0.0
+        self._update_step += 1
+        if self._update_step % self.policy_delay == 0:
+            features_det = features.detach()
+            actor_actions = self.actor(features_det)
+            actor_loss = -self.critic1(features_det, actor_actions).mean()
+            self.optimizer.zero_grad()
+            actor_loss.backward()
+            nn.utils.clip_grad_norm_(self.actor.parameters(), 5.0)
+            self.optimizer.step()
+            actor_loss_val = actor_loss.item()
+            self._soft_update(self.actor, self.actor_target, self.tau)
+            self._soft_update(self.critic1, self.critic1_target, self.tau)
+            self._soft_update(self.critic2, self.critic2_target, self.tau)
+
+        return {
+            'total': critic_loss.item() + abs(actor_loss_val),
+            'critic': critic_loss.item(),
+            'actor': actor_loss_val,
+        }
+
+    @staticmethod
+    def _soft_update(source: nn.Module, target: nn.Module, tau: float = 0.005):
+        for src_p, tgt_p in zip(source.parameters(), target.parameters()):
+            tgt_p.data.copy_(tau * src_p.data + (1.0 - tau) * tgt_p.data)
+
+    def save_model(self, filepath: str, training_step: int = 0):
+        torch.save({
+            'actor_state_dict':         self.actor.state_dict(),
+            'critic1_state_dict':       self.critic1.state_dict(),
+            'critic2_state_dict':       self.critic2.state_dict(),
+            'actor_target_state_dict':  self.actor_target.state_dict(),
+            'critic1_target_state_dict': self.critic1_target.state_dict(),
+            'critic2_target_state_dict': self.critic2_target.state_dict(),
+            'optimizer_state_dict':     self.optimizer.state_dict(),
+            'training_step':            training_step,
+            'update_step':              self._update_step,
+        }, filepath)
+
+    def load_model(self, filepath: str) -> int:
+        checkpoint = torch.load(filepath, map_location=next(self.parameters()).device)
+        self.actor.load_state_dict(checkpoint['actor_state_dict'])
+        self.critic1.load_state_dict(checkpoint['critic1_state_dict'])
+        self.critic2.load_state_dict(checkpoint['critic2_state_dict'])
+        self.actor_target.load_state_dict(checkpoint.get(
+            'actor_target_state_dict', checkpoint['actor_state_dict']))
+        self.critic1_target.load_state_dict(checkpoint.get(
+            'critic1_target_state_dict', checkpoint['critic1_state_dict']))
+        self.critic2_target.load_state_dict(checkpoint.get(
+            'critic2_target_state_dict', checkpoint['critic2_state_dict']))
+        if 'optimizer_state_dict' in checkpoint:
+            try:
+                self.optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+            except Exception as e:
+                print(f"   ↳ TD3 optimizer not restored: {e}")
+        self._update_step = int(checkpoint.get('update_step', 0))
+        return int(checkpoint.get('training_step', 0))
+
+
 class ImageProcessor:
     """Prepares and normalizes real-time image data for tensor processing."""
     
@@ -374,3 +679,20 @@ def create_model(config: Dict) -> Tuple[UR3GraspCNN_Enhanced, BehaviorCloningMod
     )
 
     return grasp_net, bc_module, image_processor
+
+
+def create_td3_module(grasp_net: UR3GraspCNN_Enhanced,
+                      robot_cfg: Dict,
+                      learning_rate: float = 3e-4) -> TD3Module:
+    """Build TD3 residual stack on a BC-loaded grasp network."""
+    td3_cfg = robot_cfg.get('td3', {})
+    return TD3Module(
+        grasp_net=grasp_net,
+        robot_cfg=robot_cfg,
+        learning_rate=float(td3_cfg.get('learning_rate', learning_rate)),
+        gamma=float(td3_cfg.get('gamma', 0.99)),
+        tau=float(td3_cfg.get('tau', 0.005)),
+        policy_noise=float(td3_cfg.get('policy_noise', 0.05)),
+        noise_clip=float(td3_cfg.get('noise_clip', 0.12)),
+        policy_delay=int(td3_cfg.get('policy_delay', 2)),
+    )
