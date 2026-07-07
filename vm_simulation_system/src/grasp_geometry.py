@@ -1,7 +1,5 @@
 """Analytic grasp pose from object world position (shared teacher + geo-grasp inference)."""
 
-from __future__ import annotations
-
 import math
 from typing import Dict, List, Tuple
 

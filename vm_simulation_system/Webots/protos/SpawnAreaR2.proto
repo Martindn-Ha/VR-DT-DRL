@@ -1,0 +1,41 @@
+#VRML_SIM R2021a utf8
+# Visual overlay: R2 spawn / board-DQN grid bounds (axis-aligned bbox; arc mask is code-only).
+# Matches board_dqn_config.yaml platform.2 and CurriculumManagerRobot2.
+# Set overlayScale 1 1 1 in Webots when calibrating warp (scale 0 hides — no visible field in R2021a).
+
+PROTO SpawnAreaR2 [
+  field SFVec3f    translation  -1.365 0.446 0.850
+  field SFRotation rotation     0 1 0 0
+  field SFString   name         "spawn_area_r2"
+  field SFColor    color        0.2 0.5 1.0
+  field SFVec3f    size         0.280 0.001 0.170
+  field SFVec3f    overlayScale 0 0 0
+]
+{
+  Solid {
+    translation IS translation
+    rotation IS rotation
+    name IS name
+
+    children [
+      Transform {
+        scale IS overlayScale
+        children [
+          Shape {
+            appearance PBRAppearance {
+              baseColor IS color
+              transparency 0.55
+              roughness 0.4
+              metalness 0.0
+            }
+            geometry Box {
+              size IS size
+            }
+            castShadows FALSE
+            isPickable FALSE
+          }
+        ]
+      }
+    ]
+  }
+}

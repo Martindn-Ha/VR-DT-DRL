@@ -32,18 +32,44 @@ from enhanced_neural_network import (
     UR3GraspCNN_Enhanced, BehaviorCloningModule, LocalizationModule, TD3Module,
     create_model, create_td3_module, ImageProcessor,
 )
+from local_grid_module import LocalGridModule, create_local_grid_module
+from full_board_dqn_module import FullBoardDQNModule, create_full_board_dqn_module
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "vm_simulation_system" / "src"))
+from board_q_diagnostics import compute_board_q_diagnostics, blend_q_heatmap_overlay  # noqa: E402
 from spawn_geometry import load_fine_tune_config, load_locator_train_config, classify_demo_bucket  # noqa: E402
 from rl_reward import load_rl_train_config, get_robot_rl_config, exploration_noise_scale  # noqa: E402
 from grasp_geometry import compute_grasp_pose_from_object_world, local_xz_to_world, DEFAULT_OBJECT_Y_M  # noqa: E402
+from local_grid import (  # noqa: E402
+    load_grid_train_config, grid_params, world_to_cell, cell_to_world, epsilon_for_episode,
+)
+from board_grid import (  # noqa: E402
+    load_board_dqn_config, board_n, world_to_board_cell, board_cell_to_world,
+    calculate_board_reward, epsilon_for_episode as board_epsilon_for_episode,
+    invalid_cell_mask, board_shaping_q_targets,
+)
+from board_warp import (
+    warp_rgb_to_board, warp_depth_to_board,
+    world_xz_to_warp_pixel, warp_pixel_to_crop_pixel,
+    get_warp_corners, _warp_image_corners,
+)  # noqa: E402
 
 _PLATFORM_CENTER = {1: (-0.646, 0.841), 2: (-1.365, 0.850)}
 
 LOCATOR_STEP_CSV_FIELDS = [
     'timestamp_utc', 'robot_id', 'loc_step', 'aux_loss', 'grad_norm',
     'buffer_weak', 'buffer_normal', 'batch_weak', 'batch_normal', 'checkpoint_saved',
+]
+
+GRID_STEP_CSV_FIELDS = [
+    'timestamp_utc', 'robot_id', 'grid_step', 'phase', 'loss', 'acc', 'grad_norm',
+    'buffer_weak', 'buffer_normal', 'replay_len', 'checkpoint_saved',
+]
+
+BOARD_STEP_CSV_FIELDS = [
+    'timestamp_utc', 'robot_id', 'board_step', 'phase', 'loss', 'shaping_mse', 'grad_norm',
+    'buffer_weak', 'buffer_normal', 'replay_len', 'checkpoint_saved',
 ]
 
 
@@ -58,6 +84,16 @@ class GPUInferenceServer:
                  locator_train: bool = False,
                  locator_config_path: str = None,
                  geo_grasp: bool = False,
+                 grid_train: bool = False,
+                 grid_config_path: str = None,
+                 local_grid: bool = False,
+                 grid_model_path: str = None,
+                 grid_model_path_r2: str = None,
+                 board_dqn_train: bool = False,
+                 board_dqn: bool = False,
+                 board_config_path: str = None,
+                 board_model_path: str = None,
+                 board_model_path_r2: str = None,
                  rl_train: bool = False, rl_train_config_path: str = None,
                  rl_residual_r1: str = None, rl_residual_r2: str = None):
         self.config     = self._load_config(config_path)
@@ -66,9 +102,19 @@ class GPUInferenceServer:
         self.fine_tune  = fine_tune
         self.locator_train = locator_train
         self.geo_grasp  = geo_grasp
+        self.grid_train = grid_train
+        self.local_grid = local_grid
+        self.grid_model_path = grid_model_path
+        self.grid_model_path_r2 = grid_model_path_r2
+        self.board_dqn_train = board_dqn_train
+        self.board_dqn = board_dqn
+        self.board_model_path = board_model_path
+        self.board_model_path_r2 = board_model_path_r2
         self.rl_train   = rl_train
         self.fine_tune_cfg: Dict = {}
         self.locator_cfg: Dict = {}
+        self.grid_cfg: Dict = {}
+        self.board_cfg: Dict = {}
         self.rl_cfg: Dict = {}
         self._rl_robot_cfg: Dict[int, Dict] = {1: {}, 2: {}}
         self.td3_module: Optional[TD3Module] = None
@@ -146,7 +192,62 @@ class GPUInferenceServer:
             self._save_path_r1 = Path(save_r1).name
             self._save_path_r2 = Path(save_r2).name
 
-        if geo_grasp and not locator_train and not fine_tune and not rl_train:
+        if grid_train or local_grid:
+            g_path = grid_config_path or str(
+                Path(__file__).resolve().parent.parent / "config" / "grid_train_config.yaml"
+            )
+            self.grid_cfg = load_grid_train_config(g_path)
+            self._grid_n, self._grid_window_m = grid_params(self.grid_cfg)
+            self._grid_n_cells = self._grid_n * self._grid_n
+            ckpt_cfg = self.grid_cfg.get('checkpoints', {})
+            loc_root = Path(__file__).resolve().parent.parent
+            loc_r1 = ckpt_cfg.get('locator_r1', 'models/R1_locator.pth')
+            loc_r2 = ckpt_cfg.get('locator_r2', 'models/R2_locator.pth')
+            save_g1 = ckpt_cfg.get('save_r1', 'models/R1_local_grid.pth')
+            save_g2 = ckpt_cfg.get('save_r2', 'models/R2_local_grid.pth')
+            if not self.model_path:
+                self.model_path = str(self._resolve_checkpoint_path(loc_r1, 'R1_locator.pth'))
+            if not self.model_path_r2:
+                self.model_path_r2 = str(self._resolve_checkpoint_path(loc_r2, 'R2_locator.pth'))
+            self._save_path_r1_grid = Path(save_g1).name
+            self._save_path_r2_grid = Path(save_g2).name
+            if grid_train:
+                self._weak_regions = self.grid_cfg['_weak_regions_parsed']
+                self._weak_ratio = float(self.grid_cfg['sampling']['weak_ratio'])
+                self._checkpoint_every = int(
+                    self.grid_cfg.get('training', {}).get('checkpoint_every_steps', 100)
+                )
+            if local_grid and not grid_train:
+                if not self.grid_model_path:
+                    self.grid_model_path = save_g1
+                if not self.grid_model_path_r2:
+                    self.grid_model_path_r2 = save_g2
+
+        if board_dqn_train or board_dqn:
+            b_path = board_config_path or str(
+                Path(__file__).resolve().parent.parent / "config" / "board_dqn_config.yaml"
+            )
+            self.board_cfg = load_board_dqn_config(b_path)
+            self._board_n = board_n(self.board_cfg)
+            self._board_n_cells = self._board_n * self._board_n
+            ckpt_cfg = self.board_cfg.get('checkpoints', {})
+            save_b1 = ckpt_cfg.get('save_r1', 'models/R1_board_dqn.pth')
+            save_b2 = ckpt_cfg.get('save_r2', 'models/R2_board_dqn.pth')
+            self._save_path_r1_board = Path(save_b1).name
+            self._save_path_r2_board = Path(save_b2).name
+            if board_dqn_train:
+                self._weak_regions = self.board_cfg['_weak_regions_parsed']
+                self._weak_ratio = float(self.board_cfg['sampling']['weak_ratio'])
+                self._checkpoint_every = int(
+                    self.board_cfg.get('training', {}).get('checkpoint_every_steps', 100)
+                )
+            if board_dqn and not board_dqn_train:
+                if not self.board_model_path:
+                    self.board_model_path = save_b1
+                if not self.board_model_path_r2:
+                    self.board_model_path_r2 = save_b2
+
+        if geo_grasp and not locator_train and not fine_tune and not rl_train and not grid_train and not local_grid and not board_dqn_train and not board_dqn:
             if not self.model_path:
                 self.model_path = "models/R1_locator.pth"
             if not self.model_path_r2:
@@ -165,16 +266,34 @@ class GPUInferenceServer:
             model_config['learning_rate'] = float(
                 self.locator_cfg.get('training', {}).get('learning_rate', 1e-4)
             )
+        if grid_train:
+            model_config['learning_rate'] = float(
+                self.grid_cfg.get('training', {}).get('learning_rate', 1e-4)
+            )
+        if board_dqn_train:
+            model_config['learning_rate'] = float(
+                self.board_cfg.get('training', {}).get('learning_rate', 1e-3)
+            )
 
-        # Robot 1 — Intel D455 (Wider FOV)
-        self.model,  self.bc_module,  self.image_processor  = create_model(model_config)
-        self.model       = self.model.to(self.device)
-        self.bc_module   = self.bc_module.to(self.device)
+        board_only = board_dqn_train or board_dqn
+        self._board_only = board_only
+        self.model = None
+        self.model2 = None
+        self.bc_module = None
+        self.bc_module2 = None
+        self.image_processor = None
+        self.image_processor2 = None
 
-        # Robot 2 — Intel D415 (Narrower FOV)
-        self.model2, self.bc_module2, self.image_processor2 = create_model(model_config)
-        self.model2      = self.model2.to(self.device)
-        self.bc_module2  = self.bc_module2.to(self.device)
+        if not board_only:
+            # Robot 1 — Intel D455 (Wider FOV)
+            self.model, self.bc_module, self.image_processor = create_model(model_config)
+            self.model = self.model.to(self.device)
+            self.bc_module = self.bc_module.to(self.device)
+
+            # Robot 2 — Intel D415 (Narrower FOV)
+            self.model2, self.bc_module2, self.image_processor2 = create_model(model_config)
+            self.model2 = self.model2.to(self.device)
+            self.bc_module2 = self.bc_module2.to(self.device)
 
         # =========================================================================
         # TRAINING BUFFER & SCHEDULING
@@ -183,6 +302,10 @@ class GPUInferenceServer:
             self.batch_size = int(self.fine_tune_cfg.get('training', {}).get('batch_size', 16))
         elif locator_train:
             self.batch_size = int(self.locator_cfg.get('training', {}).get('batch_size', 16))
+        elif grid_train:
+            self.batch_size = int(self.grid_cfg.get('training', {}).get('batch_size', 16))
+        elif board_dqn_train:
+            self.batch_size = int(self.board_cfg.get('training', {}).get('batch_size', 4))
         elif rl_train:
             self.batch_size = int(self.rl_cfg.get('training', {}).get('batch_size', 16))
         else:
@@ -200,10 +323,26 @@ class GPUInferenceServer:
         self.normal_buffer        = deque(maxlen=10000)
         self.weak_buffer2         = deque(maxlen=10000)
         self.normal_buffer2       = deque(maxlen=10000)
+        replay_cap = 10000
+        if grid_train:
+            replay_cap = int(self.grid_cfg.get('training', {}).get('replay_capacity', 10000))
+        self.grid_replay          = deque(maxlen=replay_cap)
+        self.grid_replay2         = deque(maxlen=replay_cap)
         self.training_step_count  = 0
         self.training_step_count2 = 0
+        self.grid_training_step_count  = 0
+        self.grid_training_step_count2 = 0
+        self.board_training_step_count  = 0
+        self.board_training_step_count2 = 0
+        self.board_shaping_episode_count  = 0
+        self.board_shaping_episode_count2 = 0
+        self.board_cnn_correct_count  = 0
+        self.board_cnn_correct_count2 = 0
+        self.board_cnn_total_count  = 0
+        self.board_cnn_total_count2 = 0
 
-        self._load_model_weights()
+        if not board_only:
+            self._load_model_weights()
 
         self.loc_module: Optional[LocalizationModule] = None
         self.loc_module2: Optional[LocalizationModule] = None
@@ -217,6 +356,23 @@ class GPUInferenceServer:
                 self.model2, learning_rate=loc_lr, weight_decay=loc_wd,
             ).to(self.device)
             self._load_locator_optimizer_state()
+
+        self.grid_module: Optional[LocalGridModule] = None
+        self.grid_module2: Optional[LocalGridModule] = None
+        if grid_train or local_grid:
+            self._init_grid_modules(model_config)
+            if grid_train:
+                for param in self.model.parameters():
+                    param.requires_grad = False
+                for param in self.model2.parameters():
+                    param.requires_grad = False
+                self.model.eval()
+                self.model2.eval()
+
+        self.board_module: Optional[FullBoardDQNModule] = None
+        self.board_module2: Optional[FullBoardDQNModule] = None
+        if board_dqn_train or board_dqn:
+            self._init_board_modules()
 
         if rl_train or rl_residual_r1 or rl_residual_r2:
             if not self.rl_cfg:
@@ -232,14 +388,17 @@ class GPUInferenceServer:
             self.rl_training_step_count2 = 0
             self._load_rl_weights(rl_residual_r1, rl_residual_r2)
 
-        self.lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            self.bc_module.optimizer,
-            mode='min', factor=0.5, patience=50, min_lr=1e-5
-        )
-        self.lr_scheduler2 = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            self.bc_module2.optimizer,
-            mode='min', factor=0.5, patience=50, min_lr=1e-5
-        )
+        self.lr_scheduler = None
+        self.lr_scheduler2 = None
+        if not board_only:
+            self.lr_scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                self.bc_module.optimizer,
+                mode='min', factor=0.5, patience=50, min_lr=1e-5
+            )
+            self.lr_scheduler2 = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                self.bc_module2.optimizer,
+                mode='min', factor=0.5, patience=50, min_lr=1e-5
+            )
         self.loc_lr_scheduler = None
         self.loc_lr_scheduler2 = None
         if locator_train and self.loc_module is not None:
@@ -264,20 +423,21 @@ class GPUInferenceServer:
         # Robot 2: Right camera looking inward
         R2_CROP = dict(crop_y0=0.21, crop_y1=0.885, crop_x0=0.37,  crop_x1=0.71)
 
-        self.image_processor.crop_y0  = R1_CROP['crop_y0']
-        self.image_processor.crop_y1  = R1_CROP['crop_y1']
-        self.image_processor.crop_x0  = R1_CROP['crop_x0']
-        self.image_processor.crop_x1  = R1_CROP['crop_x1']
-        self.image_processor.device   = self.device
-
-        self.image_processor2.crop_y0 = R2_CROP['crop_y0']
-        self.image_processor2.crop_y1 = R2_CROP['crop_y1']
-        self.image_processor2.crop_x0 = R2_CROP['crop_x0']
-        self.image_processor2.crop_x1 = R2_CROP['crop_x1']
-        self.image_processor2.device  = self.device
-
         self._r1_crop = R1_CROP
         self._r2_crop = R2_CROP
+
+        if not board_only:
+            self.image_processor.crop_y0  = R1_CROP['crop_y0']
+            self.image_processor.crop_y1  = R1_CROP['crop_y1']
+            self.image_processor.crop_x0  = R1_CROP['crop_x0']
+            self.image_processor.crop_x1  = R1_CROP['crop_x1']
+            self.image_processor.device   = self.device
+
+            self.image_processor2.crop_y0 = R2_CROP['crop_y0']
+            self.image_processor2.crop_y1 = R2_CROP['crop_y1']
+            self.image_processor2.crop_x0 = R2_CROP['crop_x0']
+            self.image_processor2.crop_x1 = R2_CROP['crop_x1']
+            self.image_processor2.device  = self.device
 
         # =========================================================================
         # COORDINATE SYSTEM MAPPING
@@ -293,7 +453,7 @@ class GPUInferenceServer:
         # =========================================================================
         # Ensures all active robots complete their current episode before triggering
         # global domain randomizations (e.g., lighting, floor textures).
-        self._barrier_num_robots  = 2          # Set to 1 for single-robot deployments
+        self._barrier_num_robots  = 1         # Set to 1 for single-robot deployments
         self._barrier_ready_count = 0
         self._barrier_event       = threading.Event()
         self._barrier_lock        = threading.Lock()
@@ -303,6 +463,7 @@ class GPUInferenceServer:
         self._setup_ready_count   = 0
         self._setup_lock          = threading.Lock()
         self._setup_wait_timeout_s = 120.0
+        self._barrier_wait_timeout_s = 120.0
 
         # =========================================================================
         # NETWORKING & CONCURRENCY
@@ -602,6 +763,1038 @@ class GPUInferenceServer:
             'timestamp':   time.time(),
         }
 
+    def _init_grid_modules(self, model_config: Dict) -> None:
+        """Build local-grid Q modules (separate grasp_net per robot)."""
+        tr = self.grid_cfg.get('training', {})
+        freeze = bool(tr.get('freeze_backbone', True))
+        lr = float(tr.get('learning_rate', 1e-4))
+        wd = float(model_config.get('weight_decay', 8e-4))
+        gamma = float(tr.get('gamma', 0.99))
+        n_cells = self._grid_n_cells
+
+        def _build_one(locator_model: UR3GraspCNN_Enhanced) -> LocalGridModule:
+            grid_net, _, _ = create_model(model_config)
+            grid_net.load_state_dict(locator_model.state_dict(), strict=False)
+            return create_local_grid_module(
+                grid_net,
+                n_cells=n_cells,
+                learning_rate=lr,
+                weight_decay=wd,
+                gamma=gamma,
+                freeze_backbone=freeze,
+            ).to(self.device)
+
+        self.grid_module = _build_one(self.model)
+        self.grid_module2 = _build_one(self.model2)
+        self._load_grid_weights()
+
+    def _load_grid_weights(self) -> None:
+        host_root = Path(__file__).resolve().parent.parent
+
+        def _load(mod: Optional[LocalGridModule], path_override: Optional[str], default_name: str, step_attr: str):
+            if mod is None:
+                return
+            path = self._resolve_checkpoint_path(path_override, default_name)
+            print(f"🔍 Looking for local grid at: {path.resolve()}")
+            if path.exists():
+                step = mod.load_model(str(path))
+                setattr(self, step_attr, max(getattr(self, step_attr), step))
+                print(f"✅ Loaded local grid: {path.name}  (step {step})")
+            elif self.grid_train:
+                print(f"   ↳ No grid checkpoint yet — starting from locator backbone + random Q-head")
+            elif self.local_grid:
+                print(f"⚠️  WARNING: No local grid checkpoint at {path.name} — Q-head is untrained (random cells)")
+
+        _load(self.grid_module, self.grid_model_path, self._save_path_r1_grid, 'grid_training_step_count')
+        _load(self.grid_module2, self.grid_model_path_r2, self._save_path_r2_grid, 'grid_training_step_count2')
+
+    def _grid_training_phase(self, robot_id: int) -> str:
+        phase_cfg = self.grid_cfg.get('training', {}).get('phase', 'both')
+        if phase_cfg == 'shaping':
+            return 'shaping'
+        if phase_cfg == 'rl':
+            return 'rl'
+        step = self.grid_training_step_count2 if robot_id == 2 else self.grid_training_step_count
+        shaping_steps = int(self.grid_cfg.get('training', {}).get('shaping_steps', 2000))
+        return 'shaping' if step < shaping_steps else 'rl'
+
+    def _grid_epsilon(self, session_episode: int) -> float:
+        return epsilon_for_episode(session_episode, self.grid_cfg)
+
+    def _append_grid_step_log(self, robot_id: int, row: Dict) -> None:
+        path = _REPO_ROOT / "data" / f"grid_train_steps_r{robot_id}.csv"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with self._locator_step_log_lock:
+            write_header = not path.exists()
+            with open(path, 'a', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=GRID_STEP_CSV_FIELDS)
+                if write_header:
+                    writer.writeheader()
+                writer.writerow({k: row.get(k, '') for k in GRID_STEP_CSV_FIELDS})
+
+    def _cell_from_teacher(
+        self, teacher_x: float, teacher_z: float, center_x: float, center_z: float,
+    ) -> Optional[int]:
+        return world_to_cell(
+            teacher_x, teacher_z, center_x, center_z,
+            n=self._grid_n, window_m=self._grid_window_m,
+        )
+
+    @staticmethod
+    def _grid_label_spawn_xz(training_data: Dict, obj_pos: List) -> Tuple[float, float]:
+        """Spawn-first block center for grid labels (ignore post-grasp drift)."""
+        label_x = float(training_data.get('spawn_x', 0.0))
+        label_z = float(training_data.get('spawn_z', 0.0))
+        if label_x == 0.0 and label_z == 0.0:
+            label_x = float(obj_pos[0]) if len(obj_pos) >= 1 else 0.0
+            label_z = float(obj_pos[1]) if len(obj_pos) >= 2 else 0.0
+        return label_x, label_z
+
+    @staticmethod
+    def _grid_center_xy(training_data: Dict, pred_info: Dict) -> Tuple[float, float]:
+        """Prefer grasp-time grid center from sim; fall back to fresh locator pass."""
+        gx = training_data.get('grid_center_x')
+        gz = training_data.get('grid_center_z')
+        if gx is not None and gz is not None:
+            return float(gx), float(gz)
+        return float(pred_info['pred_obj_x']), float(pred_info['pred_obj_z'])
+
+    def _pose_from_cell(
+        self, cell: int, center_x: float, center_z: float, robot_id: int,
+    ) -> List[float]:
+        wx, wz = cell_to_world(
+            cell, center_x, center_z, n=self._grid_n, window_m=self._grid_window_m,
+        )
+        return compute_grasp_pose_from_object_world(
+            wx, DEFAULT_OBJECT_Y_M, wz, robot_id, add_jitter=False,
+        )
+
+    def _predict_local_grid_pose(self, full_message: Dict) -> Dict:
+        """Locator centers grid; Q-head picks cell; geometry builds grasp."""
+        robot_id    = int(full_message.get('robot_id', 1))
+        is_sim      = full_message.get('source', 'real') == 'simulation'
+        camera_data = full_message['data']
+        grid_mod    = self.grid_module2 if robot_id == 2 else self.grid_module
+        if grid_mod is None:
+            return {'type': 'error', 'message': 'Local grid module not loaded'}
+
+        pred = self._predict_object_xz(camera_data, robot_id, is_sim)
+        rgbd = self.preprocess_rgbd_data(camera_data, is_simulation=is_sim, robot_id=robot_id)
+        with torch.no_grad():
+            cell_t = grid_mod.select_cell(rgbd, epsilon=0.0)
+        cell = int(cell_t.cpu().numpy()[0])
+        grasp_pose = self._pose_from_cell(
+            cell, pred['pred_obj_x'], pred['pred_obj_z'], robot_id,
+        )
+        return {
+            'type':           'grasp_prediction',
+            'pose':           grasp_pose,
+            'mode':           'exploit_grid',
+            'grid_cell':      cell,
+            'grid_center_x':  pred['pred_obj_x'],
+            'grid_center_z':  pred['pred_obj_z'],
+            'pred_obj_x':     pred['pred_obj_x'],
+            'pred_obj_z':     pred['pred_obj_z'],
+            'confidence':     1.0,
+            'timestamp':      time.time(),
+        }
+
+    def _predict_grid_explore_pose(self, full_message: Dict) -> Dict:
+        """RL training: epsilon-greedy cell selection."""
+        robot_id    = int(full_message.get('robot_id', 1))
+        is_sim      = full_message.get('source', 'real') == 'simulation'
+        camera_data = full_message['data']
+        grid_mod    = self.grid_module2 if robot_id == 2 else self.grid_module
+        session_ep  = max(1, int(full_message.get('session_episode', 1)))
+        eps         = self._grid_epsilon(session_ep)
+
+        pred = self._predict_object_xz(camera_data, robot_id, is_sim)
+        rgbd = self.preprocess_rgbd_data(camera_data, is_simulation=is_sim, robot_id=robot_id)
+        with torch.no_grad():
+            cell_t = grid_mod.select_cell(rgbd, epsilon=eps)
+        cell = int(cell_t.cpu().numpy()[0])
+        grasp_pose = self._pose_from_cell(
+            cell, pred['pred_obj_x'], pred['pred_obj_z'], robot_id,
+        )
+        return {
+            'type':           'grasp_prediction',
+            'pose':           grasp_pose,
+            'mode':           'grid_explore',
+            'grid_cell':      cell,
+            'grid_center_x':  pred['pred_obj_x'],
+            'grid_center_z':  pred['pred_obj_z'],
+            'pred_obj_x':     pred['pred_obj_x'],
+            'pred_obj_z':     pred['pred_obj_z'],
+            'epsilon':        eps,
+            'confidence':     1.0,
+            'timestamp':      time.time(),
+        }
+
+    def format_grid_shaping_batch(self, batch: List[Dict], robot_id: int) -> Dict[str, torch.Tensor]:
+        states_list = []
+        labels_list = []
+        for exp in batch:
+            is_sim = exp.get('source', 'real') == 'simulation'
+            states_list.append(
+                self.preprocess_rgbd_data(exp['state'], is_simulation=is_sim, robot_id=robot_id)
+            )
+            labels_list.append(int(exp['cell_label']))
+        return {
+            'states': torch.cat(states_list).to(self.device),
+            'cell_labels': torch.tensor(labels_list, dtype=torch.long, device=self.device),
+        }
+
+    def format_grid_dqn_batch(self, batch: List[Dict], robot_id: int) -> Dict[str, torch.Tensor]:
+        states_list, next_states_list = [], []
+        actions_list, rewards_list, dones_list = [], [], []
+        for exp in batch:
+            is_sim = exp.get('source', 'real') == 'simulation'
+            states_list.append(
+                self.preprocess_rgbd_data(exp['state'], is_simulation=is_sim, robot_id=robot_id)
+            )
+            ns = exp.get('next_state', exp['state'])
+            next_states_list.append(
+                self.preprocess_rgbd_data(ns, is_simulation=is_sim, robot_id=robot_id)
+            )
+            actions_list.append(int(exp['cell_action']))
+            rewards_list.append(float(exp['reward']))
+            dones_list.append(float(exp.get('done', True)))
+        return {
+            'states': torch.cat(states_list).to(self.device),
+            'next_states': torch.cat(next_states_list).to(self.device),
+            'cell_actions': torch.tensor(actions_list, dtype=torch.long, device=self.device),
+            'rewards': torch.tensor(rewards_list, dtype=torch.float32, device=self.device),
+            'dones': torch.tensor(dones_list, dtype=torch.float32, device=self.device),
+        }
+
+    def _run_grid_training_step(self, robot_id: int = 1, dqn: bool = False):
+        lock = self.train_lock if robot_id == 1 else self.train_lock2
+        if lock.locked():
+            return
+
+        with lock:
+            try:
+                if robot_id == 2:
+                    grid_mod   = self.grid_module2
+                    weak_buf   = self.weak_buffer2
+                    normal_buf = self.normal_buffer2
+                    replay_buf = self.grid_replay2
+                    step_attr  = 'grid_training_step_count2'
+                    save_name  = self._save_path_r2_grid
+                else:
+                    grid_mod   = self.grid_module
+                    weak_buf   = self.weak_buffer
+                    normal_buf = self.normal_buffer
+                    replay_buf = self.grid_replay
+                    step_attr  = 'grid_training_step_count'
+                    save_name  = self._save_path_r1_grid
+
+                phase = self._grid_training_phase(robot_id)
+                if dqn:
+                    replay_min = int(self.grid_cfg.get('training', {}).get('replay_min', 500))
+                    if len(replay_buf) < replay_min:
+                        return
+                    batch_raw = random.sample(list(replay_buf), min(self.batch_size, len(replay_buf)))
+                    torch_batch = self.format_grid_dqn_batch(batch_raw, robot_id)
+                    losses = grid_mod.update_dqn(torch_batch)
+                    tgt_every = int(self.grid_cfg.get('training', {}).get('target_update_steps', 100))
+                    if grid_mod._dqn_step % tgt_every == 0:
+                        grid_mod.sync_target()
+                    loss_key = 'dqn'
+                    acc = 0.0
+                else:
+                    batch_raw = self._sample_mixed_batch(
+                        weak_buf, normal_buf, self.batch_size, self._weak_ratio,
+                    )
+                    if not batch_raw:
+                        return
+                    torch_batch = self.format_grid_shaping_batch(batch_raw, robot_id)
+                    losses = grid_mod.update_shaping(torch_batch)
+                    loss_key = 'ce'
+                    acc = losses.get('acc', 0.0)
+
+                step = getattr(self, step_attr) + 1
+                setattr(self, step_attr, step)
+
+                ckpt_every = self._checkpoint_every
+                checkpoint_saved = int(step % ckpt_every == 0)
+
+                batch_weak = sum(1 for s in (batch_raw if not dqn else []) if s.get('demo_bucket') == 'weak')
+                self._append_grid_step_log(robot_id, {
+                    'timestamp_utc': datetime.now(timezone.utc).isoformat(),
+                    'robot_id': robot_id,
+                    'grid_step': step,
+                    'phase': 'rl' if dqn else phase,
+                    'loss': losses.get(loss_key, losses['total']),
+                    'acc': acc,
+                    'grad_norm': losses.get('grad_norm', 0.0),
+                    'buffer_weak': len(weak_buf),
+                    'buffer_normal': len(normal_buf),
+                    'replay_len': len(replay_buf),
+                    'checkpoint_saved': checkpoint_saved,
+                })
+
+                if step % 5 == 0:
+                    tag = 'GRID-DQN' if dqn else 'GRID'
+                    print(
+                        f"🔥 R{robot_id} {tag} Step {step:4d} | "
+                        f"Loss: {losses['total']:.4f} | Acc: {acc:.3f} | "
+                        f"GradNorm: {losses.get('grad_norm', 0):.3f} | "
+                        f"weak:{len(weak_buf)} normal:{len(normal_buf)} replay:{len(replay_buf)}"
+                    )
+
+                if checkpoint_saved:
+                    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                    save_dir = os.path.join(base_dir, "models")
+                    os.makedirs(save_dir, exist_ok=True)
+                    full_path = os.path.join(save_dir, save_name)
+                    grid_mod.save_model(full_path, training_step=step)
+                    print(f"💾 R{robot_id} SAVED GRID MODEL TO: {full_path}")
+
+            except Exception as e:
+                print(f"❌ CRITICAL GRID TRAINING ERROR (R{robot_id}): {e}")
+                import traceback
+                traceback.print_exc()
+
+    def _handle_grid_training_data(self, training_data: Dict, source: str, robot_id: int) -> Dict:
+        """Teacher shaping labels and RL replay for local grid."""
+        try:
+            collect_mode = training_data.get('mode', 'grid_collect')
+            is_sim = source == 'simulation'
+            obj_pos = training_data.get('object_pos', [0.0, 0.0])
+            label_x, label_z = self._grid_label_spawn_xz(training_data, obj_pos)
+            label_xz_for_loc = [label_x, label_z] if (label_x != 0.0 or label_z != 0.0) else None
+            pred_info = self._predict_object_xz(
+                training_data['state'], robot_id, is_sim,
+                label_xz=label_xz_for_loc,
+            )
+            center_x, center_z = self._grid_center_xy(training_data, pred_info)
+
+            ack: Dict = {
+                'type': 'training_ack',
+                'grid': True,
+                'pred_obj_x': center_x,
+                'pred_obj_z': center_z,
+                'grid_center_x': center_x,
+                'grid_center_z': center_z,
+                'grid_phase': self._grid_training_phase(robot_id),
+            }
+            if label_xz_for_loc is not None:
+                ack['locator_err_m'] = math.hypot(label_x - center_x, label_z - center_z)
+            elif 'locator_err_m' in pred_info:
+                ack['locator_err_m'] = pred_info['locator_err_m']
+
+            if collect_mode == 'grid_collect':
+                # Label cell from spawn center, not grasp aim XY or post-grasp block drift.
+                cell = self._cell_from_teacher(label_x, label_z, center_x, center_z)
+                if cell is None:
+                    ack['out_of_window'] = True
+                    ack['skipped'] = True
+                    return ack
+
+                sample = {
+                    'state': training_data['state'],
+                    'cell_label': cell,
+                    'source': source,
+                    'robot_id': robot_id,
+                }
+                bucket = self._resolve_demo_bucket(training_data, robot_id)
+                sample['demo_bucket'] = bucket
+                if robot_id == 2:
+                    target = self.weak_buffer2 if bucket == 'weak' else self.normal_buffer2
+                else:
+                    target = self.weak_buffer if bucket == 'weak' else self.normal_buffer
+
+                phase = self._grid_training_phase(robot_id)
+                if phase == 'shaping':
+                    target.append(sample)
+                    if self._fine_tune_buffers_ready(robot_id):
+                        threading.Thread(
+                            target=self._run_grid_training_step, args=(robot_id, False), daemon=True,
+                        ).start()
+
+                ack.update({
+                    'teacher_cell': cell,
+                    'grid_cell': cell,
+                    'out_of_window': False,
+                    'buffer_len': len(self.weak_buffer if robot_id == 1 else self.weak_buffer2)
+                        + len(self.normal_buffer if robot_id == 1 else self.normal_buffer2),
+                    'grid_step': self.grid_training_step_count2 if robot_id == 2 else self.grid_training_step_count,
+                })
+                return ack
+
+            if collect_mode == 'grid_rl':
+                cell_action = int(training_data.get('cell_action', training_data.get('grid_cell', 0)))
+
+                label_cell = self._cell_from_teacher(label_x, label_z, center_x, center_z)
+                replay_used = True
+                replay_skip_reason = ''
+                if label_cell is None:
+                    replay_used = False
+                    replay_skip_reason = 'out_of_window'
+
+                sample = {
+                    'state': training_data['state'],
+                    'next_state': training_data.get('next_state', training_data['state']),
+                    'cell_action': cell_action,
+                    'reward': float(training_data.get('reward', 0.0)),
+                    'done': bool(training_data.get('done', True)),
+                    'source': source,
+                    'robot_id': robot_id,
+                }
+                replay = self.grid_replay2 if robot_id == 2 else self.grid_replay
+                if replay_used:
+                    replay.append(sample)
+                replay_min = int(self.grid_cfg.get('training', {}).get('replay_min', 500))
+                phase = self._grid_training_phase(robot_id)
+                if replay_used and phase == 'rl' and len(replay) >= replay_min:
+                    threading.Thread(
+                        target=self._run_grid_training_step, args=(robot_id, True), daemon=True,
+                    ).start()
+                ack.update({
+                    'grid_cell': cell_action,
+                    'teacher_cell': label_cell,
+                    'replay_len': len(replay),
+                    'replay_used': replay_used,
+                    'replay_skip_reason': replay_skip_reason,
+                    'reward': sample['reward'],
+                })
+                return ack
+
+            return {'type': 'error', 'message': f'Unknown grid collect mode: {collect_mode}'}
+        except Exception as e:
+            return {'type': 'error', 'message': str(e)}
+
+    def _init_board_modules(self) -> None:
+        tr = self.board_cfg.get('training', {})
+        lr = float(tr.get('learning_rate', 1e-3))
+        wd = float(tr.get('weight_decay', 8e-5))
+        gamma = float(tr.get('gamma', 0.99))
+        enc_ph = float(tr.get('encoder_lr_factor', 0.1))
+        n_cells = self._board_n_cells
+
+        def _build_one(robot_id: int) -> FullBoardDQNModule:
+            mask_np = invalid_cell_mask(robot_id, self._board_n, self.board_cfg)
+            mask_t = torch.tensor(mask_np, dtype=torch.bool, device=self.device)
+            return create_full_board_dqn_module(
+                n_cells=n_cells,
+                learning_rate=lr,
+                weight_decay=wd,
+                encoder_lr_factor=enc_ph,
+                gamma=gamma,
+                invalid_mask=mask_t,
+            ).to(self.device)
+
+        self.board_module = _build_one(1)
+        self.board_module2 = _build_one(2)
+        self._load_board_weights()
+
+    def _load_board_weights(self) -> None:
+        def _load(mod: Optional[FullBoardDQNModule], path_override: Optional[str],
+                  default_name: str, step_attr: str):
+            if mod is None:
+                return
+            path = self._resolve_checkpoint_path(path_override, default_name)
+            print(f"[BOARD] Looking for board DQN at: {path.resolve()}")
+            if path.exists():
+                step = mod.load_model(str(path))
+                setattr(self, step_attr, max(getattr(self, step_attr), step))
+                print(f"[BOARD] Loaded board DQN: {path.name}  (step {step})")
+            elif self.board_dqn_train:
+                print("   -> No board checkpoint yet — starting from pretrained MobileNet")
+            elif self.board_dqn:
+                print(f"[BOARD] WARNING: No board DQN checkpoint at {path.name}")
+
+        _load(self.board_module, self.board_model_path, self._save_path_r1_board,
+              'board_training_step_count')
+        _load(self.board_module2, self.board_model_path_r2, self._save_path_r2_board,
+              'board_training_step_count2')
+
+    def _board_training_phase(self, robot_id: int) -> str:
+        """Paper session 2: sim uses oracle shaping only (no sparse-RL replay)."""
+        return 'shaping'
+
+    def _board_epsilon(self, session_episode: int) -> float:
+        return board_epsilon_for_episode(session_episode, self.board_cfg)
+
+    def _append_board_step_log(self, robot_id: int, row: Dict) -> None:
+        path = _REPO_ROOT / "data" / f"board_dqn_train_steps_r{robot_id}.csv"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with self._locator_step_log_lock:
+            write_header = not path.exists()
+            with open(path, 'a', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=BOARD_STEP_CSV_FIELDS)
+                if write_header:
+                    writer.writeheader()
+                writer.writerow({k: row.get(k, '') for k in BOARD_STEP_CSV_FIELDS})
+
+    def _crop_rgb_depth(self, rgb: np.ndarray, depth: np.ndarray, robot_id: int):
+        crop = self._r2_crop if robot_id == 2 else self._r1_crop
+        h, w = rgb.shape[:2]
+        y0 = int(crop['crop_y0'] * h)
+        y1 = int(crop['crop_y1'] * h)
+        x0 = int(crop['crop_x0'] * w)
+        x1 = int(crop['crop_x1'] * w)
+        return rgb[y0:y1, x0:x1].copy(), depth[y0:y1, x0:x1].copy()
+
+    def _preprocess_board_pair(self, camera_data: Dict, is_simulation: bool,
+                               robot_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
+        img = self.decode_b64_image(camera_data)
+        rgb = cv2.cvtColor(img['rgb'], cv2.COLOR_BGR2RGB)
+        depth = img['depth']
+        if depth.dtype == np.uint16:
+            depth = depth.astype(np.float32) / 1000.0
+        else:
+            depth = depth.astype(np.float32)
+        rgb_c, depth_c = self._crop_rgb_depth(rgb, depth, robot_id)
+        rgb_w = warp_rgb_to_board(rgb_c, robot_id, out_size=224, cfg=self.board_cfg)
+        depth_w = warp_depth_to_board(depth_c, robot_id, out_size=224, cfg=self.board_cfg)
+
+        DEPTH_MIN, DEPTH_MAX = 0.50, 1.00
+        depth_w = np.clip(depth_w, DEPTH_MIN, DEPTH_MAX)
+        depth_w = (depth_w - DEPTH_MIN) / (DEPTH_MAX - DEPTH_MIN)
+
+        rgb_t = torch.from_numpy(rgb_w.astype(np.float32) / 255.0).permute(2, 0, 1).unsqueeze(0)
+        depth_t = torch.from_numpy(depth_w.astype(np.float32)).unsqueeze(0).unsqueeze(0)
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+        rgb_t = (rgb_t - mean) / std
+        depth_t = (depth_t - 0.5) / 0.5
+        return rgb_t.to(self.device), depth_t.to(self.device)
+
+    def _board_label_xz(self, payload: Dict) -> Tuple[Optional[float], Optional[float]]:
+        """Prefer live object XZ (matches camera) over logged spawn."""
+        obj_pos = payload.get('object_pos')
+        if isinstance(obj_pos, (list, tuple)) and len(obj_pos) >= 2:
+            ox, oz = float(obj_pos[0]), float(obj_pos[1])
+            if abs(ox) > 1e-6 or abs(oz) > 1e-6:
+                return ox, oz
+        ox = payload.get('object_x')
+        oz = payload.get('object_z')
+        if ox is not None and oz is not None:
+            return float(ox), float(oz)
+        sx = payload.get('spawn_x')
+        sz = payload.get('spawn_z')
+        if sx is not None and sz is not None:
+            return float(sx), float(sz)
+        return None, None
+
+    def _board_cell_pixel(self, cell: int, board_h: int, board_w: int, robot_id: int = 1) -> Tuple[int, int]:
+        wx, wz = board_cell_to_world(cell, robot_id, n=self._board_n, cfg=self.board_cfg)
+        return world_xz_to_warp_pixel(
+            wx, wz, robot_id, out_size=board_w, cfg=self.board_cfg, apply_post_flip=True,
+        )
+
+    def _save_board_crop_debug(
+        self,
+        rgb_crop: np.ndarray,
+        robot_id: int,
+        label_x: Optional[float],
+        label_z: Optional[float],
+    ) -> None:
+        try:
+            debug_dir = Path(__file__).resolve().parent.parent / "debug"
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            vis = cv2.cvtColor(rgb_crop.copy(), cv2.COLOR_RGB2BGR)
+            h, w = vis.shape[:2]
+
+            yaml_extra = {}
+            warp_yaml = Path(__file__).resolve().parent.parent / "config" / f"board_warp_r{robot_id}.yaml"
+            if warp_yaml.exists():
+                with open(warp_yaml, encoding="utf-8") as f:
+                    yaml_extra = yaml.safe_load(f) or {}
+            corners = yaml_extra.get("image_corners") or []
+            if len(corners) == 4:
+                pts = np.array(corners, dtype=np.int32)
+                cv2.polylines(vis, [pts], True, (255, 255, 0), 2)
+                for i, (px, py) in enumerate(pts):
+                    cv2.circle(vis, (int(px), int(py)), 4, (255, 255, 0), -1)
+                    cv2.putText(
+                        vis, str(i), (int(px) + 4, int(py) - 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 0), 1, cv2.LINE_AA,
+                    )
+
+            if label_x is not None and label_z is not None:
+                ux, vy = world_xz_to_warp_pixel(
+                    label_x, label_z, robot_id, out_size=224, cfg=self.board_cfg,
+                    apply_post_flip=True,
+                )
+                cx, cy = warp_pixel_to_crop_pixel(
+                    ux, vy, robot_id, w, h, out_size=224, cfg=self.board_cfg,
+                    apply_post_flip=True,
+                )
+                cv2.drawMarker(
+                    vis, (int(round(cx)), int(round(cy))), (0, 0, 255),
+                    cv2.MARKER_CROSS, 14, 2,
+                )
+                cv2.putText(
+                    vis, "RED=crop point for sim XZ", (4, h - 8),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0, 0, 255), 1, cv2.LINE_AA,
+                )
+
+            out = debug_dir / f"board_crop_r{robot_id}_latest.jpg"
+            cv2.imwrite(str(out), vis)
+        except Exception as e:
+            print(f"[BOARD DEBUG R{robot_id}] crop debug save failed: {e}", flush=True)
+
+
+    def _warp_rgb_for_debug(self, camera_data: Dict, robot_id: int) -> np.ndarray:
+        img = self.decode_b64_image(camera_data)
+        rgb = cv2.cvtColor(img['rgb'], cv2.COLOR_BGR2RGB)
+        depth = img['depth']
+        if depth.dtype != np.float32:
+            depth = depth.astype(np.float32)
+        rgb_c, _ = self._crop_rgb_depth(rgb, depth, robot_id)
+        rgb_w = warp_rgb_to_board(rgb_c, robot_id, out_size=224, cfg=self.board_cfg)
+        return rgb_w
+
+    def _board_q_diag_from_tensors(
+        self,
+        rgb_t: torch.Tensor,
+        depth_t: torch.Tensor,
+        board_mod: FullBoardDQNModule,
+        teacher_cell: int,
+        argmax_cell: int,
+        robot_id: int,
+        label_x: Optional[float] = None,
+        label_z: Optional[float] = None,
+    ) -> Tuple[Optional[Dict], Optional[np.ndarray]]:
+        try:
+            with torch.no_grad():
+                q_t = board_mod.q_map(rgb_t, depth_t)
+            q_np = q_t.squeeze().cpu().numpy()
+            diag = compute_board_q_diagnostics(
+                q_np, teacher_cell, argmax_cell, robot_id, self.board_cfg,
+                label_x=label_x, label_z=label_z,
+            )
+            return diag, q_np
+        except Exception as exc:
+            print(f"[BOARD Q-DIAG R{robot_id}] failed: {exc}", flush=True)
+            return None, None
+
+    def _save_board_debug_overlay(
+        self,
+        rgb_board: np.ndarray,
+        robot_id: int,
+        cnn_cell: Optional[int] = None,
+        teacher_cell: Optional[int] = None,
+        meta: Optional[Dict] = None,
+        q_map: Optional[np.ndarray] = None,
+        q_diag: Optional[Dict] = None,
+        near_radius_cells: int = 2,
+    ) -> None:
+        try:
+            debug_dir = Path(__file__).resolve().parent.parent / "debug"
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            vis = rgb_board.copy()
+            h, w = vis.shape[:2]
+            # Draw in BGR so OpenCV colors match what is saved to disk.
+            vis_bgr = cv2.cvtColor(vis, cv2.COLOR_RGB2BGR)
+
+            if teacher_cell is not None:
+                tx, ty = self._board_cell_pixel(teacher_cell, h, w, robot_id)
+                cv2.drawMarker(vis_bgr, (tx, ty), (0, 0, 255), cv2.MARKER_CROSS, 16, 3)
+                cv2.circle(vis_bgr, (tx, ty), 12, (0, 0, 255), 2)
+
+            if cnn_cell is not None:
+                gx, gy = self._board_cell_pixel(cnn_cell, h, w, robot_id)
+                cv2.drawMarker(vis_bgr, (gx, gy), (0, 255, 0), cv2.MARKER_TILTED_CROSS, 14, 2)
+
+            stem = f"board_warp_r{robot_id}_latest"
+            out = debug_dir / f"{stem}.jpg"
+            cv2.imwrite(str(out), vis_bgr)
+
+            if q_map is not None:
+                heat_rgb = blend_q_heatmap_overlay(rgb_board, q_map, alpha=0.5)
+                heat_bgr = cv2.cvtColor(heat_rgb, cv2.COLOR_RGB2BGR)
+                if teacher_cell is not None:
+                    tx, ty = self._board_cell_pixel(teacher_cell, h, w, robot_id)
+                    cv2.drawMarker(heat_bgr, (tx, ty), (0, 0, 255), cv2.MARKER_CROSS, 16, 3)
+                    cv2.circle(heat_bgr, (tx, ty), 12, (0, 0, 255), 2)
+                    cell_px = max(w, h) / float(self._board_n)
+                    near_r = int(round(cell_px * near_radius_cells))
+                    cv2.circle(heat_bgr, (tx, ty), near_r, (0, 0, 255), 1, cv2.LINE_AA)
+                if cnn_cell is not None:
+                    gx, gy = self._board_cell_pixel(cnn_cell, h, w, robot_id)
+                    cv2.drawMarker(heat_bgr, (gx, gy), (0, 255, 0), cv2.MARKER_TILTED_CROSS, 14, 2)
+                cv2.putText(
+                    heat_bgr, "JET=Q heat  RED=teacher  GREEN=argmax", (4, 16),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA,
+                )
+                cv2.imwrite(str(debug_dir / f"board_q_heatmap_r{robot_id}_latest.jpg"), heat_bgr)
+
+            sidecar = {
+                'robot_id': robot_id,
+                'cnn_cell': cnn_cell,
+                'teacher_cell': teacher_cell,
+                'cnn_hit': (
+                    int(teacher_cell) == int(cnn_cell)
+                    if teacher_cell is not None and cnn_cell is not None else None
+                ),
+            }
+            if meta:
+                sidecar.update(meta)
+            if q_diag:
+                sidecar.update(q_diag)
+            if teacher_cell is not None:
+                lx = sidecar.get('label_x')
+                lz = sidecar.get('label_z')
+                if lx is not None and lz is not None:
+                    tpx, tpy = world_xz_to_warp_pixel(
+                        float(lx), float(lz), robot_id, out_size=h, cfg=self.board_cfg,
+                    )
+                    sidecar['teacher_warp_px'] = [tpx, tpy]
+            if teacher_cell is not None and cnn_cell is not None:
+                sidecar['cell_index_gap'] = abs(int(cnn_cell) - int(teacher_cell))
+            with open(debug_dir / f"{stem}.json", 'w', encoding='utf-8') as f:
+                json.dump(sidecar, f, indent=2)
+        except Exception as e:
+            print(f"[BOARD DEBUG R{robot_id}] overlay save failed: {e}")
+
+    def _pose_from_board_cell(self, cell: int, robot_id: int) -> List[float]:
+        wx, wz = board_cell_to_world(cell, robot_id, n=self._board_n, cfg=self.board_cfg)
+        return compute_grasp_pose_from_object_world(
+            wx, DEFAULT_OBJECT_Y_M, wz, robot_id, add_jitter=False,
+        )
+
+    def _predict_board_pose(self, full_message: Dict, explore: bool = False) -> Dict:
+        robot_id = int(full_message.get('robot_id', 1))
+        is_sim = full_message.get('source', 'real') == 'simulation'
+        camera_data = full_message['data']
+        board_mod = self.board_module2 if robot_id == 2 else self.board_module
+        if board_mod is None:
+            return {'type': 'error', 'message': 'Board DQN module not loaded'}
+
+        session_ep = max(1, int(full_message.get('session_episode', 1)))
+        eps = self._board_epsilon(session_ep) if explore else 0.0
+        rgb_t, depth_t = self._preprocess_board_pair(camera_data, is_sim, robot_id)
+        with torch.no_grad():
+            cell_t = board_mod.select_cell(rgb_t, depth_t, epsilon=eps)
+        cell = int(cell_t.cpu().numpy()[0])
+        q_diag = None
+        q_map_np = None
+        n = self._board_n
+        row, col = divmod(cell, n)
+        wx, wz = board_cell_to_world(cell, robot_id, n=n, cfg=self.board_cfg)
+        grasp_pose = self._pose_from_board_cell(cell, robot_id)
+
+        img = self.decode_b64_image(camera_data)
+        rgb = cv2.cvtColor(img['rgb'], cv2.COLOR_BGR2RGB)
+        rgb_c, _ = self._crop_rgb_depth(rgb, img['depth'].astype(np.float32), robot_id)
+        rgb_w = warp_rgb_to_board(rgb_c, robot_id, out_size=224, cfg=self.board_cfg)
+
+        teacher_cell = None
+        label_x, label_z = self._board_label_xz(full_message)
+        if is_sim and label_x is not None and label_z is not None:
+            self._save_board_crop_debug(rgb_c, robot_id, label_x, label_z)
+            teacher_cell = world_to_board_cell(
+                label_x, label_z, robot_id,
+                n=self._board_n, cfg=self.board_cfg,
+            )
+            if teacher_cell is not None:
+                q_diag, q_map_np = self._board_q_diag_from_tensors(
+                    rgb_t, depth_t, board_mod, teacher_cell, cell, robot_id,
+                    label_x=label_x, label_z=label_z,
+                )
+        elif is_sim:
+            print(
+                f"[BOARD DEBUG R{robot_id}] no spawn in camera message — "
+                f"red cross will appear after episode collect",
+                flush=True,
+            )
+        self._save_board_debug_overlay(
+            rgb_w, robot_id,
+            cnn_cell=cell,
+            teacher_cell=teacher_cell,
+            meta={
+                'label_x': label_x,
+                'label_z': label_z,
+                'spawn_x': full_message.get('spawn_x'),
+                'spawn_z': full_message.get('spawn_z'),
+                'object_x': full_message.get('object_x'),
+                'object_z': full_message.get('object_z'),
+                'session_episode': session_ep,
+                'epsilon': eps,
+            },
+            q_map=q_map_np,
+            q_diag=q_diag,
+        )
+        if teacher_cell is not None:
+            hit = int(cell) == int(teacher_cell)
+            q_line = ""
+            if q_diag:
+                q_line = (
+                    f" rank={int(q_diag['teacher_rank'])} "
+                    f"mass_near={q_diag['mass_near_teacher']:.3f} "
+                    f"topk_err={q_diag['topk_centroid_err_m']*100:.1f}cm"
+                )
+            print(
+                f"[BOARD DEBUG R{robot_id}] teacher={teacher_cell} cnn={cell} "
+                f"{'HIT' if hit else 'miss'}{q_line} | "
+                f"see debug/board_warp_r{robot_id}_latest.jpg",
+                flush=True,
+            )
+
+        mode = 'board_explore' if explore else 'exploit_board'
+        response = {
+            'type': 'grasp_prediction',
+            'pose': grasp_pose,
+            'mode': mode,
+            'board_cell': cell,
+            'board_u': col,
+            'board_v': row,
+            'target_x_m': wx,
+            'target_z_m': wz,
+            'teacher_cell': teacher_cell,
+            'epsilon': eps,
+            'confidence': 1.0,
+            'timestamp': time.time(),
+        }
+        if q_diag:
+            response.update(q_diag)
+        return response
+
+    def format_board_shaping_batch(self, batch: List[Dict], robot_id: int) -> Dict[str, torch.Tensor]:
+        rgb_list, depth_list, q_target_list = [], [], []
+        for exp in batch:
+            is_sim = exp.get('source', 'real') == 'simulation'
+            rgb_t, depth_t = self._preprocess_board_pair(exp['state'], is_sim, robot_id)
+            rgb_list.append(rgb_t)
+            depth_list.append(depth_t)
+            sx = float(exp.get('spawn_x', 0.0))
+            sz = float(exp.get('spawn_z', 0.0))
+            q_tgt = board_shaping_q_targets(sx, sz, robot_id, n=self._board_n, cfg=self.board_cfg)
+            q_target_list.append(torch.from_numpy(q_tgt))
+        return {
+            'rgb': torch.cat(rgb_list).to(self.device),
+            'depth': torch.cat(depth_list).to(self.device),
+            'q_targets': torch.stack(q_target_list).to(self.device),
+        }
+
+    def _run_board_training_step(self, robot_id: int = 1):
+        lock = self.train_lock if robot_id == 1 else self.train_lock2
+        if lock.locked():
+            return
+        with lock:
+            try:
+                if robot_id == 2:
+                    board_mod = self.board_module2
+                    weak_buf = self.weak_buffer2
+                    normal_buf = self.normal_buffer2
+                    step_attr = 'board_training_step_count2'
+                    save_name = self._save_path_r2_board
+                else:
+                    board_mod = self.board_module
+                    weak_buf = self.weak_buffer
+                    normal_buf = self.normal_buffer
+                    step_attr = 'board_training_step_count'
+                    save_name = self._save_path_r1_board
+
+                batch_raw = self._sample_mixed_batch(
+                    weak_buf, normal_buf, self.batch_size, self._weak_ratio,
+                )
+                if not batch_raw:
+                    return
+                torch_batch = self.format_board_shaping_batch(batch_raw, robot_id)
+                losses = board_mod.update_shaping(torch_batch)
+                shaping_mse = losses.get('shaping_mse', 0.0)
+
+                step = getattr(self, step_attr) + 1
+                setattr(self, step_attr, step)
+                ckpt_every = self._checkpoint_every
+                checkpoint_saved = int(step % ckpt_every == 0)
+                self._append_board_step_log(robot_id, {
+                    'timestamp_utc': datetime.now(timezone.utc).isoformat(),
+                    'robot_id': robot_id,
+                    'board_step': step,
+                    'phase': 'shaping',
+                    'loss': losses.get('shaping_mse', losses['total']),
+                    'shaping_mse': shaping_mse,
+                    'grad_norm': losses.get('grad_norm', 0.0),
+                    'buffer_weak': len(weak_buf),
+                    'buffer_normal': len(normal_buf),
+                    'replay_len': 0,
+                    'checkpoint_saved': checkpoint_saved,
+                })
+                print(
+                    f"[BOARD TRAIN R{robot_id}] step {step:4d} | "
+                    f"MSE: {shaping_mse:.4f} | "
+                    f"buf weak:{len(weak_buf)} normal:{len(normal_buf)}",
+                    flush=True,
+                )
+                if checkpoint_saved:
+                    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                    save_dir = os.path.join(base_dir, "models")
+                    os.makedirs(save_dir, exist_ok=True)
+                    full_path = os.path.join(save_dir, save_name)
+                    board_mod.save_model(full_path, training_step=step)
+                    print(f"[BOARD TRAIN R{robot_id}] SAVED checkpoint: {full_path}", flush=True)
+            except Exception as e:
+                print(f"[BOARD TRAIN R{robot_id}] CRITICAL TRAINING ERROR: {e}", flush=True)
+                import traceback
+                traceback.print_exc()
+
+    def _handle_board_training_data(self, training_data: Dict, source: str, robot_id: int) -> Dict:
+        try:
+            collect_mode = training_data.get('mode', 'board_collect')
+            label_x, label_z = self._board_label_xz(training_data)
+            if label_x is None or label_z is None:
+                obj_pos = training_data.get('object_pos', [0.0, 0.0])
+                label_x = float(obj_pos[0]) if len(obj_pos) > 0 else 0.0
+                label_z = float(obj_pos[1]) if len(obj_pos) > 1 else 0.0
+
+            ack: Dict = {
+                'type': 'training_ack',
+                'board': True,
+            }
+
+            if collect_mode == 'board_collect':
+                cnn_cell_raw = None
+                cell = world_to_board_cell(
+                    label_x, label_z, robot_id, n=self._board_n, cfg=self.board_cfg,
+                )
+                if cell is None:
+                    ack['skipped'] = True
+                    ack['invalid_cell'] = True
+                else:
+                    sample = {
+                        'state': training_data['state'],
+                        'spawn_x': label_x,
+                        'spawn_z': label_z,
+                        'source': source,
+                        'robot_id': robot_id,
+                    }
+                    bucket = self._resolve_demo_bucket(training_data, robot_id)
+                    sample['demo_bucket'] = bucket
+                    target = (self.weak_buffer2 if bucket == 'weak' else self.normal_buffer2) if robot_id == 2 \
+                        else (self.weak_buffer if bucket == 'weak' else self.normal_buffer)
+                    target.append(sample)
+                    if self._fine_tune_buffers_ready(robot_id):
+                        threading.Thread(
+                            target=self._run_board_training_step, args=(robot_id,), daemon=True,
+                        ).start()
+                    row, col = divmod(cell, self._board_n)
+                    ack.update({
+                        'teacher_cell': cell,
+                        'board_cell': cell,
+                        'board_u': col,
+                        'board_v': row,
+                    })
+                    cnn_cell_raw = training_data.get('cnn_cell', training_data.get('board_cell'))
+                    if cnn_cell_raw is not None:
+                        cnn_cell = int(cnn_cell_raw)
+                        correct = cnn_cell == cell
+                        correct_attr = 'board_cnn_correct_count2' if robot_id == 2 else 'board_cnn_correct_count'
+                        total_attr = 'board_cnn_total_count2' if robot_id == 2 else 'board_cnn_total_count'
+                        setattr(self, total_attr, getattr(self, total_attr) + 1)
+                        if correct:
+                            setattr(self, correct_attr, getattr(self, correct_attr) + 1)
+                        ack['cnn_cell'] = cnn_cell
+                        ack['cnn_correct'] = correct
+                    if cell is not None and training_data.get('state'):
+                        try:
+                            img = self.decode_b64_image(training_data['state'])
+                            rgb = cv2.cvtColor(img['rgb'], cv2.COLOR_BGR2RGB)
+                            rgb_c, _ = self._crop_rgb_depth(
+                                rgb, img['depth'].astype(np.float32), robot_id,
+                            )
+                            self._save_board_crop_debug(rgb_c, robot_id, label_x, label_z)
+                            rgb_w = self._warp_rgb_for_debug(training_data['state'], robot_id)
+                            cnn_for_overlay = int(cnn_cell_raw) if cnn_cell_raw is not None else None
+                            q_diag = None
+                            q_map_np = None
+                            board_mod = self.board_module2 if robot_id == 2 else self.board_module
+                            if (
+                                board_mod is not None
+                                and cnn_for_overlay is not None
+                                and cell is not None
+                            ):
+                                rgb_t, depth_t = self._preprocess_board_pair(
+                                    training_data['state'], source == 'simulation', robot_id,
+                                )
+                                q_diag, q_map_np = self._board_q_diag_from_tensors(
+                                    rgb_t, depth_t, board_mod, cell, cnn_for_overlay, robot_id,
+                                    label_x=label_x, label_z=label_z,
+                                )
+                            self._save_board_debug_overlay(
+                                rgb_w, robot_id,
+                                cnn_cell=cnn_for_overlay,
+                                teacher_cell=cell,
+                                meta={
+                                    'label_x': label_x,
+                                    'label_z': label_z,
+                                    'spawn_x': training_data.get('spawn_x'),
+                                    'spawn_z': training_data.get('spawn_z'),
+                                    'object_pos': training_data.get('object_pos'),
+                                    'source': 'board_collect',
+                                },
+                                q_map=q_map_np,
+                                q_diag=q_diag,
+                            )
+                            print(
+                                f"[BOARD DEBUG R{robot_id}] saved overlay teacher={cell} "
+                                f"cnn={cnn_for_overlay} | debug/board_warp_r{robot_id}_latest.jpg",
+                                flush=True,
+                            )
+                        except Exception as overlay_exc:
+                            print(
+                                f"[BOARD DEBUG R{robot_id}] overlay at collect failed: {overlay_exc}",
+                                flush=True,
+                            )
+                ep_attr = 'board_shaping_episode_count2' if robot_id == 2 else 'board_shaping_episode_count'
+                ep = getattr(self, ep_attr) + 1
+                setattr(self, ep_attr, ep)
+                ack['board_phase'] = 'shaping'
+                ack['board_step'] = self.board_training_step_count2 if robot_id == 2 else self.board_training_step_count
+                weak_buf = self.weak_buffer2 if robot_id == 2 else self.weak_buffer
+                normal_buf = self.normal_buffer2 if robot_id == 2 else self.normal_buffer
+                buf_total = len(weak_buf) + len(normal_buf)
+                batch_size = self.batch_size
+                if cnn_cell_raw is not None:
+                    hit = 'HIT' if ack.get('cnn_correct') else 'miss'
+                    print(
+                        f"[BOARD TRAIN R{robot_id}] shaping ep {ep} | "
+                        f"cnn={int(cnn_cell_raw)} teacher={ack.get('teacher_cell', '?')} {hit} | "
+                        f"buffer {buf_total}/{batch_size}",
+                        flush=True,
+                    )
+                elif cell is None:
+                    print(
+                        f"[BOARD TRAIN R{robot_id}] shaping ep {ep} | "
+                        f"invalid spawn cell | buffer {buf_total}/{batch_size}",
+                        flush=True,
+                    )
+                else:
+                    print(
+                        f"[BOARD TRAIN R{robot_id}] shaping ep {ep} | "
+                        f"teacher={cell} (no cnn_cell) | buffer {buf_total}/{batch_size}",
+                        flush=True,
+                    )
+                shaping_episodes = int(self.board_cfg.get('training', {}).get('shaping_episodes', 250))
+                log_every = int(self.board_cfg.get('training', {}).get('accuracy_log_every', 10))
+                if cnn_cell_raw is not None and ep % log_every == 0:
+                    correct_attr = 'board_cnn_correct_count2' if robot_id == 2 else 'board_cnn_correct_count'
+                    total_attr = 'board_cnn_total_count2' if robot_id == 2 else 'board_cnn_total_count'
+                    total = getattr(self, total_attr)
+                    correct_n = getattr(self, correct_attr)
+                    acc = 100.0 * correct_n / total if total else 0.0
+                    print(
+                        f"[BOARD TRAIN R{robot_id}] CNN accuracy @ ep {ep}: "
+                        f"{acc:.1f}% ({correct_n}/{total})",
+                        flush=True,
+                    )
+                if ep >= shaping_episodes and ep == shaping_episodes:
+                    print(
+                        f"[BOARD TRAIN R{robot_id}] Shaping complete ({ep} episodes). "
+                        f"Stop sim — continue on real arm (paper session 3).",
+                        flush=True,
+                    )
+                return ack
+
+            return {'type': 'error', 'message': f'Unknown board collect mode: {collect_mode}'}
+        except Exception as e:
+            return {'type': 'error', 'message': str(e)}
+
     def format_rl_batch_for_torch(self, batch: List[Dict], robot_id: int) -> Dict[str, torch.Tensor]:
         states_list  = []
         actions_list = []
@@ -849,6 +2042,28 @@ class GPUInferenceServer:
                     'timestamp': time.time()
                 }
 
+            if client_mode == 'grid_train':
+                if self._grid_training_phase(robot_id) == 'rl':
+                    return self._predict_grid_explore_pose(full_message)
+                return {
+                    'type':      'grasp_prediction',
+                    'mode':      'explore',
+                    'pose':      [0.0] * 6,
+                    'timestamp': time.time(),
+                    'grid_phase': 'shaping',
+                }
+
+            if client_mode == 'board_dqn_train':
+                return self._predict_board_pose(full_message, explore=True)
+
+            use_board = self.board_dqn or bool(full_message.get('use_board_dqn', False))
+            if use_board:
+                return self._predict_board_pose(full_message, explore=False)
+
+            use_local = self.local_grid or bool(full_message.get('use_local_grid', False))
+            if use_local:
+                return self._predict_local_grid_pose(full_message)
+
             use_geo = self.geo_grasp or bool(full_message.get('use_geo_grasp', False))
             if use_geo:
                 return self._predict_geo_grasp_pose(full_message)
@@ -915,6 +2130,12 @@ class GPUInferenceServer:
                     cv2.imwrite(f"ai_vision_debug_depth_sim_r{robot_id}.png", depth_vis)
                 except Exception as e:
                     print(f"[DEBUG R{robot_id}] Sim image save failed: {e}")
+
+            if self.grid_train:
+                return self._handle_grid_training_data(training_data, source, robot_id)
+
+            if self.board_dqn_train:
+                return self._handle_board_training_data(training_data, source, robot_id)
 
             sample = {
                 'state':      training_data['state'],
@@ -1141,7 +2362,17 @@ class GPUInferenceServer:
             if count >= needed:
                 self._barrier_event.set()
 
-        self._barrier_event.wait()
+        if not self._barrier_event.wait(timeout=self._barrier_wait_timeout_s):
+            with self._barrier_lock:
+                self._barrier_ready_count = max(0, self._barrier_ready_count - 1)
+            return {
+                'type': 'error',
+                'message': (
+                    f'timeout ({self._barrier_wait_timeout_s}s) waiting for '
+                    f'{self._barrier_num_robots} robot(s) at episode_end '
+                    f'(got {count}, R{robot_id} reported)'
+                ),
+            }
 
         with self._barrier_lock:
             self._barrier_ready_count -= 1
@@ -1265,13 +2496,21 @@ class GPUInferenceServer:
         
         self.server_socket.bind((host, port))
         self.server_socket.listen(5)
-        mode_label = "residual RL" if self.rl_train else (
-            "locator train" if self.locator_train else (
-                "targeted fine-tune" if self.fine_tune else "behavior cloning"
+        mode_label = "board DQN train" if self.board_dqn_train else (
+            "board DQN" if self.board_dqn else (
+                "residual RL" if self.rl_train else (
+                    "grid train" if self.grid_train else (
+                        "locator train" if self.locator_train else (
+                            "targeted fine-tune" if self.fine_tune else "behavior cloning"
+                        )
+                    )
+                )
             )
         )
-        print(f"🚀 BC Server listening on {host}:{port} ({mode_label} mode)")
-        if self.geo_grasp and not self.locator_train:
+        print(f"GPU Server listening on {host}:{port} ({mode_label} mode)")
+        if self.local_grid and not self.grid_train:
+            print(f"   Local grid inference enabled (locator + Q-cell → geometry)")
+        if self.geo_grasp and not self.locator_train and not self.local_grid:
             print(f"   Geo-grasp inference enabled (aux_position → grasp geometry)")
         if self.rl_train:
             lr = float(self._rl_robot_cfg[1].get('td3', {}).get('learning_rate', 1e-4))
@@ -1292,6 +2531,20 @@ class GPUInferenceServer:
                 f"{1 - self._weak_ratio:.0%} normal | aux-only loss | LR="
                 f"{self.locator_cfg.get('training', {}).get('learning_rate', 1e-4)} | "
                 f"checkpoints: {self._save_path_r1}, {self._save_path_r2}"
+            )
+        if self.grid_train:
+            tr = self.grid_cfg.get('training', {})
+            print(
+                f"   Grid train: {self._grid_n}x{self._grid_n} window={self._grid_window_m}m | "
+                f"phase={tr.get('phase', 'both')} shaping_steps={tr.get('shaping_steps', 2000)} | "
+                f"checkpoints: {self._save_path_r1_grid}, {self._save_path_r2_grid}"
+            )
+        if self.board_dqn_train or self.board_dqn:
+            tr = self.board_cfg.get('training', {})
+            print(
+                f"   Board DQN: {self._board_n}x{self._board_n} full platform | "
+                f"shaping_episodes={tr.get('shaping_episodes', 250)} | "
+                f"checkpoints: {self._save_path_r1_board}, {self._save_path_r2_board}"
             )
         
         while True:
@@ -1317,6 +2570,26 @@ if __name__ == "__main__":
                         help='Path to locator_train_config.yaml')
     parser.add_argument('--geo-grasp', action='store_true',
                         help='Inference: aux_position → analytic grasp geometry (not pose_6dof)')
+    parser.add_argument('--grid-train', action='store_true',
+                        help='Local grid DQN train (teacher shaping + RL)')
+    parser.add_argument('--grid-config', type=str, default=None,
+                        help='Path to grid_train_config.yaml')
+    parser.add_argument('--local-grid', action='store_true',
+                        help='Inference: locator-centered grid Q-head → geometry')
+    parser.add_argument('--grid-model', type=str, default=None,
+                        help='Local grid checkpoint for R1')
+    parser.add_argument('--grid-model-r2', type=str, default=None,
+                        help='Local grid checkpoint for R2')
+    parser.add_argument('--board-dqn-train', action='store_true',
+                        help='Full-board DQN train (Gomes paper: 112x112, shaping + RL)')
+    parser.add_argument('--board-dqn', action='store_true',
+                        help='Inference: full-board DQN cell picker')
+    parser.add_argument('--board-config', type=str, default=None,
+                        help='Path to board_dqn_config.yaml')
+    parser.add_argument('--board-model', type=str, default=None,
+                        help='Board DQN checkpoint for R1')
+    parser.add_argument('--board-model-r2', type=str, default=None,
+                        help='Board DQN checkpoint for R2')
     parser.add_argument('--rl-train', action='store_true',
                         help='TD3 residual RL fine-tune (BC frozen; separate RL checkpoints)')
     parser.add_argument('--rl-train-config', type=str, default=None,
@@ -1335,6 +2608,30 @@ if __name__ == "__main__":
         parser.error('Use either --fine-tune or --locator-train, not both.')
     if args.geo_grasp and args.locator_train:
         parser.error('--geo-grasp is for inference only; omit when --locator-train.')
+    if args.grid_train and args.locator_train:
+        parser.error('Use either --grid-train or --locator-train, not both.')
+    if args.grid_train and args.rl_train:
+        parser.error('Use either --grid-train or --rl-train, not both.')
+    if args.grid_train and args.fine_tune:
+        parser.error('Use either --grid-train or --fine-tune, not both.')
+    if args.local_grid and args.geo_grasp:
+        parser.error('Use either --local-grid or --geo-grasp, not both.')
+    if args.grid_train and args.local_grid:
+        parser.error('Use --grid-train for training; --local-grid is inference only.')
+    if args.board_dqn_train and args.locator_train:
+        parser.error('Use either --board-dqn-train or --locator-train, not both.')
+    if args.board_dqn_train and args.grid_train:
+        parser.error('Use either --board-dqn-train or --grid-train, not both.')
+    if args.board_dqn_train and args.rl_train:
+        parser.error('Use either --board-dqn-train or --rl-train, not both.')
+    if args.board_dqn_train and args.fine_tune:
+        parser.error('Use either --board-dqn-train or --fine-tune, not both.')
+    if args.board_dqn and args.geo_grasp:
+        parser.error('Use either --board-dqn or --geo-grasp, not both.')
+    if args.board_dqn and args.local_grid:
+        parser.error('Use either --board-dqn or --local-grid, not both.')
+    if args.board_dqn_train and args.board_dqn:
+        parser.error('Use --board-dqn-train for training; --board-dqn is inference only.')
 
     server = GPUInferenceServer(
         model_path=args.model,
@@ -1344,6 +2641,16 @@ if __name__ == "__main__":
         locator_train=args.locator_train,
         locator_config_path=args.locator_config,
         geo_grasp=args.geo_grasp,
+        grid_train=args.grid_train,
+        grid_config_path=args.grid_config,
+        local_grid=args.local_grid,
+        grid_model_path=args.grid_model,
+        grid_model_path_r2=args.grid_model_r2,
+        board_dqn_train=args.board_dqn_train,
+        board_dqn=args.board_dqn,
+        board_config_path=args.board_config,
+        board_model_path=args.board_model,
+        board_model_path_r2=args.board_model_r2,
         rl_train=args.rl_train,
         rl_train_config_path=args.rl_train_config,
         rl_residual_r1=args.rl_residual_r1,

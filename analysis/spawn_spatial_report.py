@@ -276,7 +276,8 @@ def clean_episode_log(
             n0 = len(out)
 
     if exploit_only and "grasp_mode" in out.columns:
-        out = out.loc[out["grasp_mode"].astype(str) == "exploit"]
+        modes = out["grasp_mode"].astype(str)
+        out = out.loc[modes.eq("exploit") | modes.str.startswith("exploit_")]
         if len(out) < n0:
             notes.append(f"dropped {n0 - len(out)} non-exploit rows")
             n0 = len(out)

@@ -10,8 +10,8 @@ vm_simulation_system/data/*
 !vm_simulation_system/data/.gitkeep
 
 # Curriculum state (written each run; do not commit)
-vm_simulation_system/config/curriculum_state.json
-vm_simulation_system/config/curriculum_state_robot2.json
+**/curriculum_state.json
+**/curriculum_state_robot2.json
 
 # Local analysis and exports (not for version control)
 docs/
@@ -31,7 +31,7 @@ venv/
 env/
 
 # ML checkpoints (large binaries — copy locally, do not commit)
-host_gpu_system/models/*.pth
+host_gpu_system/models/**/*.pth
 
 # IDE / OS
 .vscode/
@@ -48,7 +48,8 @@ Thumbs.db
 # Debug / session scratch
 debug-*.log
 **/client_vision_debug_*.jpg
-host_gpu_system/ai_vision_debug_*
+**/ai_vision_debug_*
+host_gpu_system/debug/
 
 # Webots editor state and cache (regenerated)
 *.wbproj
