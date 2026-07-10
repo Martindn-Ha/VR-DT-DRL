@@ -1,0 +1,10 @@
+# Local Ultralytics YOLO on 224×224 warps. Train with analysis/train_block_yolo.py
+weights: "host_gpu_system/models/block_yolo/weights/best.pt"
+conf: 0.25
+imgsz: 224
+min_confidence: 0.10
+warp_size: 224
+grid_n: 112
+
+# Optional: only keep detections with this class name (null = any class)
+class_name: null

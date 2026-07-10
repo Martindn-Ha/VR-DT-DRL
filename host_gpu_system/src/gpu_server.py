@@ -34,11 +34,22 @@ from enhanced_neural_network import (
 )
 from local_grid_module import LocalGridModule, create_local_grid_module
 from full_board_dqn_module import FullBoardDQNModule, create_full_board_dqn_module
+from board_locator_module import (
+    BoardLocatorModule, create_board_locator_module, fuse_q_with_detector,
+)
+from yolo_locator import (
+    LocalYoloLocator, load_yolo_locator_config, random_cell_in_bbox,
+    best_q_cell_in_bbox, dist_cell_to_bbox_px, dist_cell_to_bbox_cells,
+)
+from board_seg_labels import make_block_mask_warp, blend_mask_overlay, mask_grid_to_cell
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
 sys.path.insert(0, str(_REPO_ROOT / "vm_simulation_system" / "src"))
 from board_q_diagnostics import compute_board_q_diagnostics, blend_q_heatmap_overlay  # noqa: E402
-from spawn_geometry import load_fine_tune_config, load_locator_train_config, classify_demo_bucket  # noqa: E402
+from spawn_geometry import (  # noqa: E402
+    load_fine_tune_config, load_locator_train_config, load_board_locator_train_config,
+    classify_demo_bucket,
+)
 from rl_reward import load_rl_train_config, get_robot_rl_config, exploration_noise_scale  # noqa: E402
 from grasp_geometry import compute_grasp_pose_from_object_world, local_xz_to_world, DEFAULT_OBJECT_Y_M  # noqa: E402
 from local_grid import (  # noqa: E402
@@ -72,6 +83,11 @@ BOARD_STEP_CSV_FIELDS = [
     'buffer_weak', 'buffer_normal', 'replay_len', 'checkpoint_saved',
 ]
 
+BOARD_LOCATOR_STEP_CSV_FIELDS = [
+    'timestamp_utc', 'robot_id', 'locator_step', 'seg_bce', 'seg_dice', 'grad_norm',
+    'buffer_weak', 'buffer_normal', 'checkpoint_saved',
+]
+
 
 class GPUInferenceServer:
     """
@@ -94,6 +110,14 @@ class GPUInferenceServer:
                  board_config_path: str = None,
                  board_model_path: str = None,
                  board_model_path_r2: str = None,
+                 board_locator_train: bool = False,
+                 board_locator: bool = False,
+                 board_locator_config_path: str = None,
+                 board_locator_model_path: str = None,
+                 board_locator_model_path_r2: str = None,
+                 yolo_locator_test: bool = False,
+                 yolo_locator_config_path: str = None,
+                 yolo_fuse: bool = False,
                  rl_train: bool = False, rl_train_config_path: str = None,
                  rl_residual_r1: str = None, rl_residual_r2: str = None):
         self.config     = self._load_config(config_path)
@@ -110,11 +134,20 @@ class GPUInferenceServer:
         self.board_dqn = board_dqn
         self.board_model_path = board_model_path
         self.board_model_path_r2 = board_model_path_r2
+        self.board_locator_train = board_locator_train
+        self.board_locator = board_locator
+        self.board_locator_model_path = board_locator_model_path
+        self.board_locator_model_path_r2 = board_locator_model_path_r2
+        self.yolo_locator_test = yolo_locator_test
+        self.yolo_fuse = yolo_fuse
+        self.yolo_locator_cfg: Dict = {}
+        self.yolo_client: Optional[LocalYoloLocator] = None
         self.rl_train   = rl_train
         self.fine_tune_cfg: Dict = {}
         self.locator_cfg: Dict = {}
         self.grid_cfg: Dict = {}
         self.board_cfg: Dict = {}
+        self.board_locator_cfg: Dict = {}
         self.rl_cfg: Dict = {}
         self._rl_robot_cfg: Dict[int, Dict] = {1: {}, 2: {}}
         self.td3_module: Optional[TD3Module] = None
@@ -223,13 +256,23 @@ class GPUInferenceServer:
                 if not self.grid_model_path_r2:
                     self.grid_model_path_r2 = save_g2
 
-        if board_dqn_train or board_dqn:
+        if (board_dqn_train or board_dqn or board_locator_train or board_locator
+                or yolo_locator_test):
             b_path = board_config_path or str(
                 Path(__file__).resolve().parent.parent / "config" / "board_dqn_config.yaml"
             )
             self.board_cfg = load_board_dqn_config(b_path)
             self._board_n = board_n(self.board_cfg)
             self._board_n_cells = self._board_n * self._board_n
+
+        if yolo_locator_test or yolo_fuse:
+            yl_path = yolo_locator_config_path or str(
+                Path(__file__).resolve().parent.parent / "config" / "yolo_locator_config.yaml"
+            )
+            self.yolo_locator_cfg = load_yolo_locator_config(yl_path)
+            self.yolo_client = LocalYoloLocator(self.yolo_locator_cfg)
+
+        if board_dqn_train or board_dqn:
             ckpt_cfg = self.board_cfg.get('checkpoints', {})
             save_b1 = ckpt_cfg.get('save_r1', 'models/R1_board_dqn.pth')
             save_b2 = ckpt_cfg.get('save_r2', 'models/R2_board_dqn.pth')
@@ -247,7 +290,29 @@ class GPUInferenceServer:
                 if not self.board_model_path_r2:
                     self.board_model_path_r2 = save_b2
 
-        if geo_grasp and not locator_train and not fine_tune and not rl_train and not grid_train and not local_grid and not board_dqn_train and not board_dqn:
+        if board_locator_train or board_locator:
+            bl_path = board_locator_config_path or str(
+                Path(__file__).resolve().parent.parent / "config" / "board_locator_train_config.yaml"
+            )
+            self.board_locator_cfg = load_board_locator_train_config(bl_path)
+            bl_ckpt = self.board_locator_cfg.get('checkpoints', {})
+            save_l1 = bl_ckpt.get('save_r1', 'models/R1_board_locator.pth')
+            save_l2 = bl_ckpt.get('save_r2', 'models/R2_board_locator.pth')
+            self._save_path_r1_board_locator = Path(save_l1).name
+            self._save_path_r2_board_locator = Path(save_l2).name
+            if board_locator_train:
+                self._weak_regions = self.board_locator_cfg['_weak_regions_parsed']
+                self._weak_ratio = float(self.board_locator_cfg['sampling']['weak_ratio'])
+                self._checkpoint_every = int(
+                    self.board_locator_cfg.get('training', {}).get('checkpoint_every_steps', 100)
+                )
+            if board_locator and not board_locator_train:
+                if not self.board_locator_model_path:
+                    self.board_locator_model_path = save_l1
+                if not self.board_locator_model_path_r2:
+                    self.board_locator_model_path_r2 = save_l2
+
+        if geo_grasp and not locator_train and not fine_tune and not rl_train and not grid_train and not local_grid and not board_dqn_train and not board_dqn and not board_locator_train and not board_locator and not yolo_locator_test:
             if not self.model_path:
                 self.model_path = "models/R1_locator.pth"
             if not self.model_path_r2:
@@ -274,8 +339,15 @@ class GPUInferenceServer:
             model_config['learning_rate'] = float(
                 self.board_cfg.get('training', {}).get('learning_rate', 1e-3)
             )
+        if board_locator_train:
+            model_config['learning_rate'] = float(
+                self.board_locator_cfg.get('training', {}).get('learning_rate', 1e-3)
+            )
 
-        board_only = board_dqn_train or board_dqn
+        board_only = (
+            board_dqn_train or board_dqn or board_locator_train or board_locator
+            or yolo_locator_test
+        )
         self._board_only = board_only
         self.model = None
         self.model2 = None
@@ -306,6 +378,8 @@ class GPUInferenceServer:
             self.batch_size = int(self.grid_cfg.get('training', {}).get('batch_size', 16))
         elif board_dqn_train:
             self.batch_size = int(self.board_cfg.get('training', {}).get('batch_size', 4))
+        elif board_locator_train:
+            self.batch_size = int(self.board_locator_cfg.get('training', {}).get('batch_size', 8))
         elif rl_train:
             self.batch_size = int(self.rl_cfg.get('training', {}).get('batch_size', 16))
         else:
@@ -334,6 +408,8 @@ class GPUInferenceServer:
         self.grid_training_step_count2 = 0
         self.board_training_step_count  = 0
         self.board_training_step_count2 = 0
+        self.board_locator_training_step_count  = 0
+        self.board_locator_training_step_count2 = 0
         self.board_shaping_episode_count  = 0
         self.board_shaping_episode_count2 = 0
         self.board_cnn_correct_count  = 0
@@ -373,6 +449,11 @@ class GPUInferenceServer:
         self.board_module2: Optional[FullBoardDQNModule] = None
         if board_dqn_train or board_dqn:
             self._init_board_modules()
+
+        self.board_loc_module: Optional[BoardLocatorModule] = None
+        self.board_loc_module2: Optional[BoardLocatorModule] = None
+        if board_locator_train or board_locator:
+            self._init_board_locator_modules()
 
         if rl_train or rl_residual_r1 or rl_residual_r2:
             if not self.rl_cfg:
@@ -1210,6 +1291,75 @@ class GPUInferenceServer:
         _load(self.board_module2, self.board_model_path_r2, self._save_path_r2_board,
               'board_training_step_count2')
 
+    def _init_board_locator_modules(self) -> None:
+        tr = self.board_locator_cfg.get('training', {})
+        lr = float(tr.get('learning_rate', 1e-3))
+        wd = float(tr.get('weight_decay', 8e-5))
+        enc_ph = float(tr.get('encoder_lr_factor', 0.1))
+        n_cells = self._board_n_cells
+        grid_n = self._board_n
+
+        def _build_one(robot_id: int) -> BoardLocatorModule:
+            mask_np = invalid_cell_mask(robot_id, self._board_n, self.board_cfg)
+            mask_t = torch.tensor(mask_np, dtype=torch.bool, device=self.device)
+            return create_board_locator_module(
+                n_cells=n_cells,
+                grid_n=grid_n,
+                learning_rate=lr,
+                weight_decay=wd,
+                encoder_lr_factor=enc_ph,
+                invalid_mask=mask_t,
+            ).to(self.device)
+
+        self.board_loc_module = _build_one(1)
+        self.board_loc_module2 = _build_one(2)
+        self._load_board_locator_weights()
+
+    def _load_board_locator_weights(self) -> None:
+        def _load(mod: Optional[BoardLocatorModule], path_override: Optional[str],
+                  default_name: str, step_attr: str):
+            if mod is None:
+                return
+            path = self._resolve_checkpoint_path(path_override, default_name)
+            print(f"[BOARD-LOC] Looking for board locator at: {path.resolve()}")
+            if path.exists():
+                step = mod.load_model(str(path))
+                setattr(self, step_attr, max(getattr(self, step_attr), step))
+                print(f"[BOARD-LOC] Loaded board locator: {path.name}  (step {step})")
+            elif self.board_locator_train:
+                ckpt_cfg = self.board_locator_cfg.get('checkpoints', {})
+                r_num = 1 if 'r1' in default_name.lower() else 2
+                init_key = f'init_from_board_dqn_r{r_num}'
+                init_name = Path(ckpt_cfg.get(init_key, '')).name
+                if init_name:
+                    dqn_path = self._resolve_checkpoint_path(None, init_name)
+                    if dqn_path.exists():
+                        tmp = create_full_board_dqn_module(
+                            n_cells=self._board_n_cells,
+                        ).to(self.device)
+                        tmp.load_model(str(dqn_path))
+                        mod.load_encoder_from_board_dqn(tmp)
+                        print(f"[BOARD-LOC] Warm-started encoders from {dqn_path.name}")
+                print("   -> No board locator checkpoint yet — starting from pretrained MobileNet")
+            elif self.board_locator:
+                print(f"[BOARD-LOC] WARNING: No board locator checkpoint at {path.name}")
+
+        _load(self.board_loc_module, self.board_locator_model_path,
+              self._save_path_r1_board_locator, 'board_locator_training_step_count')
+        _load(self.board_loc_module2, self.board_locator_model_path_r2,
+              self._save_path_r2_board_locator, 'board_locator_training_step_count2')
+
+    def _append_board_locator_step_log(self, robot_id: int, row: Dict) -> None:
+        path = _REPO_ROOT / "data" / f"board_locator_train_steps_r{robot_id}.csv"
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with self._locator_step_log_lock:
+            write_header = not path.exists()
+            with open(path, 'a', newline='', encoding='utf-8') as f:
+                writer = csv.DictWriter(f, fieldnames=BOARD_LOCATOR_STEP_CSV_FIELDS)
+                if write_header:
+                    writer.writeheader()
+                writer.writerow({k: row.get(k, '') for k in BOARD_LOCATOR_STEP_CSV_FIELDS})
+
     def _board_training_phase(self, robot_id: int) -> str:
         """Paper session 2: sim uses oracle shaping only (no sparse-RL replay)."""
         return 'shaping'
@@ -1382,6 +1532,7 @@ class GPUInferenceServer:
         q_map: Optional[np.ndarray] = None,
         q_diag: Optional[Dict] = None,
         near_radius_cells: int = 2,
+        yolo_bbox: Optional[Tuple[float, float, float, float]] = None,
     ) -> None:
         try:
             debug_dir = Path(__file__).resolve().parent.parent / "debug"
@@ -1395,6 +1546,14 @@ class GPUInferenceServer:
                 tx, ty = self._board_cell_pixel(teacher_cell, h, w, robot_id)
                 cv2.drawMarker(vis_bgr, (tx, ty), (0, 0, 255), cv2.MARKER_CROSS, 16, 3)
                 cv2.circle(vis_bgr, (tx, ty), 12, (0, 0, 255), 2)
+
+            if yolo_bbox is not None:
+                x1, y1, x2, y2 = [int(round(v)) for v in yolo_bbox]
+                cv2.rectangle(vis_bgr, (x1, y1), (x2, y2), (0, 128, 255), 2)
+
+            if meta and meta.get('dqn_outside_bbox') and meta.get('dqn_cell') is not None:
+                dx, dy = self._board_cell_pixel(int(meta['dqn_cell']), h, w, robot_id)
+                cv2.drawMarker(vis_bgr, (dx, dy), (255, 255, 0), cv2.MARKER_DIAMOND, 12, 2)
 
             if cnn_cell is not None:
                 gx, gy = self._board_cell_pixel(cnn_cell, h, w, robot_id)
@@ -1469,19 +1628,79 @@ class GPUInferenceServer:
         eps = self._board_epsilon(session_ep) if explore else 0.0
         rgb_t, depth_t = self._preprocess_board_pair(camera_data, is_sim, robot_id)
         with torch.no_grad():
+            q_map_t = board_mod.q_map(rgb_t, depth_t)
             cell_t = board_mod.select_cell(rgb_t, depth_t, epsilon=eps)
-        cell = int(cell_t.cpu().numpy()[0])
-        q_diag = None
-        q_map_np = None
-        n = self._board_n
-        row, col = divmod(cell, n)
-        wx, wz = board_cell_to_world(cell, robot_id, n=n, cfg=self.board_cfg)
-        grasp_pose = self._pose_from_board_cell(cell, robot_id)
+        dqn_cell = int(cell_t.cpu().numpy()[0])
+        q_map_np = q_map_t.squeeze().cpu().numpy()
+
+        use_loc = self.board_locator or bool(full_message.get('use_board_locator', False))
+        use_yolo_fuse = self.yolo_fuse or bool(full_message.get('use_yolo_fuse', False))
+        loc_mod = self.board_loc_module2 if robot_id == 2 else self.board_loc_module
+        detector_cell = None
+        detector_conf = None
+        fusion_used = False
+        cell = dqn_cell
+        yolo_bbox_px = None
+        yolo_conf = None
+        cells_in_bbox_count = None
+        dqn_outside_bbox = None
+        dqn_dist_to_bbox_px = None
+        dqn_dist_to_bbox_cells = None
 
         img = self.decode_b64_image(camera_data)
         rgb = cv2.cvtColor(img['rgb'], cv2.COLOR_BGR2RGB)
         rgb_c, _ = self._crop_rgb_depth(rgb, img['depth'].astype(np.float32), robot_id)
         rgb_w = warp_rgb_to_board(rgb_c, robot_id, out_size=224, cfg=self.board_cfg)
+        h, w = rgb_w.shape[:2]
+        inv_np = invalid_cell_mask(robot_id, self._board_n, self.board_cfg)
+
+        if use_yolo_fuse and self.yolo_client is not None:
+            try:
+                bbox, _raw = self.yolo_client.detect_bbox(rgb_w)
+            except Exception as exc:
+                print(f"[YOLO FUSE R{robot_id}] detect failed: {exc} — falling back to DQN", flush=True)
+                bbox = None
+            if bbox is not None:
+                yolo_bbox_px = (bbox.x1, bbox.y1, bbox.x2, bbox.y2)
+                yolo_conf = float(bbox.confidence)
+                fused, cells_in_bbox_count = best_q_cell_in_bbox(
+                    q_map_np, bbox, self._board_n, inv_np, h, w, robot_id,
+                    board_cfg=self.board_cfg,
+                )
+                outside, dist_px = dist_cell_to_bbox_px(
+                    dqn_cell, bbox, self._board_n, h, w, robot_id,
+                )
+                _, dist_cells = dist_cell_to_bbox_cells(
+                    dqn_cell, bbox, self._board_n, inv_np, h, w, robot_id,
+                    board_cfg=self.board_cfg,
+                )
+                dqn_outside_bbox = bool(outside)
+                dqn_dist_to_bbox_px = float(dist_px)
+                dqn_dist_to_bbox_cells = dist_cells
+                if fused is not None:
+                    cell = int(fused)
+                    fusion_used = True
+            # else: keep cell = dqn_cell (fallback)
+        elif use_loc and loc_mod is not None:
+            detector_cell, detector_conf, _ = loc_mod.predict_cell(rgb_t, depth_t)
+            fusion_cfg = self.board_locator_cfg.get('fusion', {})
+            if fusion_cfg.get('enabled', True):
+                cell, fusion_used = fuse_q_with_detector(
+                    q_map_np,
+                    detector_cell,
+                    dqn_cell,
+                    inv_np,
+                    grid_n=self._board_n,
+                    radius_cells=int(fusion_cfg.get('radius_cells', 3)),
+                    min_confidence=float(fusion_cfg.get('min_mask_confidence', 0.15)),
+                    detector_confidence=float(detector_conf),
+                )
+
+        q_diag = None
+        n = self._board_n
+        row, col = divmod(cell, n)
+        wx, wz = board_cell_to_world(cell, robot_id, n=n, cfg=self.board_cfg)
+        grasp_pose = self._pose_from_board_cell(cell, robot_id)
 
         teacher_cell = None
         label_x, label_z = self._board_label_xz(full_message)
@@ -1492,7 +1711,7 @@ class GPUInferenceServer:
                 n=self._board_n, cfg=self.board_cfg,
             )
             if teacher_cell is not None:
-                q_diag, q_map_np = self._board_q_diag_from_tensors(
+                q_diag, _ = self._board_q_diag_from_tensors(
                     rgb_t, depth_t, board_mod, teacher_cell, cell, robot_id,
                     label_x=label_x, label_z=label_z,
                 )
@@ -1506,6 +1725,7 @@ class GPUInferenceServer:
             rgb_w, robot_id,
             cnn_cell=cell,
             teacher_cell=teacher_cell,
+            yolo_bbox=yolo_bbox_px,
             meta={
                 'label_x': label_x,
                 'label_z': label_z,
@@ -1515,11 +1735,39 @@ class GPUInferenceServer:
                 'object_z': full_message.get('object_z'),
                 'session_episode': session_ep,
                 'epsilon': eps,
+                'dqn_cell': dqn_cell,
+                'detector_cell': detector_cell,
+                'detector_conf': detector_conf,
+                'fused_cell': cell,
+                'fusion_used': fusion_used,
+                'yolo_fuse': use_yolo_fuse,
+                'yolo_conf': yolo_conf,
+                'yolo_bbox_px': list(yolo_bbox_px) if yolo_bbox_px is not None else None,
+                'cells_in_bbox_count': cells_in_bbox_count,
+                'dqn_outside_bbox': dqn_outside_bbox,
+                'dqn_dist_to_bbox_px': dqn_dist_to_bbox_px,
+                'dqn_dist_to_bbox_cells': dqn_dist_to_bbox_cells,
             },
             q_map=q_map_np,
             q_diag=q_diag,
         )
-        if teacher_cell is not None:
+        if use_yolo_fuse:
+            dist_line = ""
+            if dqn_outside_bbox:
+                dist_line = (
+                    f" dqn_outside dist_px={dqn_dist_to_bbox_px:.1f}"
+                    f" dist_cells={dqn_dist_to_bbox_cells}"
+                )
+            elif dqn_outside_bbox is False:
+                dist_line = " dqn_in_bbox"
+            conf_s = f"{yolo_conf:.3f}" if yolo_conf is not None else "none"
+            print(
+                f"[YOLO FUSE R{robot_id}] yolo_conf={conf_s} fused={cell} "
+                f"dqn={dqn_cell} fusion={fusion_used}{dist_line} | "
+                f"see debug/board_warp_r{robot_id}_latest.jpg",
+                flush=True,
+            )
+        elif teacher_cell is not None:
             hit = int(cell) == int(teacher_cell)
             q_line = ""
             if q_diag:
@@ -1528,10 +1776,21 @@ class GPUInferenceServer:
                     f"mass_near={q_diag['mass_near_teacher']:.3f} "
                     f"topk_err={q_diag['topk_centroid_err_m']*100:.1f}cm"
                 )
+            loc_line = ""
+            if detector_cell is not None:
+                loc_hit = int(detector_cell) == int(teacher_cell)
+                loc_line = f" det={detector_cell}({'HIT' if loc_hit else 'miss'})"
             print(
                 f"[BOARD DEBUG R{robot_id}] teacher={teacher_cell} cnn={cell} "
+                f"dqn={dqn_cell}{loc_line} fusion={fusion_used} "
                 f"{'HIT' if hit else 'miss'}{q_line} | "
                 f"see debug/board_warp_r{robot_id}_latest.jpg",
+                flush=True,
+            )
+        elif detector_cell is not None:
+            print(
+                f"[BOARD DEBUG R{robot_id}] dqn={dqn_cell} det={detector_cell} "
+                f"conf={detector_conf:.3f} fused={cell} fusion={fusion_used}",
                 flush=True,
             )
 
@@ -1546,6 +1805,17 @@ class GPUInferenceServer:
             'target_x_m': wx,
             'target_z_m': wz,
             'teacher_cell': teacher_cell,
+            'dqn_cell': dqn_cell,
+            'detector_cell': detector_cell,
+            'detector_conf': detector_conf,
+            'fusion_used': fusion_used,
+            'yolo_fuse': use_yolo_fuse,
+            'yolo_conf': yolo_conf,
+            'yolo_bbox_px': list(yolo_bbox_px) if yolo_bbox_px is not None else None,
+            'cells_in_bbox_count': cells_in_bbox_count,
+            'dqn_outside_bbox': dqn_outside_bbox,
+            'dqn_dist_to_bbox_px': dqn_dist_to_bbox_px,
+            'dqn_dist_to_bbox_cells': dqn_dist_to_bbox_cells,
             'epsilon': eps,
             'confidence': 1.0,
             'timestamp': time.time(),
@@ -1553,6 +1823,111 @@ class GPUInferenceServer:
         if q_diag:
             response.update(q_diag)
         return response
+
+    def _predict_yolo_bbox_random_pose(self, full_message: Dict) -> Dict:
+        """YOLO bbox on warp image → random valid cell inside box → grasp (no DQN)."""
+        if self.yolo_client is None:
+            return {'type': 'error', 'message': 'Local YOLO locator not initialized — use --yolo-locator-test'}
+
+        robot_id = int(full_message.get('robot_id', 1))
+        is_sim = full_message.get('source', 'real') == 'simulation'
+        camera_data = full_message['data']
+        rgb_w = self._warp_rgb_for_debug(camera_data, robot_id)
+        h, w = rgb_w.shape[:2]
+
+        try:
+            bbox, raw_result = self.yolo_client.detect_bbox(rgb_w)
+        except Exception as exc:
+            return {'type': 'error', 'message': f'Local YOLO inference failed: {exc}'}
+
+        if bbox is None:
+            n_raw = 0
+            if isinstance(raw_result, dict) and isinstance(raw_result.get("predictions"), list):
+                n_raw = len(raw_result["predictions"])
+            try:
+                self._save_board_debug_overlay(
+                    rgb_w, robot_id, cnn_cell=None, teacher_cell=None,
+                    meta={'mode': 'yolo_bbox_random', 'yolo_detections_raw': n_raw},
+                )
+            except Exception:
+                pass
+            return {
+                'type': 'error',
+                'message': (
+                    f'No valid YOLO bbox (raw_detections={n_raw}). '
+                    f'Retrain on sim warps if block color/view differs from dataset.'
+                ),
+                'yolo_raw': raw_result,
+            }
+
+        inv_np = invalid_cell_mask(robot_id, self._board_n, self.board_cfg)
+        cell, cells_count = random_cell_in_bbox(
+            bbox, self._board_n, inv_np, h, w, robot_id, board_cfg=self.board_cfg,
+        )
+        if cell is None:
+            return {
+                'type': 'error',
+                'message': 'YOLO bbox contains no valid board cells',
+                'yolo_conf': bbox.confidence,
+                'cells_in_bbox_count': 0,
+            }
+
+        row, col = divmod(cell, self._board_n)
+        wx, wz = board_cell_to_world(cell, robot_id, n=self._board_n, cfg=self.board_cfg)
+        grasp_pose = self._pose_from_board_cell(cell, robot_id)
+
+        teacher_cell = None
+        label_x, label_z = self._board_label_xz(full_message)
+        if is_sim and label_x is not None and label_z is not None:
+            teacher_cell = world_to_board_cell(
+                label_x, label_z, robot_id, n=self._board_n, cfg=self.board_cfg,
+            )
+
+        yolo_bbox_px = (bbox.x1, bbox.y1, bbox.x2, bbox.y2)
+        self._save_board_debug_overlay(
+            rgb_w, robot_id,
+            cnn_cell=cell,
+            teacher_cell=teacher_cell,
+            yolo_bbox=yolo_bbox_px,
+            meta={
+                'mode': 'yolo_bbox_random',
+                'label_x': label_x,
+                'label_z': label_z,
+                'yolo_bbox_px': list(yolo_bbox_px),
+                'yolo_conf': bbox.confidence,
+                'yolo_class': bbox.class_name,
+                'random_cell': cell,
+                'cells_in_bbox_count': cells_count,
+            },
+        )
+
+        hit_line = ""
+        if teacher_cell is not None:
+            hit = int(cell) == int(teacher_cell)
+            hit_line = f" teacher={teacher_cell} {'HIT' if hit else 'miss'}"
+        print(
+            f"[YOLO R{robot_id}] conf={bbox.confidence:.3f} "
+            f"cells_in_bbox={cells_count} random_cell={cell}{hit_line} | "
+            f"see debug/board_warp_r{robot_id}_latest.jpg",
+            flush=True,
+        )
+
+        return {
+            'type': 'grasp_prediction',
+            'pose': grasp_pose,
+            'mode': 'yolo_bbox_random',
+            'board_cell': cell,
+            'board_u': col,
+            'board_v': row,
+            'target_x_m': wx,
+            'target_z_m': wz,
+            'teacher_cell': teacher_cell,
+            'yolo_conf': bbox.confidence,
+            'yolo_bbox_px': list(yolo_bbox_px),
+            'cells_in_bbox_count': cells_count,
+            'confidence': bbox.confidence,
+            'timestamp': time.time(),
+        }
 
     def format_board_shaping_batch(self, batch: List[Dict], robot_id: int) -> Dict[str, torch.Tensor]:
         rgb_list, depth_list, q_target_list = [], [], []
@@ -1633,6 +2008,224 @@ class GPUInferenceServer:
                 print(f"[BOARD TRAIN R{robot_id}] CRITICAL TRAINING ERROR: {e}", flush=True)
                 import traceback
                 traceback.print_exc()
+
+    def format_board_locator_batch(self, batch: List[Dict], robot_id: int) -> Dict[str, torch.Tensor]:
+        rgb_list, depth_list, mask_list = [], [], []
+        for exp in batch:
+            is_sim = exp.get('source', 'real') == 'simulation'
+            rgb_t, depth_t = self._preprocess_board_pair(exp['state'], is_sim, robot_id)
+            rgb_list.append(rgb_t)
+            depth_list.append(depth_t)
+            sx = float(exp.get('spawn_x', 0.0))
+            sz = float(exp.get('spawn_z', 0.0))
+            _, mask_grid = make_block_mask_warp(
+                sx, sz, robot_id,
+                grid_n=self._board_n,
+                board_cfg=self.board_cfg,
+                locator_cfg=self.board_locator_cfg,
+            )
+            mask_list.append(torch.from_numpy(mask_grid).unsqueeze(0).unsqueeze(0))
+        return {
+            'rgb': torch.cat(rgb_list).to(self.device),
+            'depth': torch.cat(depth_list).to(self.device),
+            'masks': torch.cat(mask_list).to(self.device),
+        }
+
+    def _run_board_locator_training_step(self, robot_id: int = 1):
+        lock = self.train_lock if robot_id == 1 else self.train_lock2
+        if lock.locked():
+            return
+        with lock:
+            try:
+                if robot_id == 2:
+                    loc_mod = self.board_loc_module2
+                    weak_buf = self.weak_buffer2
+                    normal_buf = self.normal_buffer2
+                    step_attr = 'board_locator_training_step_count2'
+                    save_name = self._save_path_r2_board_locator
+                else:
+                    loc_mod = self.board_loc_module
+                    weak_buf = self.weak_buffer
+                    normal_buf = self.normal_buffer
+                    step_attr = 'board_locator_training_step_count'
+                    save_name = self._save_path_r1_board_locator
+
+                batch_raw = self._sample_mixed_batch(
+                    weak_buf, normal_buf, self.batch_size, self._weak_ratio,
+                )
+                if not batch_raw:
+                    return
+                torch_batch = self.format_board_locator_batch(batch_raw, robot_id)
+                losses = loc_mod.update(torch_batch)
+                step = getattr(self, step_attr) + 1
+                setattr(self, step_attr, step)
+                ckpt_every = self._checkpoint_every
+                checkpoint_saved = int(step % ckpt_every == 0)
+                self._append_board_locator_step_log(robot_id, {
+                    'timestamp_utc': datetime.now(timezone.utc).isoformat(),
+                    'robot_id': robot_id,
+                    'locator_step': step,
+                    'seg_bce': losses.get('seg_bce', losses['total']),
+                    'seg_dice': losses.get('seg_dice', 0.0),
+                    'grad_norm': losses.get('grad_norm', 0.0),
+                    'buffer_weak': len(weak_buf),
+                    'buffer_normal': len(normal_buf),
+                    'checkpoint_saved': checkpoint_saved,
+                })
+                print(
+                    f"[BOARD-LOC TRAIN R{robot_id}] step {step:4d} | "
+                    f"BCE: {losses.get('seg_bce', losses['total']):.4f} | "
+                    f"Dice: {losses.get('seg_dice', 0.0):.3f} | "
+                    f"buf weak:{len(weak_buf)} normal:{len(normal_buf)}",
+                    flush=True,
+                )
+                debug_every = int(self.board_locator_cfg.get('debug', {}).get('save_every_steps', 50))
+                if debug_every > 0 and step % debug_every == 0 and batch_raw:
+                    try:
+                        exp0 = batch_raw[0]
+                        self._save_board_seg_train_debug(
+                            exp0['state'], robot_id,
+                            float(exp0.get('spawn_x', 0.0)),
+                            float(exp0.get('spawn_z', 0.0)),
+                            loc_mod=loc_mod,
+                            step=step,
+                        )
+                    except Exception as exc:
+                        print(f"[BOARD-LOC DEBUG R{robot_id}] save failed: {exc}", flush=True)
+                if checkpoint_saved:
+                    base_dir = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+                    save_dir = os.path.join(base_dir, "models")
+                    os.makedirs(save_dir, exist_ok=True)
+                    full_path = os.path.join(save_dir, save_name)
+                    loc_mod.save_model(full_path, training_step=step)
+                    print(f"[BOARD-LOC TRAIN R{robot_id}] SAVED checkpoint: {full_path}", flush=True)
+            except Exception as e:
+                print(f"[BOARD-LOC TRAIN R{robot_id}] CRITICAL TRAINING ERROR: {e}", flush=True)
+                import traceback
+                traceback.print_exc()
+
+    def _save_board_seg_train_debug(
+        self,
+        camera_data: Dict,
+        robot_id: int,
+        label_x: float,
+        label_z: float,
+        loc_mod: Optional[BoardLocatorModule] = None,
+        step: Optional[int] = None,
+    ) -> None:
+        debug_dir = Path(__file__).resolve().parent.parent / "debug"
+        debug_dir.mkdir(parents=True, exist_ok=True)
+        rgb_w = self._warp_rgb_for_debug(camera_data, robot_id)
+        mask_warp, mask_grid = make_block_mask_warp(
+            label_x, label_z, robot_id,
+            grid_n=self._board_n,
+            board_cfg=self.board_cfg,
+            locator_cfg=self.board_locator_cfg,
+        )
+        _, teacher_conf = mask_grid_to_cell(
+            mask_grid, invalid_cell_mask(robot_id, self._board_n, self.board_cfg),
+        )
+        # Canonical teacher cell (same convention as board_warp overlay).
+        teacher_cell = world_to_board_cell(
+            label_x, label_z, robot_id, n=self._board_n, cfg=self.board_cfg,
+        )
+        vis = blend_mask_overlay(rgb_w, mask_warp, color_rgb=(0, 255, 0), alpha=0.45)
+        if teacher_cell is not None:
+            # Red cross at the exact block center (matches green mask center).
+            tx, ty = world_xz_to_warp_pixel(
+                label_x, label_z, robot_id,
+                out_size=vis.shape[1], cfg=self.board_cfg, apply_post_flip=True,
+            )
+            vis_bgr = cv2.cvtColor(vis, cv2.COLOR_RGB2BGR)
+            cv2.drawMarker(vis_bgr, (int(tx), int(ty)), (0, 0, 255), cv2.MARKER_CROSS, 12, 2)
+            pred_cell = None
+            pred_conf = None
+            pred_mask = None
+            if loc_mod is not None:
+                rgb_t, depth_t = self._preprocess_board_pair(camera_data, True, robot_id)
+                pred_cell, pred_conf, pred_mask = loc_mod.predict_cell(rgb_t, depth_t)
+                pred_x, pred_y = self._board_cell_pixel(pred_cell, vis.shape[0], vis.shape[1], robot_id)
+                cv2.drawMarker(vis_bgr, (pred_x, pred_y), (255, 255, 0), cv2.MARKER_TILTED_CROSS, 10, 2)
+                if pred_mask is not None:
+                    pm = cv2.resize(pred_mask, (vis.shape[1], vis.shape[0]))
+                    contours, _ = cv2.findContours(
+                        (pm > 0.5).astype(np.uint8), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE,
+                    )
+                    cv2.drawContours(vis_bgr, contours, -1, (255, 255, 0), 1)
+            stem = f"board_seg_train_r{robot_id}_latest"
+            if step is not None:
+                cv2.imwrite(str(debug_dir / f"board_seg_train_r{robot_id}_step{step}.jpg"), vis_bgr)
+            cv2.imwrite(str(debug_dir / f"{stem}.jpg"), vis_bgr)
+            sidecar = {
+                'robot_id': robot_id,
+                'label_x': label_x,
+                'label_z': label_z,
+                'teacher_cell': teacher_cell,
+                'teacher_mask_conf': teacher_conf,
+                'pred_cell': pred_cell,
+                'pred_conf': pred_conf,
+                'step': step,
+            }
+            with open(debug_dir / f"{stem}.json", 'w', encoding='utf-8') as f:
+                json.dump(sidecar, f, indent=2)
+
+    def _save_board_locator_raw_sample(
+        self, camera_data: Dict, robot_id: int, label_x: float, label_z: float,
+    ) -> Dict:
+        """Save clean warped RGB for manual segmentation (no auto-label)."""
+        ds_dir = _REPO_ROOT / "data" / "board_locator_dataset" / f"r{robot_id}"
+        img_dir = ds_dir / "images"
+        img_dir.mkdir(parents=True, exist_ok=True)
+
+        count_attr = f'_board_locator_raw_count_r{robot_id}'
+        idx = getattr(self, count_attr, 0)
+        setattr(self, count_attr, idx + 1)
+        stem = f"r{robot_id}_{idx:05d}"
+
+        rgb_w = self._warp_rgb_for_debug(camera_data, robot_id)
+        warp_path = img_dir / f"{stem}_warp.png"
+        cv2.imwrite(str(warp_path), cv2.cvtColor(rgb_w, cv2.COLOR_RGB2BGR))
+
+        meta = {
+            'stem': stem,
+            'robot_id': robot_id,
+            'warp_image': warp_path.name,
+            'warp_size': 224,
+            'spawn_x': label_x,
+            'spawn_z': label_z,
+            'timestamp_utc': datetime.now(timezone.utc).isoformat(),
+            'note': 'segment the block manually; spawn_x/z is reference only, not a label',
+        }
+        with open(ds_dir / f"{stem}.json", 'w', encoding='utf-8') as f:
+            json.dump(meta, f, indent=2)
+        return {'stem': stem, 'dir': str(ds_dir), 'index': idx}
+
+    def _handle_board_locator_training_data(self, training_data: Dict, source: str, robot_id: int) -> Dict:
+        try:
+            label_x, label_z = self._board_label_xz(training_data)
+            if label_x is None or label_z is None:
+                obj_pos = training_data.get('object_pos', [0.0, 0.0])
+                label_x = float(obj_pos[0]) if len(obj_pos) > 0 else 0.0
+                label_z = float(obj_pos[1]) if len(obj_pos) > 1 else 0.0
+
+            ack: Dict = {'type': 'training_ack', 'board_locator': True}
+            if not training_data.get('state'):
+                ack['skipped'] = True
+                return ack
+
+            info = self._save_board_locator_raw_sample(
+                training_data['state'], robot_id, label_x, label_z,
+            )
+            ack['saved_stem'] = info['stem']
+            ack['saved_index'] = info['index']
+            print(
+                f"[BOARD-LOC COLLECT R{robot_id}] saved {info['stem']} "
+                f"(warp) → {info['dir']}",
+                flush=True,
+            )
+            return ack
+        except Exception as e:
+            return {'type': 'error', 'message': str(e)}
 
     def _handle_board_training_data(self, training_data: Dict, source: str, robot_id: int) -> Dict:
         try:
@@ -2034,7 +2627,7 @@ class GPUInferenceServer:
             client_mode = full_message.get('mode', 'inference')
             robot_id    = int(full_message.get('robot_id', 1))
 
-            if client_mode in ('training', 'fine_tune', 'locator_train'):
+            if client_mode in ('training', 'fine_tune', 'locator_train', 'board_locator_train'):
                 return {
                     'type':      'grasp_prediction',
                     'mode':      'explore',
@@ -2055,6 +2648,9 @@ class GPUInferenceServer:
 
             if client_mode == 'board_dqn_train':
                 return self._predict_board_pose(full_message, explore=True)
+
+            if self.yolo_locator_test or bool(full_message.get('use_yolo_locator_test', False)):
+                return self._predict_yolo_bbox_random_pose(full_message)
 
             use_board = self.board_dqn or bool(full_message.get('use_board_dqn', False))
             if use_board:
@@ -2136,6 +2732,9 @@ class GPUInferenceServer:
 
             if self.board_dqn_train:
                 return self._handle_board_training_data(training_data, source, robot_id)
+
+            if self.board_locator_train:
+                return self._handle_board_locator_training_data(training_data, source, robot_id)
 
             sample = {
                 'state':      training_data['state'],
@@ -2496,12 +3095,16 @@ class GPUInferenceServer:
         
         self.server_socket.bind((host, port))
         self.server_socket.listen(5)
-        mode_label = "board DQN train" if self.board_dqn_train else (
-            "board DQN" if self.board_dqn else (
-                "residual RL" if self.rl_train else (
-                    "grid train" if self.grid_train else (
-                        "locator train" if self.locator_train else (
-                            "targeted fine-tune" if self.fine_tune else "behavior cloning"
+        mode_label = "YOLO locator test" if self.yolo_locator_test else (
+            "board locator train" if self.board_locator_train else (
+                "board DQN train" if self.board_dqn_train else (
+                    "board DQN" if self.board_dqn else (
+                        "residual RL" if self.rl_train else (
+                            "grid train" if self.grid_train else (
+                                "locator train" if self.locator_train else (
+                                    "targeted fine-tune" if self.fine_tune else "behavior cloning"
+                                )
+                            )
                         )
                     )
                 )
@@ -2539,6 +3142,31 @@ class GPUInferenceServer:
                 f"phase={tr.get('phase', 'both')} shaping_steps={tr.get('shaping_steps', 2000)} | "
                 f"checkpoints: {self._save_path_r1_grid}, {self._save_path_r2_grid}"
             )
+        if self.board_locator_train:
+            tr = self.board_locator_cfg.get('training', {})
+            print(
+                f"   Board locator: {self._board_n}x{self._board_n} seg on warp RGB-D | "
+                f"LR={tr.get('learning_rate', 1e-3)} | "
+                f"checkpoints: {self._save_path_r1_board_locator}, {self._save_path_r2_board_locator}"
+            )
+        if self.yolo_locator_test:
+            yc = self.yolo_locator_cfg
+            print(
+                f"   YOLO locator test: local Ultralytics | "
+                f"weights={yc.get('weights')} | conf={yc.get('conf')} | "
+                f"min_conf={yc.get('min_confidence')}"
+            )
+        if self.yolo_fuse:
+            yc = self.yolo_locator_cfg
+            print(
+                f"   YOLO+DQN fuse: bbox → best Q in box | "
+                f"weights={yc.get('weights')} | conf={yc.get('conf')} | "
+                f"fallback=plain DQN on miss"
+            )
+        if self.board_dqn or self.board_locator:
+            fusion_on = self.board_locator and self.board_locator_cfg.get('fusion', {}).get('enabled', True)
+            if self.board_locator:
+                print(f"   Board locator inference enabled (fusion={'on' if fusion_on and self.board_dqn else 'n/a'})")
         if self.board_dqn_train or self.board_dqn:
             tr = self.board_cfg.get('training', {})
             print(
@@ -2546,7 +3174,7 @@ class GPUInferenceServer:
                 f"shaping_episodes={tr.get('shaping_episodes', 250)} | "
                 f"checkpoints: {self._save_path_r1_board}, {self._save_path_r2_board}"
             )
-        
+
         while True:
             conn, addr = self.server_socket.accept()
             threading.Thread(
@@ -2590,6 +3218,22 @@ if __name__ == "__main__":
                         help='Board DQN checkpoint for R1')
     parser.add_argument('--board-model-r2', type=str, default=None,
                         help='Board DQN checkpoint for R2')
+    parser.add_argument('--board-locator-train', action='store_true',
+                        help='Warp-space block segmentation train (auxiliary board locator)')
+    parser.add_argument('--board-locator', action='store_true',
+                        help='Inference: fuse board locator with board DQN cell picker')
+    parser.add_argument('--board-locator-config', type=str, default=None,
+                        help='Path to board_locator_train_config.yaml')
+    parser.add_argument('--board-locator-model', type=str, default=None,
+                        help='Board locator checkpoint for R1')
+    parser.add_argument('--board-locator-model-r2', type=str, default=None,
+                        help='Board locator checkpoint for R2')
+    parser.add_argument('--yolo-locator-test', action='store_true',
+                        help='Inference: local YOLO bbox → random cell grasp (no DQN)')
+    parser.add_argument('--yolo-locator-config', type=str, default=None,
+                        help='Path to yolo_locator_config.yaml')
+    parser.add_argument('--yolo-fuse', action='store_true',
+                        help='With --board-dqn: YOLO bbox → best Q cell inside (fallback plain DQN)')
     parser.add_argument('--rl-train', action='store_true',
                         help='TD3 residual RL fine-tune (BC frozen; separate RL checkpoints)')
     parser.add_argument('--rl-train-config', type=str, default=None,
@@ -2632,6 +3276,38 @@ if __name__ == "__main__":
         parser.error('Use either --board-dqn or --local-grid, not both.')
     if args.board_dqn_train and args.board_dqn:
         parser.error('Use --board-dqn-train for training; --board-dqn is inference only.')
+    if args.board_locator_train and args.board_locator:
+        parser.error('Use --board-locator-train for training; --board-locator is inference only.')
+    if args.board_locator_train and args.locator_train:
+        parser.error('Use either --board-locator-train or --locator-train, not both.')
+    if args.board_locator_train and args.board_dqn_train:
+        parser.error('Use either --board-locator-train or --board-dqn-train, not both.')
+    if args.board_locator_train and args.fine_tune:
+        parser.error('Use either --board-locator-train or --fine-tune, not both.')
+    if args.board_locator_train and args.grid_train:
+        parser.error('Use either --board-locator-train or --grid-train, not both.')
+    if args.board_locator_train and args.rl_train:
+        parser.error('Use either --board-locator-train or --rl-train, not both.')
+    if args.board_locator and args.geo_grasp:
+        parser.error('Use either --board-locator with --board-dqn or --geo-grasp, not both.')
+    if args.board_locator and not args.board_dqn:
+        parser.error('--board-locator requires --board-dqn for fused inference.')
+    if args.yolo_locator_test and args.board_dqn:
+        parser.error('Use either --yolo-locator-test or --board-dqn, not both.')
+    if args.yolo_fuse and not args.board_dqn:
+        parser.error('--yolo-fuse requires --board-dqn.')
+    if args.yolo_fuse and args.yolo_locator_test:
+        parser.error('Use either --yolo-fuse or --yolo-locator-test, not both.')
+    if args.yolo_locator_test and args.board_locator:
+        parser.error('Use either --yolo-locator-test or --board-locator, not both.')
+    if args.yolo_locator_test and args.board_dqn_train:
+        parser.error('Use either --yolo-locator-test or --board-dqn-train, not both.')
+    if args.yolo_locator_test and args.board_locator_train:
+        parser.error('Use either --yolo-locator-test or --board-locator-train, not both.')
+    if args.yolo_locator_test and args.geo_grasp:
+        parser.error('Use either --yolo-locator-test or --geo-grasp, not both.')
+    if args.yolo_locator_test and args.local_grid:
+        parser.error('Use either --yolo-locator-test or --local-grid, not both.')
 
     server = GPUInferenceServer(
         model_path=args.model,
@@ -2651,6 +3327,14 @@ if __name__ == "__main__":
         board_config_path=args.board_config,
         board_model_path=args.board_model,
         board_model_path_r2=args.board_model_r2,
+        board_locator_train=args.board_locator_train,
+        board_locator=args.board_locator,
+        board_locator_config_path=args.board_locator_config,
+        board_locator_model_path=args.board_locator_model,
+        board_locator_model_path_r2=args.board_locator_model_r2,
+        yolo_locator_test=args.yolo_locator_test,
+        yolo_locator_config_path=args.yolo_locator_config,
+        yolo_fuse=args.yolo_fuse,
         rl_train=args.rl_train,
         rl_train_config_path=args.rl_train_config,
         rl_residual_r1=args.rl_residual_r1,

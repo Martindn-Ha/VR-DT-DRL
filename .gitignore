@@ -30,8 +30,17 @@ venv/
 .venv/
 env/
 
-# ML checkpoints (large binaries — copy locally, do not commit)
+# ML checkpoints / weights (large binaries — copy locally, do not commit)
 host_gpu_system/models/**/*.pth
+host_gpu_system/models/**/*.pt
+*.pt
+Block Dataset.yolo26/
+
+# YOLO train run artifacts under models/
+host_gpu_system/models/block_yolo/
+
+# Local API secrets (never commit)
+host_gpu_system/config/roboflow_secrets.local.yaml
 
 # IDE / OS
 .vscode/

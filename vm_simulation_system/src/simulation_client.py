@@ -29,6 +29,7 @@ from rl_reward import load_rl_train_config, get_robot_rl_config, calculate_rl_re
 from spawn_geometry import (
     load_fine_tune_config,
     load_locator_train_config,
+    load_board_locator_train_config,
     pick_random_weak_cell,
     quadrant_from_spawn,
     sample_spawn_in_phase_quadrant,
@@ -581,10 +582,14 @@ class SimulationClient:
                  use_residual: bool = False, use_geo_grasp: bool = False,
                  use_local_grid: bool = False,
                  use_board_dqn: bool = False,
+                 use_board_locator: bool = False,
+                 use_yolo_locator_test: bool = False,
+                 use_yolo_fuse: bool = False,
                  no_workspace_clamp: bool = False,
                  rl_train_config_path: Optional[str] = None,
                  grid_config_path: Optional[str] = None,
-                 board_config_path: Optional[str] = None):
+                 board_config_path: Optional[str] = None,
+                 board_locator_config_path: Optional[str] = None):
         
         self.mode       = mode
         self.real_robot = real_robot
@@ -594,6 +599,9 @@ class SimulationClient:
         self.use_geo_grasp = use_geo_grasp
         self.use_local_grid = use_local_grid
         self.use_board_dqn = use_board_dqn
+        self.use_board_locator = use_board_locator
+        self.use_yolo_locator_test = use_yolo_locator_test
+        self.use_yolo_fuse = use_yolo_fuse
         self.no_workspace_clamp = no_workspace_clamp
         self._rl_reward_cfg: Dict[str, Any] = {}
         self._grid_reward_cfg: Dict[str, Any] = {}
@@ -649,6 +657,8 @@ class SimulationClient:
             self._load_grid_train_settings(grid_config_path)
         if mode == 'board_dqn_train':
             self._load_board_train_settings(board_config_path)
+        if mode == 'board_locator_train':
+            self._load_board_locator_train_settings(board_locator_config_path)
         if mode == 'rl_train':
             self._load_rl_train_settings(rl_train_config_path)
 
@@ -770,11 +780,29 @@ class SimulationClient:
             f"112x112 full board"
         )
 
+    def _load_board_locator_train_settings(self, config_path: Optional[str] = None):
+        path = config_path or str(
+            VR_DRL_DATA_DIR.parent / "host_gpu_system" / "config" / "board_locator_train_config.yaml"
+        )
+        cfg = load_board_locator_train_config(path)
+        self._fine_tune_cfg = cfg
+        self._fine_tune_weak_regions = cfg['_weak_regions_parsed']
+        self._fine_tune_weak_spawn_p = float(
+            cfg.get('collection', {}).get('weak_spawn_probability', 0.7)
+        )
+        print(
+            f"[BOARD-LOC R{self.robot_id}] weak_spawn_p={self._fine_tune_weak_spawn_p:.0%} | "
+            f"warp seg labels from spawn XZ"
+        )
+
     def _is_grid_train(self) -> bool:
         return self.mode == 'grid_train'
 
     def _is_board_dqn_train(self) -> bool:
         return self.mode == 'board_dqn_train'
+
+    def _is_board_locator_train(self) -> bool:
+        return self.mode == 'board_locator_train'
 
     def _log_grid_result(self, robot_id: int, line: str) -> None:
         print()
@@ -810,6 +838,8 @@ class SimulationClient:
             return f"episode_log_r{self.robot_id}_grid_train"
         if self.mode == 'board_dqn_train':
             return f"episode_log_r{self.robot_id}_board_dqn_train"
+        if self.mode == 'board_locator_train':
+            return f"episode_log_r{self.robot_id}_board_locator_train"
         if self.mode == 'inference' and self.inference_mode == 'phase':
             return f"episode_log_r{self.robot_id}_phase{self.fixed_phase}"
         return f"episode_log_r{self.robot_id}"
@@ -822,6 +852,8 @@ class SimulationClient:
 
     def _episode_log_columns(self) -> List[str]:
         if self.mode == 'locator_train':
+            return LOCATOR_EPISODE_LOG_COLUMNS
+        if self.mode == 'board_locator_train':
             return LOCATOR_EPISODE_LOG_COLUMNS
         if self.mode == 'grid_train':
             return GRID_EPISODE_LOG_COLUMNS
@@ -891,6 +923,9 @@ class SimulationClient:
         elif self.mode == 'board_dqn_train':
             if row.get('success') == '':
                 row['success'] = int(bool(success))
+        elif self.mode == 'board_locator_train':
+            if row.get('demo_ok') == '':
+                row['demo_ok'] = int(bool(success))
         else:
             row['inference_mode']   = self.inference_mode if self.mode == 'inference' else ''
             row['curriculum_phase'] = self.curriculum.phase
@@ -935,6 +970,8 @@ class SimulationClient:
         if self.mode == 'locator_train':
             return str(self._fine_tune_spawn_phase)
         if self.mode == 'grid_train':
+            return str(self._fine_tune_spawn_phase)
+        if self.mode == 'board_locator_train':
             return str(self._fine_tune_spawn_phase)
         if self.mode != 'inference':
             return str(self.curriculum.phase)
@@ -1205,6 +1242,65 @@ class SimulationClient:
                 locator_fields['loc_step_at_pred'] = int(loc_step)
 
         self._episode_log_fields.update(locator_fields)
+        self._end_episode_and_restart(success=bool(demo_ok))
+
+    def _collect_board_locator_training_demo(self, current_state: Dict, duck_node, node_found: bool):
+        """Warp RGB-D + spawn XZ for board_locator_train (no grasp)."""
+        robot_id = self.robot_id
+        self.last_grasp_mode = 'board_locator_collect'
+        spawn_xz = self._spawn_block_xz()
+        label_source = 'spawn' if spawn_xz is not None else 'pre_grasp'
+        obj_pos = self._object_pos_for_locator_label(duck_node)
+        print(
+            f"[BOARD-LOC-COLLECT R{robot_id}] label=({obj_pos[0]:.3f}, {obj_pos[1]:.3f}) "
+            f"| source={label_source} | bucket={self._fine_tune_demo_bucket}"
+        )
+
+        demo_sent = 0
+        demo_ok = 0
+        response = None
+        if current_state.get('rgb') and self.mode != 'inference':
+            spawn_x_log = self._episode_log_fields.get('spawn_x', '')
+            spawn_z_log = self._episode_log_fields.get('spawn_z', '')
+            train_payload = {
+                'state': current_state,
+                'mode': 'board_locator_collect',
+                'object_pos': obj_pos,
+                'spawn_phase': self._fine_tune_spawn_phase,
+                'spawn_x': float(spawn_x_log) if spawn_x_log != '' else 0.0,
+                'spawn_z': float(spawn_z_log) if spawn_z_log != '' else 0.0,
+                'quadrant': self._fine_tune_spawn_quadrant,
+                'demo_bucket': self._fine_tune_demo_bucket,
+                'spawn_collection': self._fine_tune_spawn_collection,
+            }
+            response = self._send_message_to_host({
+                'type': 'training_data',
+                'source': 'simulation',
+                'robot_id': robot_id,
+                'data': train_payload,
+            })
+            if response and response.get('type') == 'training_ack':
+                demo_sent = 1
+                demo_ok = 1
+
+        fields: Dict[str, Any] = {
+            'grasp_mode': 'board_locator_collect',
+            'label_x_m': self._fmt_log_float(obj_pos[0]),
+            'label_z_m': self._fmt_log_float(obj_pos[1]),
+            'label_source': label_source,
+            'object_found': int(bool(node_found)),
+            'demo_sent': demo_sent,
+            'demo_ok': demo_ok,
+        }
+        if response and response.get('type') == 'training_ack':
+            tc = response.get('teacher_cell')
+            if tc is not None:
+                fields['teacher_cell'] = str(int(tc))
+            loc_step = response.get('locator_step')
+            if loc_step is not None:
+                fields['locator_step_at_pred'] = int(loc_step)
+
+        self._episode_log_fields.update(fields)
         self._end_episode_and_restart(success=bool(demo_ok))
 
     def _compute_lateral_aim_metrics(
@@ -1971,7 +2067,7 @@ class SimulationClient:
         try:
             with self.connection_lock:
                 self.host_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                self.host_socket.settimeout(30)
+                self.host_socket.settimeout(30.0)
                 self.host_socket.connect((host_ip, host_port))
                 self.connected = True
             rospy.loginfo(f"Connected to GPU server at {host_ip}:{host_port}")
@@ -2001,7 +2097,8 @@ class SimulationClient:
             self.latest_rgb_b64 = base64.b64encode(rgb_enc).decode('utf-8')
 
             if self.latest_depth_image is not None:
-                depth_mm = (self.latest_depth_image * 1000).astype(np.uint16)
+                depth_m = np.nan_to_num(self.latest_depth_image, nan=0.0, posinf=0.0, neginf=0.0)
+                depth_mm = (depth_m * 1000).astype(np.uint16)
                 h, w = depth_mm.shape
                 header = np.array([h, w], dtype=np.uint32).tobytes()
                 self.latest_depth_b64 = base64.b64encode(header + depth_mm.tobytes()).decode('utf-8')
@@ -2018,6 +2115,9 @@ class SimulationClient:
                 'use_geo_grasp': self.use_geo_grasp,
                 'use_local_grid': self.use_local_grid,
                 'use_board_dqn': self.use_board_dqn,
+                'use_board_locator': self.use_board_locator,
+                'use_yolo_locator_test': self.use_yolo_locator_test,
+                'use_yolo_fuse': self.use_yolo_fuse,
                 'session_episode': self.session_episode_count,
             }
             spawn_x_log = self._episode_log_fields.get('spawn_x', '')
@@ -2065,6 +2165,9 @@ class SimulationClient:
                     self._execute_grasp_prediction(response)
             elif response and response.get('type') == 'error':
                 print(f"[GPU R{self.robot_id}] Inference error: {response.get('message')}")
+                if self.use_yolo_locator_test and self.episode_active:
+                    print(f"[YOLO R{self.robot_id}] No bbox — skipping to next episode")
+                    self._end_episode_and_restart(False)
             elif self.episode_active:
                 print(f"[GPU R{self.robot_id}] Unexpected response: {response}")
         except Exception as e:
@@ -2234,6 +2337,10 @@ class SimulationClient:
 
             if self.mode == 'locator_train':
                 self._collect_locator_training_demo(current_state, duck_node, node_found)
+                return
+
+            if self.mode == 'board_locator_train':
+                self._collect_board_locator_training_demo(current_state, duck_node, node_found)
                 return
 
             if self.mode == 'grid_train' and mode == 'explore':
@@ -2610,9 +2717,9 @@ class SimulationClient:
             hypothesis_id="C",
         )
         self.end_current_episode(success)
-        if self.mode != 'locator_train':
+        if self.mode != 'locator_train' and self.mode != 'board_locator_train':
             self.robot_controller.home_position()
-        flush_steps = 20 if self.mode == 'locator_train' else 40
+        flush_steps = 20 if self.mode in ('locator_train', 'board_locator_train') else 40
         self._flush_camera_buffers(steps=flush_steps)
 
         if not self._is_grid_train():
@@ -3029,6 +3136,14 @@ class SimulationClient:
                 f"spawn=({sx}, {sz}) | {self._fine_tune_demo_bucket} | "
                 f"board_phase={self._board_phase}"
             )
+        elif self._is_board_locator_train():
+            sx = self._episode_log_fields.get('spawn_x', '?')
+            sz = self._episode_log_fields.get('spawn_z', '?')
+            print("-------")
+            print(
+                f"[BOARD-LOC R{self.robot_id}] ep {self.episode_count} | "
+                f"spawn=({sx}, {sz}) | {self._fine_tune_demo_bucket}"
+            )
         _agent_debug_log(
             "simulation_client.py:start_new_episode:exit",
             "start_new_episode_done",
@@ -3164,7 +3279,7 @@ class SimulationClient:
                 return
 
             spawn_radius_cm = None
-            if self.mode in ('fine_tune', 'locator_train', 'grid_train', 'board_dqn_train'):
+            if self.mode in ('fine_tune', 'locator_train', 'grid_train', 'board_dqn_train', 'board_locator_train'):
                 spawn_x, spawn_z, spawn_radius_cm = self._spawn_fine_tune_position()
                 self._episode_log_fields['spawn_quadrant'] = str(self._fine_tune_spawn_quadrant)
                 self._episode_log_fields['demo_bucket'] = self._fine_tune_demo_bucket
@@ -3177,7 +3292,7 @@ class SimulationClient:
                 spawn_x, _, spawn_z = self.curriculum.get_spawn_position()
 
             spawn_y = 0.461
-            if self.mode in ('fine_tune', 'locator_train', 'grid_train', 'board_dqn_train'):
+            if self.mode in ('fine_tune', 'locator_train', 'grid_train', 'board_dqn_train', 'board_locator_train'):
                 self._episode_log_fields['spawn_phase'] = str(self._fine_tune_spawn_phase)
 
             position_field = obj_node.getField("translation")
@@ -3287,6 +3402,13 @@ class SimulationClient:
         elif self.mode == 'locator_train':
             print(
                 f"[LOCATOR-TRAIN R{robot_id}] {status} Ep {self.episode_count} (session {self.session_episode_count}) | "
+                f"bucket={self._fine_tune_demo_bucket} | "
+                f"band={self._fine_tune_spawn_phase} Q{self._fine_tune_spawn_quadrant} | "
+                f"grasp={mode}"
+            )
+        elif self.mode == 'board_locator_train':
+            print(
+                f"[BOARD-LOC-TRAIN R{robot_id}] {status} Ep {self.episode_count} (session {self.session_episode_count}) | "
                 f"bucket={self._fine_tune_demo_bucket} | "
                 f"band={self._fine_tune_spawn_phase} Q{self._fine_tune_spawn_quadrant} | "
                 f"grasp={mode}"
@@ -3499,7 +3621,7 @@ def main():
         formatter_class=argparse.RawTextHelpFormatter
     )
     parser.add_argument('--mode', type=str, default='training',
-                        help='training | fine_tune | locator_train | grid_train | board_dqn_train | rl_train | inference')
+                        help='training | fine_tune | locator_train | grid_train | board_dqn_train | board_locator_train | rl_train | inference')
     parser.add_argument('--fine-tune-config', type=str, default=None,
                         help='Path to fine_tune_config.yaml (fine_tune mode only)')
     parser.add_argument('--locator-config', type=str, default=None,
@@ -3508,6 +3630,8 @@ def main():
                         help='Path to grid_train_config.yaml (grid_train mode only)')
     parser.add_argument('--board-config', type=str, default=None,
                         help='Path to board_dqn_config.yaml (board_dqn_train mode only)')
+    parser.add_argument('--board-locator-config', type=str, default=None,
+                        help='Path to board_locator_train_config.yaml (board_locator_train mode only)')
     parser.add_argument('--rl-train-config', type=str, default=None,
                         help='Path to rl_train_config.yaml (rl_train mode only)')
     parser.add_argument('--use-residual', action='store_true',
@@ -3518,6 +3642,12 @@ def main():
                         help='Inference: locator-centered grid Q-head (requires gpu_server --local-grid)')
     parser.add_argument('--use-board-dqn', action='store_true',
                         help='Inference: full-board DQN (requires gpu_server --board-dqn)')
+    parser.add_argument('--use-board-locator', action='store_true',
+                        help='Inference: fuse board locator with board DQN (requires --use-board-dqn and gpu_server --board-locator)')
+    parser.add_argument('--use-yolo-locator-test', action='store_true',
+                        help='Inference: local YOLO bbox → random cell (requires gpu_server --yolo-locator-test)')
+    parser.add_argument('--use-yolo-fuse', action='store_true',
+                        help='Inference: YOLO bbox → best board-DQN Q in box (requires --use-board-dqn and gpu_server --yolo-fuse)')
     parser.add_argument('--no-workspace-clamp', action='store_true',
                         help='Inference: skip X/Y/Z workspace clip on exploit/exploit_geo poses (diagnostic; teacher explore unchanged)')
     parser.add_argument('--episodes', type=int, default=None,
@@ -3566,8 +3696,8 @@ def main():
     is_real = args.real or args.ros_camera
     mode = 'inference' if is_real else args.mode
 
-    if mode not in ('training', 'fine_tune', 'locator_train', 'grid_train', 'board_dqn_train', 'rl_train', 'inference'):
-        parser.error("--mode must be training, fine_tune, locator_train, grid_train, board_dqn_train, rl_train, or inference.")
+    if mode not in ('training', 'fine_tune', 'locator_train', 'grid_train', 'board_dqn_train', 'board_locator_train', 'rl_train', 'inference'):
+        parser.error("--mode must be training, fine_tune, locator_train, grid_train, board_dqn_train, board_locator_train, rl_train, or inference.")
 
     if mode == 'rl_train' and is_real:
         parser.error("rl_train mode is simulation-only (omit --real).")
@@ -3580,6 +3710,30 @@ def main():
         parser.error("--use-local-grid requires --mode inference.")
     if args.use_board_dqn and mode != 'inference':
         parser.error("--use-board-dqn requires --mode inference.")
+    if args.use_board_locator and mode != 'inference':
+        parser.error("--use-board-locator requires --mode inference.")
+    if args.use_yolo_locator_test and mode != 'inference':
+        parser.error("--use-yolo-locator-test requires --mode inference.")
+    if args.use_yolo_fuse and mode != 'inference':
+        parser.error("--use-yolo-fuse requires --mode inference.")
+    if args.use_board_locator and not args.use_board_dqn:
+        parser.error("--use-board-locator requires --use-board-dqn.")
+    if args.use_yolo_fuse and not args.use_board_dqn:
+        parser.error("--use-yolo-fuse requires --use-board-dqn.")
+    if args.use_yolo_fuse and args.use_yolo_locator_test:
+        parser.error("Use either --use-yolo-fuse or --use-yolo-locator-test, not both.")
+    if args.use_yolo_locator_test and args.use_board_dqn:
+        parser.error("Use either --use-yolo-locator-test or --use-board-dqn, not both.")
+    if args.use_yolo_locator_test and args.use_board_locator:
+        parser.error("Use either --use-yolo-locator-test or --use-board-locator, not both.")
+    if args.use_yolo_fuse and args.use_board_locator:
+        parser.error("Use either --use-yolo-fuse or --use-board-locator, not both.")
+    if args.use_yolo_locator_test and args.use_geo_grasp:
+        parser.error("Use either --use-yolo-locator-test or --use-geo-grasp, not both.")
+    if args.use_yolo_locator_test and args.use_local_grid:
+        parser.error("Use either --use-yolo-locator-test or --use-local-grid, not both.")
+    if args.use_yolo_locator_test and args.use_residual:
+        parser.error("Use either --use-yolo-locator-test or --use-residual, not both.")
     if args.use_residual and args.use_geo_grasp:
         parser.error("Use either --use-residual or --use-geo-grasp, not both.")
     if args.use_geo_grasp and args.use_local_grid:
@@ -3608,6 +3762,8 @@ def main():
         parser.error("grid_train mode does not support --cycle / --free / --phase.")
     if mode == 'board_dqn_train' and any(inf_flags):
         parser.error("board_dqn_train mode does not support --cycle / --free / --phase.")
+    if mode == 'board_locator_train' and any(inf_flags):
+        parser.error("board_locator_train mode does not support --cycle / --free / --phase.")
     if mode == 'rl_train' and any(inf_flags):
         parser.error("rl_train mode does not support --cycle / --free / --phase.")
     if args.cycle is None and (args.cycle_from != 0 or args.cycle_to != 5):
@@ -3638,10 +3794,14 @@ def main():
             use_geo_grasp=args.use_geo_grasp,
             use_local_grid=args.use_local_grid,
             use_board_dqn=args.use_board_dqn,
+            use_board_locator=args.use_board_locator,
+            use_yolo_locator_test=args.use_yolo_locator_test,
+            use_yolo_fuse=args.use_yolo_fuse,
             no_workspace_clamp=args.no_workspace_clamp,
             rl_train_config_path=args.rl_train_config,
             grid_config_path=args.grid_config,
             board_config_path=args.board_config,
+            board_locator_config_path=args.board_locator_config,
         )
     except Exception:
         import traceback
@@ -3662,6 +3822,9 @@ def main():
 
     if mode == 'board_dqn_train' and args.board_config:
         client._load_board_train_settings(args.board_config)
+
+    if mode == 'board_locator_train' and args.board_locator_config:
+        client._load_board_locator_train_settings(args.board_locator_config)
 
     if mode == 'fine_tune':
         cfg = client._fine_tune_cfg or {}
@@ -3702,6 +3865,15 @@ def main():
             f"start gpu_server.py with --board-dqn-train"
         )
 
+    if mode == 'board_locator_train':
+        cfg = client._fine_tune_cfg or {}
+        wr = cfg.get('sampling', {}).get('weak_ratio', 0.7)
+        print(
+            f"[BOARD-LOC R{robot_id}] Warp seg labels from spawn XZ | "
+            f"batch mix {wr:.0%} weak | "
+            f"start gpu_server.py with --board-locator-train"
+        )
+
     if mode == 'rl_train':
         print(
             f"[RL-TRAIN R{robot_id}] TD3 residual collection | "
@@ -3717,7 +3889,15 @@ def main():
         print(f"[INFERENCE R{robot_id}] Local grid (--use-local-grid) | locator + Q-cell → geometry")
 
     if mode == 'inference' and args.use_board_dqn:
-        print(f"[INFERENCE R{robot_id}] Full-board DQN (--use-board-dqn) | 112x112 Q-map → geometry")
+        loc_note = " + locator fusion" if args.use_board_locator else ""
+        yolo_note = " + YOLO fuse" if args.use_yolo_fuse else ""
+        print(f"[INFERENCE R{robot_id}] Full-board DQN (--use-board-dqn){loc_note}{yolo_note}")
+
+    if mode == 'inference' and args.use_yolo_locator_test:
+        print(f"[INFERENCE R{robot_id}] YOLO bbox random cell (--use-yolo-locator-test)")
+
+    if mode == 'inference' and args.use_yolo_fuse:
+        print(f"[INFERENCE R{robot_id}] YOLO bbox → best Q in box (--use-yolo-fuse)")
 
     if mode == 'inference' and args.no_workspace_clamp:
         print(f"[INFERENCE R{robot_id}] Workspace clamp DISABLED (--no-workspace-clamp)")

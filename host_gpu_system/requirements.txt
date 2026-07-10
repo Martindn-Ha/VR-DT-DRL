@@ -17,3 +17,4 @@ wandb>=0.13.0
 flask>=2.2.0
 requests>=2.28.0
 openpyxl>=3.1.0
+ultralytics>=8.3.0

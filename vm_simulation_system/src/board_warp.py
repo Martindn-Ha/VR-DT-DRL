@@ -36,6 +36,9 @@ def _load_warp_yaml(robot_id: int) -> Dict[str, Any]:
         return yaml.safe_load(f) or {}
 
 
+_load_warp_yaml = lru_cache(maxsize=4)(_load_warp_yaml)
+
+
 def image_corners_crop_local(robot_id: int, crop_w: int, crop_h: int) -> np.ndarray:
     """Default image corners: full cropped frame maps to platform."""
     return np.asarray([
