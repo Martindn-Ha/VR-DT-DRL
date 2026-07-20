@@ -15,6 +15,7 @@ OUTCOME_CLASSES = (
     'success',
     'sim_nan_abort',
     'object_not_found',
+    'yolo_detection_failed',
     'far_miss',
     'weak_lift',
     'drop_or_push',

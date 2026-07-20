@@ -229,6 +229,28 @@ def world_xz_to_warp_pixel(
     return int(round(u)), int(round(v))
 
 
+def warp_pixel_to_world_xz(
+    u: float,
+    v: float,
+    robot_id: int,
+    out_size: int = 224,
+    cfg: Optional[Dict[str, Any]] = None,
+    *,
+    apply_post_flip: bool = True,
+) -> Tuple[float, float]:
+    """Inverse of world_xz_to_warp_pixel (undo post-flip first)."""
+    uu, vv = float(u), float(v)
+    if apply_post_flip:
+        if _post_flip_vertical(robot_id):
+            vv = out_size - vv
+        if _post_flip_horizontal(robot_id):
+            uu = out_size - uu
+    x_min, x_max, z_min, z_max = board_bounds(robot_id, cfg)
+    x = x_min + (uu / max(float(out_size), 1e-9)) * (x_max - x_min)
+    z = z_max - (vv / max(float(out_size), 1e-9)) * (z_max - z_min)
+    return float(x), float(z)
+
+
 def warp_pixel_to_crop_pixel(
     u: float,
     v: float,

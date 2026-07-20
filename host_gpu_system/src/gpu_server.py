@@ -41,6 +41,12 @@ from yolo_locator import (
     LocalYoloLocator, load_yolo_locator_config, random_cell_in_bbox,
     best_q_cell_in_bbox, dist_cell_to_bbox_px, dist_cell_to_bbox_cells,
 )
+from local_bbox_dqn_module import LocalBBoxDQNModule, create_local_bbox_dqn_module
+from local_bbox_window import (
+    load_local_bbox_dqn_config, local_bbox_grid_params,
+    bbox_center_world, crop_fixed_window, local_cell_to_world, world_to_local_cell,
+    window_xyxy_warp,
+)
 from board_seg_labels import make_block_mask_warp, blend_mask_overlay, mask_grid_to_cell
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -54,6 +60,7 @@ from rl_reward import load_rl_train_config, get_robot_rl_config, exploration_noi
 from grasp_geometry import compute_grasp_pose_from_object_world, local_xz_to_world, DEFAULT_OBJECT_Y_M  # noqa: E402
 from local_grid import (  # noqa: E402
     load_grid_train_config, grid_params, world_to_cell, cell_to_world, epsilon_for_episode,
+    calculate_grid_reward,
 )
 from board_grid import (  # noqa: E402
     load_board_dqn_config, board_n, world_to_board_cell, board_cell_to_world,
@@ -62,7 +69,7 @@ from board_grid import (  # noqa: E402
 )
 from board_warp import (
     warp_rgb_to_board, warp_depth_to_board,
-    world_xz_to_warp_pixel, warp_pixel_to_crop_pixel,
+    world_xz_to_warp_pixel, warp_pixel_to_crop_pixel, warp_pixel_to_world_xz,
     get_warp_corners, _warp_image_corners,
 )  # noqa: E402
 
@@ -118,6 +125,11 @@ class GPUInferenceServer:
                  yolo_locator_test: bool = False,
                  yolo_locator_config_path: str = None,
                  yolo_fuse: bool = False,
+                 local_bbox_dqn: bool = False,
+                 local_bbox_dqn_train: bool = False,
+                 local_bbox_dqn_config_path: str = None,
+                 local_bbox_model_path: str = None,
+                 local_bbox_model_path_r2: str = None,
                  rl_train: bool = False, rl_train_config_path: str = None,
                  rl_residual_r1: str = None, rl_residual_r2: str = None):
         self.config     = self._load_config(config_path)
@@ -140,8 +152,18 @@ class GPUInferenceServer:
         self.board_locator_model_path_r2 = board_locator_model_path_r2
         self.yolo_locator_test = yolo_locator_test
         self.yolo_fuse = yolo_fuse
+        self.local_bbox_dqn = local_bbox_dqn
+        self.local_bbox_dqn_train = local_bbox_dqn_train
+        self.local_bbox_model_path = local_bbox_model_path
+        self.local_bbox_model_path_r2 = local_bbox_model_path_r2
         self.yolo_locator_cfg: Dict = {}
         self.yolo_client: Optional[LocalYoloLocator] = None
+        self.local_bbox_cfg: Dict = {}
+        self.local_bbox_module: Optional[LocalBBoxDQNModule] = None
+        self.local_bbox_module2: Optional[LocalBBoxDQNModule] = None
+        self._local_bbox_n = 20
+        self._local_bbox_window_m = 0.02
+        self._local_bbox_crop_size = 224
         self.rl_train   = rl_train
         self.fine_tune_cfg: Dict = {}
         self.locator_cfg: Dict = {}
@@ -257,7 +279,7 @@ class GPUInferenceServer:
                     self.grid_model_path_r2 = save_g2
 
         if (board_dqn_train or board_dqn or board_locator_train or board_locator
-                or yolo_locator_test):
+                or yolo_locator_test or local_bbox_dqn or local_bbox_dqn_train):
             b_path = board_config_path or str(
                 Path(__file__).resolve().parent.parent / "config" / "board_dqn_config.yaml"
             )
@@ -271,6 +293,36 @@ class GPUInferenceServer:
             )
             self.yolo_locator_cfg = load_yolo_locator_config(yl_path)
             self.yolo_client = LocalYoloLocator(self.yolo_locator_cfg)
+
+        if local_bbox_dqn or local_bbox_dqn_train:
+            lb_path = local_bbox_dqn_config_path or str(
+                Path(__file__).resolve().parent.parent / "config" / "local_bbox_dqn_config.yaml"
+            )
+            self.local_bbox_cfg = load_local_bbox_dqn_config(lb_path)
+            self._local_bbox_n, self._local_bbox_window_m = local_bbox_grid_params(self.local_bbox_cfg)
+            self._local_bbox_crop_size = int(self.local_bbox_cfg.get("crop", {}).get("out_size", 224))
+            yolo_cfg = dict(self.local_bbox_cfg.get("yolo") or {})
+            if yolo_locator_config_path:
+                yolo_cfg = load_yolo_locator_config(yolo_locator_config_path)
+            elif not yolo_cfg.get("weights"):
+                yolo_cfg = load_yolo_locator_config()
+            self.yolo_locator_cfg = yolo_cfg
+            if self.yolo_client is None:
+                self.yolo_client = LocalYoloLocator(yolo_cfg)
+            ckpt_cfg = self.local_bbox_cfg.get("checkpoints", {})
+            save_l1 = ckpt_cfg.get("save_r1", "models/R1_local_bbox_dqn.pth")
+            save_l2 = ckpt_cfg.get("save_r2", "models/R2_local_bbox_dqn.pth")
+            self._save_path_r1_local_bbox = Path(save_l1).name
+            self._save_path_r2_local_bbox = Path(save_l2).name
+            if local_bbox_dqn and not local_bbox_dqn_train:
+                if not self.local_bbox_model_path:
+                    self.local_bbox_model_path = save_l1
+                if not self.local_bbox_model_path_r2:
+                    self.local_bbox_model_path_r2 = save_l2
+            if local_bbox_dqn_train:
+                self._checkpoint_every = int(
+                    self.local_bbox_cfg.get("training", {}).get("checkpoint_every_steps", 100)
+                )
 
         if board_dqn_train or board_dqn:
             ckpt_cfg = self.board_cfg.get('checkpoints', {})
@@ -312,7 +364,7 @@ class GPUInferenceServer:
                 if not self.board_locator_model_path_r2:
                     self.board_locator_model_path_r2 = save_l2
 
-        if geo_grasp and not locator_train and not fine_tune and not rl_train and not grid_train and not local_grid and not board_dqn_train and not board_dqn and not board_locator_train and not board_locator and not yolo_locator_test:
+        if geo_grasp and not locator_train and not fine_tune and not rl_train and not grid_train and not local_grid and not board_dqn_train and not board_dqn and not board_locator_train and not board_locator and not yolo_locator_test and not local_bbox_dqn and not local_bbox_dqn_train:
             if not self.model_path:
                 self.model_path = "models/R1_locator.pth"
             if not self.model_path_r2:
@@ -343,10 +395,14 @@ class GPUInferenceServer:
             model_config['learning_rate'] = float(
                 self.board_locator_cfg.get('training', {}).get('learning_rate', 1e-3)
             )
+        if local_bbox_dqn_train:
+            model_config['learning_rate'] = float(
+                self.local_bbox_cfg.get('training', {}).get('learning_rate', 1e-3)
+            )
 
         board_only = (
             board_dqn_train or board_dqn or board_locator_train or board_locator
-            or yolo_locator_test
+            or yolo_locator_test or local_bbox_dqn or local_bbox_dqn_train
         )
         self._board_only = board_only
         self.model = None
@@ -380,6 +436,8 @@ class GPUInferenceServer:
             self.batch_size = int(self.board_cfg.get('training', {}).get('batch_size', 4))
         elif board_locator_train:
             self.batch_size = int(self.board_locator_cfg.get('training', {}).get('batch_size', 8))
+        elif local_bbox_dqn_train:
+            self.batch_size = int(self.local_bbox_cfg.get('training', {}).get('batch_size', 8))
         elif rl_train:
             self.batch_size = int(self.rl_cfg.get('training', {}).get('batch_size', 16))
         else:
@@ -400,12 +458,18 @@ class GPUInferenceServer:
         replay_cap = 10000
         if grid_train:
             replay_cap = int(self.grid_cfg.get('training', {}).get('replay_capacity', 10000))
+        if local_bbox_dqn_train:
+            replay_cap = int(self.local_bbox_cfg.get('training', {}).get('replay_capacity', 5000))
         self.grid_replay          = deque(maxlen=replay_cap)
         self.grid_replay2         = deque(maxlen=replay_cap)
+        self.local_bbox_replay    = deque(maxlen=replay_cap)
+        self.local_bbox_replay2   = deque(maxlen=replay_cap)
         self.training_step_count  = 0
         self.training_step_count2 = 0
         self.grid_training_step_count  = 0
         self.grid_training_step_count2 = 0
+        self.local_bbox_training_step_count  = 0
+        self.local_bbox_training_step_count2 = 0
         self.board_training_step_count  = 0
         self.board_training_step_count2 = 0
         self.board_locator_training_step_count  = 0
@@ -454,6 +518,9 @@ class GPUInferenceServer:
         self.board_loc_module2: Optional[BoardLocatorModule] = None
         if board_locator_train or board_locator:
             self._init_board_locator_modules()
+
+        if local_bbox_dqn or local_bbox_dqn_train:
+            self._init_local_bbox_modules()
 
         if rl_train or rl_residual_r1 or rl_residual_r2:
             if not self.rl_cfg:
@@ -1291,6 +1358,67 @@ class GPUInferenceServer:
         _load(self.board_module2, self.board_model_path_r2, self._save_path_r2_board,
               'board_training_step_count2')
 
+    def _init_local_bbox_modules(self) -> None:
+        tr = self.local_bbox_cfg.get("training", {})
+        lr = float(tr.get("learning_rate", 1e-3))
+        wd = float(tr.get("weight_decay", 8e-5))
+        gamma = float(tr.get("gamma", 0.99))
+        enc_ph = float(tr.get("encoder_lr_factor", 0.1))
+        self.local_bbox_module = create_local_bbox_dqn_module(
+            grid_n=self._local_bbox_n,
+            learning_rate=lr,
+            weight_decay=wd,
+            encoder_lr_factor=enc_ph,
+            gamma=gamma,
+        ).to(self.device)
+        self.local_bbox_module2 = create_local_bbox_dqn_module(
+            grid_n=self._local_bbox_n,
+            learning_rate=lr,
+            weight_decay=wd,
+            encoder_lr_factor=enc_ph,
+            gamma=gamma,
+        ).to(self.device)
+        self._load_local_bbox_weights()
+
+    def _load_local_bbox_weights(self) -> None:
+        def _load(mod: Optional[LocalBBoxDQNModule], path_override: Optional[str],
+                  default_name: str, step_attr: str):
+            if mod is None:
+                return
+            path = self._resolve_checkpoint_path(path_override, default_name)
+            print(f"[LOCAL-BBOX] Looking for checkpoint at: {path.resolve()}")
+            if path.exists():
+                step = mod.load_model(str(path))
+                setattr(self, step_attr, max(getattr(self, step_attr), step))
+                print(f"[LOCAL-BBOX] Loaded: {path.name}  (step {step})")
+            elif self.local_bbox_dqn_train:
+                print("   -> No local-bbox checkpoint yet — starting from pretrained MobileNet")
+            elif self.local_bbox_dqn:
+                print(f"[LOCAL-BBOX] WARNING: No checkpoint at {path.name}")
+
+        _load(self.local_bbox_module, self.local_bbox_model_path,
+              self._save_path_r1_local_bbox, "local_bbox_training_step_count")
+        _load(self.local_bbox_module2, self.local_bbox_model_path_r2,
+              self._save_path_r2_local_bbox, "local_bbox_training_step_count2")
+
+    def _local_bbox_training_phase(self, robot_id: int) -> str:
+        phase_cfg = str(self.local_bbox_cfg.get("training", {}).get("phase", "both")).lower()
+        if phase_cfg == "shaping":
+            return "shaping"
+        if phase_cfg == "rl":
+            return "rl"
+        step = self.local_bbox_training_step_count2 if robot_id == 2 else self.local_bbox_training_step_count
+        shaping_steps = int(self.local_bbox_cfg.get("training", {}).get("shaping_steps", 500))
+        weak = self.weak_buffer2 if robot_id == 2 else self.weak_buffer
+        normal = self.normal_buffer2 if robot_id == 2 else self.normal_buffer
+        # Explore-only runs send RL samples, not shaping demos — don't deadlock in shaping.
+        if step < shaping_steps and (len(weak) + len(normal)) > 0:
+            return "shaping"
+        return "rl"
+
+    def _local_bbox_epsilon(self, session_episode: int) -> float:
+        return epsilon_for_episode(session_episode, self.local_bbox_cfg)
+
     def _init_board_locator_modules(self) -> None:
         tr = self.board_locator_cfg.get('training', {})
         lr = float(tr.get('learning_rate', 1e-3))
@@ -1533,6 +1661,8 @@ class GPUInferenceServer:
         q_diag: Optional[Dict] = None,
         near_radius_cells: int = 2,
         yolo_bbox: Optional[Tuple[float, float, float, float]] = None,
+        window_xyxy: Optional[Tuple[int, int, int, int]] = None,
+        local_pick_px: Optional[Tuple[int, int]] = None,
     ) -> None:
         try:
             debug_dir = Path(__file__).resolve().parent.parent / "debug"
@@ -1550,6 +1680,14 @@ class GPUInferenceServer:
             if yolo_bbox is not None:
                 x1, y1, x2, y2 = [int(round(v)) for v in yolo_bbox]
                 cv2.rectangle(vis_bgr, (x1, y1), (x2, y2), (0, 128, 255), 2)
+
+            if window_xyxy is not None:
+                wx1, wy1, wx2, wy2 = [int(v) for v in window_xyxy]
+                cv2.rectangle(vis_bgr, (wx1, wy1), (wx2, wy2), (255, 0, 255), 2)
+
+            if local_pick_px is not None:
+                px, py = int(local_pick_px[0]), int(local_pick_px[1])
+                cv2.drawMarker(vis_bgr, (px, py), (0, 255, 0), cv2.MARKER_TILTED_CROSS, 14, 2)
 
             if meta and meta.get('dqn_outside_bbox') and meta.get('dqn_cell') is not None:
                 dx, dy = self._board_cell_pixel(int(meta['dqn_cell']), h, w, robot_id)
@@ -1928,6 +2066,362 @@ class GPUInferenceServer:
             'confidence': bbox.confidence,
             'timestamp': time.time(),
         }
+
+    def _warp_rgb_depth_pair(self, camera_data: Dict, robot_id: int) -> Tuple[np.ndarray, np.ndarray]:
+        img = self.decode_b64_image(camera_data)
+        rgb = cv2.cvtColor(img['rgb'], cv2.COLOR_BGR2RGB)
+        depth = img['depth']
+        if depth.dtype == np.uint16:
+            depth = depth.astype(np.float32) / 1000.0
+        else:
+            depth = depth.astype(np.float32)
+        rgb_c, depth_c = self._crop_rgb_depth(rgb, depth, robot_id)
+        rgb_w = warp_rgb_to_board(rgb_c, robot_id, out_size=224, cfg=self.board_cfg)
+        depth_w = warp_depth_to_board(depth_c, robot_id, out_size=224, cfg=self.board_cfg)
+        return rgb_w, depth_w
+
+    def _preprocess_local_bbox_crop(
+        self, rgb_crop: np.ndarray, depth_crop: np.ndarray,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        DEPTH_MIN, DEPTH_MAX = 0.50, 1.00
+        depth_w = np.clip(depth_crop.astype(np.float32), DEPTH_MIN, DEPTH_MAX)
+        depth_w = (depth_w - DEPTH_MIN) / (DEPTH_MAX - DEPTH_MIN)
+        rgb_t = torch.from_numpy(rgb_crop.astype(np.float32) / 255.0).permute(2, 0, 1).unsqueeze(0)
+        depth_t = torch.from_numpy(depth_w).unsqueeze(0).unsqueeze(0)
+        mean = torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1)
+        std = torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1)
+        rgb_t = (rgb_t - mean) / std
+        depth_t = (depth_t - 0.5) / 0.5
+        return rgb_t.to(self.device), depth_t.to(self.device)
+
+    def _local_bbox_crop_from_camera(
+        self, camera_data: Dict, robot_id: int, center_x: float, center_z: float,
+    ) -> Tuple[np.ndarray, np.ndarray, Tuple[int, int, int, int], np.ndarray]:
+        rgb_w, depth_w = self._warp_rgb_depth_pair(camera_data, robot_id)
+        rgb_c, depth_c, xyxy = crop_fixed_window(
+            rgb_w, depth_w, center_x, center_z, robot_id,
+            window_m=self._local_bbox_window_m,
+            out_size=self._local_bbox_crop_size,
+            board_cfg=self.board_cfg,
+        )
+        assert depth_c is not None
+        return rgb_c, depth_c, xyxy, rgb_w
+
+    def _predict_local_bbox_pose(self, full_message: Dict, explore: bool = False) -> Dict:
+        """YOLO center → fixed window → local DQN cell → world grasp."""
+        if self.yolo_client is None:
+            return {'type': 'error', 'message': 'YOLO detector not initialized for local-bbox DQN'}
+        robot_id = int(full_message.get('robot_id', 1))
+        is_sim = full_message.get('source', 'real') == 'simulation'
+        camera_data = full_message['data']
+        mod = self.local_bbox_module2 if robot_id == 2 else self.local_bbox_module
+        if mod is None:
+            return {'type': 'error', 'message': 'Local-bbox DQN module not loaded'}
+
+        rgb_w, depth_w = self._warp_rgb_depth_pair(camera_data, robot_id)
+        try:
+            bbox, raw_result = self.yolo_client.detect_bbox(rgb_w)
+        except Exception as exc:
+            return {'type': 'error', 'message': f'YOLO inference failed: {exc}'}
+
+        if bbox is None:
+            try:
+                self._save_board_debug_overlay(
+                    rgb_w, robot_id, cnn_cell=None, teacher_cell=None,
+                    meta={'mode': 'local_bbox_dqn', 'yolo_miss': True},
+                )
+            except Exception:
+                pass
+            return {
+                'type': 'error',
+                'message': 'No valid YOLO bbox for local-bbox DQN',
+                'yolo_raw': raw_result,
+            }
+
+        center_x, center_z = bbox_center_world(
+            bbox, robot_id, warp_size=rgb_w.shape[1], board_cfg=self.board_cfg,
+        )
+        rgb_c, depth_c, win_xyxy = crop_fixed_window(
+            rgb_w, depth_w, center_x, center_z, robot_id,
+            window_m=self._local_bbox_window_m,
+            out_size=self._local_bbox_crop_size,
+            board_cfg=self.board_cfg,
+        )
+        assert depth_c is not None
+        rgb_t, depth_t = self._preprocess_local_bbox_crop(rgb_c, depth_c)
+
+        session_ep = max(1, int(full_message.get('session_episode', 1)))
+        eps = self._local_bbox_epsilon(session_ep) if explore else 0.0
+        with torch.no_grad():
+            cell_t = mod.select_cell(rgb_t, depth_t, epsilon=eps)
+        cell = int(cell_t.cpu().numpy()[0])
+        wx, wz = local_cell_to_world(
+            cell, center_x, center_z,
+            n=self._local_bbox_n, window_m=self._local_bbox_window_m,
+        )
+        grasp_pose = compute_grasp_pose_from_object_world(
+            wx, DEFAULT_OBJECT_Y_M, wz, robot_id, add_jitter=False,
+        )
+
+        teacher_cell = None
+        label_x, label_z = self._board_label_xz(full_message)
+        if is_sim and label_x is not None and label_z is not None:
+            teacher_cell = world_to_local_cell(
+                label_x, label_z, center_x, center_z,
+                n=self._local_bbox_n, window_m=self._local_bbox_window_m,
+            )
+
+        yolo_bbox_px = (bbox.x1, bbox.y1, bbox.x2, bbox.y2)
+        pick_u, pick_v = world_xz_to_warp_pixel(
+            wx, wz, robot_id, out_size=rgb_w.shape[1], cfg=self.board_cfg,
+        )
+        self._save_board_debug_overlay(
+            rgb_w, robot_id,
+            cnn_cell=None,
+            teacher_cell=None,
+            yolo_bbox=yolo_bbox_px,
+            meta={
+                'mode': 'local_bbox_explore' if explore else 'local_bbox_dqn',
+                'label_x': label_x,
+                'label_z': label_z,
+                'yolo_bbox_px': list(yolo_bbox_px),
+                'yolo_conf': bbox.confidence,
+                'window_xyxy': list(win_xyxy),
+                'window_center_x': center_x,
+                'window_center_z': center_z,
+                'local_cell': cell,
+                'teacher_local_cell': teacher_cell,
+                'pick_warp_px': [pick_u, pick_v],
+            },
+            local_pick_px=(pick_u, pick_v),
+            window_xyxy=win_xyxy,
+        )
+
+        mode = 'local_bbox_explore' if explore else 'local_bbox_dqn'
+        return {
+            'type': 'grasp_prediction',
+            'pose': grasp_pose,
+            'mode': mode,
+            'local_cell': cell,
+            'grid_cell': cell,
+            'grid_center_x': center_x,
+            'grid_center_z': center_z,
+            'window_center_x': center_x,
+            'window_center_z': center_z,
+            'target_x_m': wx,
+            'target_z_m': wz,
+            'teacher_cell': teacher_cell,
+            'yolo_conf': bbox.confidence,
+            'yolo_bbox_px': list(yolo_bbox_px),
+            'window_xyxy': list(win_xyxy),
+            'epsilon': eps,
+            'confidence': bbox.confidence,
+            'timestamp': time.time(),
+        }
+
+    def format_local_bbox_shaping_batch(
+        self, batch: List[Dict], robot_id: int,
+    ) -> Dict[str, torch.Tensor]:
+        rgb_list, depth_list, labels = [], [], []
+        for exp in batch:
+            is_sim = exp.get('source', 'real') == 'simulation'
+            cx = float(exp['window_center_x'])
+            cz = float(exp['window_center_z'])
+            rgb_c, depth_c, _, _ = self._local_bbox_crop_from_camera(
+                exp['state'], robot_id, cx, cz,
+            )
+            rgb_t, depth_t = self._preprocess_local_bbox_crop(rgb_c, depth_c)
+            rgb_list.append(rgb_t)
+            depth_list.append(depth_t)
+            labels.append(int(exp['cell_label']))
+        return {
+            'rgb': torch.cat(rgb_list, dim=0),
+            'depth': torch.cat(depth_list, dim=0),
+            'cell_labels': torch.tensor(labels, dtype=torch.long, device=self.device),
+        }
+
+    def format_local_bbox_rl_batch(
+        self, batch: List[Dict], robot_id: int,
+    ) -> Dict[str, torch.Tensor]:
+        rgb_list, depth_list = [], []
+        nrgb_list, ndepth_list = [], []
+        actions, rewards, dones = [], [], []
+        for exp in batch:
+            cx = float(exp['window_center_x'])
+            cz = float(exp['window_center_z'])
+            rgb_c, depth_c, _, _ = self._local_bbox_crop_from_camera(
+                exp['state'], robot_id, cx, cz,
+            )
+            rgb_t, depth_t = self._preprocess_local_bbox_crop(rgb_c, depth_c)
+            next_state = exp.get('next_state', exp['state'])
+            nrgb_c, ndepth_c, _, _ = self._local_bbox_crop_from_camera(
+                next_state, robot_id, cx, cz,
+            )
+            nrgb_t, ndepth_t = self._preprocess_local_bbox_crop(nrgb_c, ndepth_c)
+            rgb_list.append(rgb_t)
+            depth_list.append(depth_t)
+            nrgb_list.append(nrgb_t)
+            ndepth_list.append(ndepth_t)
+            actions.append(int(exp['cell_action']))
+            rewards.append(float(exp.get('reward', 0.0)))
+            dones.append(1.0 if exp.get('done', True) else 0.0)
+        return {
+            'rgb': torch.cat(rgb_list, dim=0),
+            'depth': torch.cat(depth_list, dim=0),
+            'next_rgb': torch.cat(nrgb_list, dim=0),
+            'next_depth': torch.cat(ndepth_list, dim=0),
+            'cell_actions': torch.tensor(actions, dtype=torch.long, device=self.device),
+            'rewards': torch.tensor(rewards, dtype=torch.float32, device=self.device),
+            'dones': torch.tensor(dones, dtype=torch.float32, device=self.device),
+        }
+
+    def _run_local_bbox_training_step(self, robot_id: int, rl: bool = False) -> None:
+        lock = self.train_lock if robot_id == 1 else self.train_lock2
+        if lock.locked():
+            return
+        with lock:
+            try:
+                mod = self.local_bbox_module2 if robot_id == 2 else self.local_bbox_module
+                if mod is None:
+                    return
+                if rl:
+                    replay = self.local_bbox_replay2 if robot_id == 2 else self.local_bbox_replay
+                    if len(replay) < self.batch_size:
+                        return
+                    batch_raw = random.sample(list(replay), self.batch_size)
+                    torch_batch = self.format_local_bbox_rl_batch(batch_raw, robot_id)
+                    metrics = mod.update_dqn(torch_batch)
+                    tgt_every = int(self.local_bbox_cfg.get('training', {}).get('target_update_steps', 100))
+                    if mod._dqn_step % max(1, tgt_every) == 0:
+                        mod.sync_target()
+                    phase = 'rl'
+                else:
+                    weak = self.weak_buffer2 if robot_id == 2 else self.weak_buffer
+                    normal = self.normal_buffer2 if robot_id == 2 else self.normal_buffer
+                    pool = list(weak) + list(normal)
+                    if len(pool) < self.batch_size:
+                        return
+                    batch_raw = random.sample(pool, self.batch_size)
+                    torch_batch = self.format_local_bbox_shaping_batch(batch_raw, robot_id)
+                    metrics = mod.update_shaping(torch_batch)
+                    phase = 'shaping'
+
+                step_attr = 'local_bbox_training_step_count2' if robot_id == 2 else 'local_bbox_training_step_count'
+                step = getattr(self, step_attr) + 1
+                setattr(self, step_attr, step)
+                print(
+                    f"[LOCAL-BBOX TRAIN R{robot_id}] {phase} step {step} "
+                    f"loss={metrics.get('total', 0):.4f}",
+                    flush=True,
+                )
+                if step % max(1, self._checkpoint_every) == 0:
+                    name = self._save_path_r2_local_bbox if robot_id == 2 else self._save_path_r1_local_bbox
+                    path = Path(__file__).resolve().parent.parent / "models" / name
+                    path.parent.mkdir(parents=True, exist_ok=True)
+                    mod.save_model(str(path), training_step=step)
+                    print(f"[LOCAL-BBOX] saved {path.name}", flush=True)
+            except Exception as e:
+                print(f"[LOCAL-BBOX TRAIN R{robot_id}] ERROR: {e}", flush=True)
+                import traceback
+                traceback.print_exc()
+
+    def _handle_local_bbox_training_data(
+        self, training_data: Dict, source: str, robot_id: int,
+    ) -> Dict:
+        try:
+            collect_mode = training_data.get('mode', 'local_bbox_collect')
+            label_x, label_z = self._board_label_xz(training_data)
+            if label_x is None or label_z is None:
+                obj_pos = training_data.get('object_pos', [0.0, 0.0])
+                label_x = float(obj_pos[0]) if len(obj_pos) > 0 else 0.0
+                label_z = float(obj_pos[1]) if len(obj_pos) > 1 else 0.0
+
+            cx = training_data.get('window_center_x', training_data.get('grid_center_x'))
+            cz = training_data.get('window_center_z', training_data.get('grid_center_z'))
+            if cx is None or cz is None:
+                if self.yolo_client is None or not training_data.get('state'):
+                    return {'type': 'error', 'message': 'local-bbox training requires window_center_x/z or YOLO+state'}
+                rgb_w = self._warp_rgb_for_debug(training_data['state'], robot_id)
+                bbox, _ = self.yolo_client.detect_bbox(rgb_w)
+                if bbox is None:
+                    return {'type': 'error', 'message': 'YOLO missed during local-bbox collect'}
+                center_x, center_z = bbox_center_world(
+                    bbox, robot_id, warp_size=rgb_w.shape[1], board_cfg=self.board_cfg,
+                )
+            else:
+                center_x, center_z = float(cx), float(cz)
+
+            ack: Dict = {
+                'type': 'training_ack',
+                'local_bbox': True,
+                'window_center_x': center_x,
+                'window_center_z': center_z,
+                'local_bbox_phase': self._local_bbox_training_phase(robot_id),
+            }
+
+            if collect_mode in ('local_bbox_collect', 'grid_collect'):
+                cell = world_to_local_cell(
+                    label_x, label_z, center_x, center_z,
+                    n=self._local_bbox_n, window_m=self._local_bbox_window_m,
+                )
+                if cell is None:
+                    ack['out_of_window'] = True
+                    ack['skipped'] = True
+                    return ack
+                sample = {
+                    'state': training_data['state'],
+                    'cell_label': cell,
+                    'window_center_x': center_x,
+                    'window_center_z': center_z,
+                    'source': source,
+                    'robot_id': robot_id,
+                }
+                bucket = self._resolve_demo_bucket(training_data, robot_id)
+                sample['demo_bucket'] = bucket
+                target = (self.weak_buffer2 if bucket == 'weak' else self.normal_buffer2) if robot_id == 2 \
+                    else (self.weak_buffer if bucket == 'weak' else self.normal_buffer)
+                if self._local_bbox_training_phase(robot_id) == 'shaping':
+                    target.append(sample)
+                    if self._fine_tune_buffers_ready(robot_id):
+                        threading.Thread(
+                            target=self._run_local_bbox_training_step,
+                            args=(robot_id, False), daemon=True,
+                        ).start()
+                ack.update({'teacher_cell': cell, 'local_cell': cell, 'out_of_window': False})
+                return ack
+
+            if collect_mode in ('local_bbox_rl', 'grid_rl'):
+                cell_action = int(training_data.get('cell_action', training_data.get('local_cell', 0)))
+                sample = {
+                    'state': training_data['state'],
+                    'next_state': training_data.get('next_state', training_data['state']),
+                    'cell_action': cell_action,
+                    'reward': float(training_data.get('reward', 0.0)),
+                    'done': bool(training_data.get('done', True)),
+                    'window_center_x': center_x,
+                    'window_center_z': center_z,
+                    'source': source,
+                    'robot_id': robot_id,
+                }
+                replay = self.local_bbox_replay2 if robot_id == 2 else self.local_bbox_replay
+                replay.append(sample)
+                replay_min = int(self.local_bbox_cfg.get('training', {}).get('replay_min', 200))
+                if self._local_bbox_training_phase(robot_id) == 'rl' and len(replay) >= replay_min:
+                    threading.Thread(
+                        target=self._run_local_bbox_training_step,
+                        args=(robot_id, True), daemon=True,
+                    ).start()
+                ack.update({
+                    'local_cell': cell_action,
+                    'replay_len': len(replay),
+                    'replay_used': True,
+                    'reward': sample['reward'],
+                })
+                return ack
+
+            return {'type': 'error', 'message': f'Unknown local-bbox collect mode: {collect_mode}'}
+        except Exception as e:
+            return {'type': 'error', 'message': str(e)}
 
     def format_board_shaping_batch(self, batch: List[Dict], robot_id: int) -> Dict[str, torch.Tensor]:
         rgb_list, depth_list, q_target_list = [], [], []
@@ -2649,6 +3143,12 @@ class GPUInferenceServer:
             if client_mode == 'board_dqn_train':
                 return self._predict_board_pose(full_message, explore=True)
 
+            if client_mode == 'local_bbox_dqn_train':
+                return self._predict_local_bbox_pose(full_message, explore=True)
+
+            if self.local_bbox_dqn or bool(full_message.get('use_local_bbox_dqn', False)):
+                return self._predict_local_bbox_pose(full_message, explore=False)
+
             if self.yolo_locator_test or bool(full_message.get('use_yolo_locator_test', False)):
                 return self._predict_yolo_bbox_random_pose(full_message)
 
@@ -2729,6 +3229,9 @@ class GPUInferenceServer:
 
             if self.grid_train:
                 return self._handle_grid_training_data(training_data, source, robot_id)
+
+            if self.local_bbox_dqn_train:
+                return self._handle_local_bbox_training_data(training_data, source, robot_id)
 
             if self.board_dqn_train:
                 return self._handle_board_training_data(training_data, source, robot_id)
@@ -3096,18 +3599,22 @@ class GPUInferenceServer:
         self.server_socket.bind((host, port))
         self.server_socket.listen(5)
         mode_label = "YOLO locator test" if self.yolo_locator_test else (
-            "board locator train" if self.board_locator_train else (
-                "board DQN train" if self.board_dqn_train else (
-                    "board DQN" if self.board_dqn else (
-                        "residual RL" if self.rl_train else (
-                            "grid train" if self.grid_train else (
-                                "locator train" if self.locator_train else (
-                                    "targeted fine-tune" if self.fine_tune else "behavior cloning"
+            "local-bbox DQN train" if self.local_bbox_dqn_train else (
+                "local-bbox DQN" if self.local_bbox_dqn else (
+                "board locator train" if self.board_locator_train else (
+                    "board DQN train" if self.board_dqn_train else (
+                        "board DQN" if self.board_dqn else (
+                            "residual RL" if self.rl_train else (
+                                "grid train" if self.grid_train else (
+                                    "locator train" if self.locator_train else (
+                                        "targeted fine-tune" if self.fine_tune else "behavior cloning"
+                                    )
                                 )
                             )
                         )
                     )
                 )
+            )
             )
         )
         print(f"GPU Server listening on {host}:{port} ({mode_label} mode)")
@@ -3234,6 +3741,16 @@ if __name__ == "__main__":
                         help='Path to yolo_locator_config.yaml')
     parser.add_argument('--yolo-fuse', action='store_true',
                         help='With --board-dqn: YOLO bbox → best Q cell inside (fallback plain DQN)')
+    parser.add_argument('--local-bbox-dqn', action='store_true',
+                        help='Inference: YOLO center → fixed window → local DQN grasp')
+    parser.add_argument('--local-bbox-dqn-train', action='store_true',
+                        help='Train local-bbox DQN (shaping + RL) with YOLO-centered window')
+    parser.add_argument('--local-bbox-dqn-config', type=str, default=None,
+                        help='Path to local_bbox_dqn_config.yaml')
+    parser.add_argument('--local-bbox-model', type=str, default=None,
+                        help='Local-bbox DQN checkpoint for R1')
+    parser.add_argument('--local-bbox-model-r2', type=str, default=None,
+                        help='Local-bbox DQN checkpoint for R2')
     parser.add_argument('--rl-train', action='store_true',
                         help='TD3 residual RL fine-tune (BC frozen; separate RL checkpoints)')
     parser.add_argument('--rl-train-config', type=str, default=None,
@@ -3308,6 +3825,18 @@ if __name__ == "__main__":
         parser.error('Use either --yolo-locator-test or --geo-grasp, not both.')
     if args.yolo_locator_test and args.local_grid:
         parser.error('Use either --yolo-locator-test or --local-grid, not both.')
+    if args.local_bbox_dqn_train and args.local_bbox_dqn:
+        parser.error('Use --local-bbox-dqn-train for training; --local-bbox-dqn is inference only.')
+    if args.local_bbox_dqn and args.board_dqn:
+        parser.error('Use either --local-bbox-dqn or --board-dqn, not both.')
+    if args.local_bbox_dqn and args.yolo_locator_test:
+        parser.error('Use either --local-bbox-dqn or --yolo-locator-test, not both.')
+    if args.local_bbox_dqn and args.local_grid:
+        parser.error('Use either --local-bbox-dqn or --local-grid, not both.')
+    if args.local_bbox_dqn_train and args.board_dqn_train:
+        parser.error('Use either --local-bbox-dqn-train or --board-dqn-train, not both.')
+    if args.local_bbox_dqn_train and args.grid_train:
+        parser.error('Use either --local-bbox-dqn-train or --grid-train, not both.')
 
     server = GPUInferenceServer(
         model_path=args.model,
@@ -3335,6 +3864,11 @@ if __name__ == "__main__":
         yolo_locator_test=args.yolo_locator_test,
         yolo_locator_config_path=args.yolo_locator_config,
         yolo_fuse=args.yolo_fuse,
+        local_bbox_dqn=args.local_bbox_dqn,
+        local_bbox_dqn_train=args.local_bbox_dqn_train,
+        local_bbox_dqn_config_path=args.local_bbox_dqn_config,
+        local_bbox_model_path=args.local_bbox_model,
+        local_bbox_model_path_r2=args.local_bbox_model_r2,
         rl_train=args.rl_train,
         rl_train_config_path=args.rl_train_config,
         rl_residual_r1=args.rl_residual_r1,

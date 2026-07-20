@@ -1,7 +1,8 @@
-﻿"""Local table grid for hybrid locator + cell-picker grasp (world XZ meters)."""
+"""Local table grid for hybrid locator + cell-picker grasp (world XZ meters)."""
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
@@ -66,6 +67,40 @@ def cell_to_world(
     x = float(center_x) - half + (col + 0.5) * cell_size
     z = float(center_z) + half - (row + 0.5) * cell_size
     return x, z
+
+
+def calculate_local_bbox_center_reward(
+    pick_x: float,
+    pick_z: float,
+    true_x: float,
+    true_z: float,
+    reward_cfg: Optional[Dict[str, Any]] = None,
+    *,
+    cell_action: Optional[int] = None,
+    teacher_cell: Optional[int] = None,
+) -> float:
+    """Center-focused reward: pick world XZ vs sim GT block center (not lift)."""
+    cfg = reward_cfg or {}
+    dist = math.hypot(float(pick_x) - float(true_x), float(pick_z) - float(true_z))
+    success_m = float(cfg.get("center_success_m", 0.002))
+    fail_m = float(cfg.get("center_fail_m", 0.010))
+    if fail_m <= success_m:
+        fail_m = success_m + 1e-6
+    if dist <= success_m:
+        r = 1.0
+    elif dist >= fail_m:
+        r = 0.0
+    else:
+        r = 1.0 - (dist - success_m) / (fail_m - success_m)
+    teacher_bonus = float(cfg.get("teacher_cell_bonus", 0.0))
+    if (
+        cell_action is not None
+        and teacher_cell is not None
+        and int(cell_action) == int(teacher_cell)
+        and teacher_bonus > 0
+    ):
+        r = min(1.0, r + teacher_bonus)
+    return float(r)
 
 
 def calculate_grid_reward(

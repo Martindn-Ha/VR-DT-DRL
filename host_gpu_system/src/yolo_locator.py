@@ -5,7 +5,7 @@ from __future__ import annotations
 import random
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Tuple, Union
+from typing import Any, Dict, List, Optional, Protocol, Tuple, Union
 
 import cv2
 import numpy as np
@@ -28,6 +28,13 @@ class BBox:
 
     def contains(self, x: float, y: float) -> bool:
         return self.x1 <= x <= self.x2 and self.y1 <= y <= self.y2
+
+
+class BlockBBoxDetector(Protocol):
+    """Detect a block bbox on a warped RGB board image."""
+
+    def detect_bbox(self, rgb_w: np.ndarray) -> Tuple[Optional[BBox], Any]:
+        ...
 
 
 def default_yolo_locator_config_path() -> Path:

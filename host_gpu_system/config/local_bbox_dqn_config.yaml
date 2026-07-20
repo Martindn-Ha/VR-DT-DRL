@@ -1,0 +1,43 @@
+# YOLO center → fixed world window → local DQN (20×20 ≈ 1 mm on 2 cm window)
+
+grid:
+  n: 20
+  window_m: 0.02
+
+crop:
+  out_size: 224
+
+training:
+  phase: rl
+  shaping_steps: 500
+  learning_rate: 1.0e-3
+  encoder_lr_factor: 0.1
+  weight_decay: 8.0e-5
+  batch_size: 8
+  checkpoint_every_steps: 100
+  epsilon_start: 0.3
+  epsilon_end: 0.05
+  epsilon_decay_episodes: 500
+  gamma: 0.99
+  replay_min: 32
+  replay_capacity: 5000
+  target_update_steps: 100
+
+reward:
+  # Primary signal: pick world XZ vs sim GT spawn center (not lift).
+  center_success_m: 0.002
+  center_fail_m: 0.010
+  teacher_cell_bonus: 0.0
+
+checkpoints:
+  save_r1: models/R1_local_bbox_dqn.pth
+  save_r2: models/R2_local_bbox_dqn.pth
+
+# YOLO weights / thresholds (same schema as yolo_locator_config.yaml)
+yolo:
+  weights: "host_gpu_system/models/block_yolo/weights/best.pt"
+  conf: 0.25
+  imgsz: 224
+  min_confidence: 0.10
+  warp_size: 224
+  class_name: null
