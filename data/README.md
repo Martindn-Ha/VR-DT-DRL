@@ -2,6 +2,8 @@
 
 Put `.xlsx` logs in `episode logs/`. PDFs go to `episode report/`.
 
+**Residual RL training history** (archived `TD3 (pre-dist)/`, `RL logs (pre align v2)/`, etc.): see [`docs/rl_residual_training_chronicle.md`](../docs/rl_residual_training_chronicle.md).
+
 Each row is one grasp episode, logged by `vm_simulation_system/src/simulation_client.py`. Spawn and grasp positions use Webots world coordinates (meters). For a longer analysis-oriented dictionary, see [`docs/simulation_episode_data_dictionary.md`](../docs/simulation_episode_data_dictionary.md).
 
 ## Log parameters
@@ -11,7 +13,8 @@ Each row is one grasp episode, logged by `vm_simulation_system/src/simulation_cl
 | `timestamp` | string | — | UTC wall time when the episode row was written (ISO 8601). |
 | `timestamp_local` | datetime | — | Excel-only: local time derived from `timestamp` (column B). |
 | `robot_id` | int | — | UR3 instance that ran the episode (`1` or `2`). |
-| `episode` | int | — | Monotonic episode counter for that robot client. |
+| `episode` | int | — | Monotonic episode counter for that robot client (persists across restarts). |
+| `session_episode` | int | — | Episode index for this client run only; resets to 1 on each launch. |
 | `run_mode` | string | — | Client mode, e.g. `inference` or training-related modes. |
 | `inference_mode` | string | — | When `run_mode=inference`: `normal`, `phase`, `cycle`, or `free`. Empty otherwise. |
 | `curriculum_phase` | int | — | Active curriculum phase index (controls spawn difficulty / radius). |
@@ -61,3 +64,18 @@ python analysis/spawn_spatial_report.py "data/episode logs/your_log.xlsx" --taxo
 ```
 
 Optional: If you have multiple phases in one spreadsheet, add `--spawn-phase #` flag to filter to one curriculum phase. (i.e '--spawn-phase 4' to view only phase 4 in a spreadsheet with multiple phases)
+
+## Locator training (`run_mode=locator_train`)
+
+Uses a **separate** episode schema (coordinate training, not grasp). Files:
+
+| File | Description |
+|------|-------------|
+| `data/episode_log_r1_locator_train.xlsx` | Per-demo: spawn, labels, CNN prediction error |
+| `data/locator_train_steps_r1.csv` | Per GPU step: `aux_loss`, buffers (written by `--locator-train` server) |
+
+```powershell
+python analysis/locator_train_report.py data/episode_log_r1_locator_train.xlsx
+```
+
+See [`docs/locator_geo_grasp.md`](../docs/locator_geo_grasp.md) for column definitions. Do **not** run grasp failure taxonomy on locator train logs.

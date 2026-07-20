@@ -165,6 +165,12 @@ def default_fine_tune_config_path() -> Path:
     return repo_root / "host_gpu_system" / "config" / "fine_tune_config.yaml"
 
 
+def default_locator_train_config_path() -> Path:
+    """Resolve locator_train_config.yaml from repo root."""
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    return repo_root / "host_gpu_system" / "config" / "locator_train_config.yaml"
+
+
 def load_fine_tune_config(path: Optional[Union[str, Path]] = None) -> Dict[str, Any]:
     cfg_path = Path(path) if path else default_fine_tune_config_path()
     with open(cfg_path, 'r', encoding='utf-8') as f:
@@ -187,6 +193,24 @@ def load_fine_tune_config(path: Optional[Union[str, Path]] = None) -> Dict[str, 
 
     cfg['_weak_regions_parsed'] = weak_regions
     return cfg
+
+
+def load_locator_train_config(path: Optional[Union[str, Path]] = None) -> Dict[str, Any]:
+    """Load locator_train_config.yaml (same schema as fine_tune_config)."""
+    cfg_path = Path(path) if path else default_locator_train_config_path()
+    return load_fine_tune_config(cfg_path)
+
+
+def default_board_locator_train_config_path() -> Path:
+    """Resolve board_locator_train_config.yaml from repo root."""
+    repo_root = Path(__file__).resolve().parent.parent.parent
+    return repo_root / "host_gpu_system" / "config" / "board_locator_train_config.yaml"
+
+
+def load_board_locator_train_config(path: Optional[Union[str, Path]] = None) -> Dict[str, Any]:
+    """Load board_locator_train_config.yaml (same schema as fine_tune_config)."""
+    cfg_path = Path(path) if path else default_board_locator_train_config_path()
+    return load_fine_tune_config(cfg_path)
 
 
 def pick_random_weak_cell(robot_id: int,

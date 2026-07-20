@@ -2,7 +2,8 @@
 
 from typing import Any, Mapping, Optional, Sequence, Union
 
-REQUIRED_LIFT = 0.023
+REQUIRED_LIFT = 0.023  # legacy analysis threshold; sim success uses pickup-hold, not lift height
+MIN_PICKUP_LIFT = 0.001
 FAR_MISS_DIST = 0.20
 NEAR_MISS_DIST = 0.10
 DROP_LIFT = 0.0  # drop_or_push when lifted_m < 0
@@ -14,6 +15,7 @@ OUTCOME_CLASSES = (
     'success',
     'sim_nan_abort',
     'object_not_found',
+    'yolo_detection_failed',
     'far_miss',
     'weak_lift',
     'drop_or_push',
@@ -68,8 +70,8 @@ def classify_outcome(
         return 'far_miss'
 
     lift = _as_float(lifted_m)
-    if lift is not None and 0.0 < lift <= REQUIRED_LIFT:
-        return 'weak_lift'
+    if lift is not None and lift > MIN_PICKUP_LIFT:
+        return 'drop_or_push'
 
     if lift is not None and lift < DROP_LIFT:
         return 'drop_or_push'

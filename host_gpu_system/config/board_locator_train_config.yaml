@@ -1,0 +1,50 @@
+sampling:
+  weak_ratio: 0.7
+  normal_ratio: 0.3
+
+training:
+  learning_rate: 1.0e-3
+  weight_decay: 8.0e-5
+  encoder_lr_factor: 0.1
+  batch_size: 8
+  checkpoint_every_steps: 100
+
+block:
+  width_m: 0.013
+  depth_m: 0.033
+
+fusion:
+  enabled: true
+  mode: snap
+  radius_cells: 3
+  min_mask_confidence: 0.15
+
+debug:
+  save_every_steps: 50
+
+checkpoints:
+  save_r1: models/R1_board_locator.pth
+  save_r2: models/R2_board_locator.pth
+  init_from_board_dqn_r1: models/R1_board_dqn.pth
+  init_from_board_dqn_r2: models/R2_board_dqn.pth
+
+collection:
+  weak_spawn_probability: 0.7
+
+weak_regions:
+  1:
+    - {phase: 3, quadrant: 1}
+    - {phase: 3, quadrant: 2}
+    - {phase: 3, quadrant: 3}
+    - {phase: 4, quadrant: 1}
+    - {phase: 4, quadrant: 2}
+    - {phase: 4, quadrant: 3}
+    - {phase: 4, quadrant: 4}
+  2:
+    - {phase: 3, quadrant: 2}
+    - {phase: 3, quadrant: 3}
+    - {phase: 3, quadrant: 4}
+    - {phase: 4, quadrant: 1}
+    - {phase: 4, quadrant: 2}
+    - {phase: 4, quadrant: 3}
+    - {phase: 4, quadrant: 4}

@@ -1,0 +1,60 @@
+﻿grid:
+  n: 5
+  window_m: 0.04
+
+sampling:
+  weak_ratio: 0.7
+  normal_ratio: 0.3
+
+training:
+  phase: both
+  shaping_steps: 700
+  learning_rate: 1.0e-4
+  batch_size: 16
+  checkpoint_every_steps: 100
+  epsilon_start: 0.3
+  epsilon_end: 0.05
+  epsilon_decay_episodes: 500
+  gamma: 0.99
+  replay_min: 500
+  replay_capacity: 10000
+  # DQN replay skipped only when true spawn center is outside the 4cm grid window.
+  target_update_steps: 100
+  freeze_backbone: true
+
+reward:
+  lift_success_mm: 23
+  lift_bonus: 1.0
+  miss_penalty: 0.0
+  # Partial credit uses horizontal XZ closest distance; taxonomy unchanged for logs.
+  distance_scale: 0.5          # max partial in near band (0 cm)
+  mid_miss_scale: 0.25         # fraction of distance_scale at mid band inner edge (10 cm)
+  contact_partial_scale: 0.3   # knock/push gets this fraction of distance partial
+  teacher_cell_bonus: 0.1      # hindsight bonus when picked cell matches spawn cell
+
+checkpoints:
+  locator_r1: models/R1_locator.pth
+  locator_r2: models/R2_locator.pth
+  save_r1: models/R1_local_grid.pth
+  save_r2: models/R2_local_grid.pth
+
+collection:
+  weak_spawn_probability: 0.7
+
+weak_regions:
+  1:
+    - {phase: 3, quadrant: 1}
+    - {phase: 3, quadrant: 2}
+    - {phase: 3, quadrant: 3}
+    - {phase: 4, quadrant: 1}
+    - {phase: 4, quadrant: 2}
+    - {phase: 4, quadrant: 3}
+    - {phase: 4, quadrant: 4}
+  2:
+    - {phase: 3, quadrant: 2}
+    - {phase: 3, quadrant: 3}
+    - {phase: 3, quadrant: 4}
+    - {phase: 4, quadrant: 1}
+    - {phase: 4, quadrant: 2}
+    - {phase: 4, quadrant: 3}
+    - {phase: 4, quadrant: 4}

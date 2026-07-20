@@ -1,0 +1,41 @@
+#VRML_SIM R2021a utf8
+# Visual overlay: R1 spawn / board-DQN grid bounds (not the full Platform slab).
+# Matches board_dqn_config.yaml platform.1 and CurriculumManager half-sizes.
+# Set overlayScale 1 1 1 in Webots when calibrating warp (scale 0 hides — no visible field in R2021a).
+
+PROTO SpawnAreaR1 [
+  field SFVec3f    translation  -0.646 0.446 0.841
+  field SFRotation rotation     0 1 0 0
+  field SFString   name         "spawn_area_r1"
+  field SFColor    color        1 0.25 0.1
+  field SFVec3f    size         0.28735 0.001 0.16735
+  field SFVec3f    overlayScale 0 0 0
+]
+{
+  Solid {
+    translation IS translation
+    rotation IS rotation
+    name IS name
+
+    children [
+      Transform {
+        scale IS overlayScale
+        children [
+          Shape {
+            appearance PBRAppearance {
+              baseColor IS color
+              transparency 0.55
+              roughness 0.4
+              metalness 0.0
+            }
+            geometry Box {
+              size IS size
+            }
+            castShadows FALSE
+            isPickable FALSE
+          }
+        ]
+      }
+    ]
+  }
+}

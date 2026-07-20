@@ -1,0 +1,57 @@
+grid:
+  n: 112
+  grasp_reward: 1.0
+  reward_dist_m: 0.02
+
+platform:
+  1:
+    x_min: -0.789675
+    x_max: -0.502325
+    z_min: 0.757325
+    z_max: 0.924675
+  2:
+    x_min: -1.505
+    x_max: -1.225
+    z_min: 0.765
+    z_max: 0.935
+
+sampling:
+  weak_ratio: 0.7
+  normal_ratio: 0.3
+
+training:
+  shaping_episodes: 250
+  accuracy_log_every: 10
+  learning_rate: 1.0e-3
+  weight_decay: 8.0e-4
+  encoder_lr_factor: 0.1
+  batch_size: 10
+  checkpoint_every_steps: 100
+  epsilon_start: 0.9
+  epsilon_end: 0.05
+  epsilon_decay: 200
+
+checkpoints:
+  save_r1: models/R1_board_dqn.pth
+  save_r2: models/R2_board_dqn.pth
+
+collection:
+  weak_spawn_probability: 0.7
+
+weak_regions:
+  1:
+    - {phase: 3, quadrant: 1}
+    - {phase: 3, quadrant: 2}
+    - {phase: 3, quadrant: 3}
+    - {phase: 4, quadrant: 1}
+    - {phase: 4, quadrant: 2}
+    - {phase: 4, quadrant: 3}
+    - {phase: 4, quadrant: 4}
+  2:
+    - {phase: 3, quadrant: 2}
+    - {phase: 3, quadrant: 3}
+    - {phase: 3, quadrant: 4}
+    - {phase: 4, quadrant: 1}
+    - {phase: 4, quadrant: 2}
+    - {phase: 4, quadrant: 3}
+    - {phase: 4, quadrant: 4}

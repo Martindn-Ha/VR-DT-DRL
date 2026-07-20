@@ -48,6 +48,8 @@ except ImportError:
 
 ROBOT1_DEF_CANDIDATES = ("ur3e_robot", "UR3", "ur3_robot")
 ROBOT2_DEF_CANDIDATES = ("ur3e_robot2", "ur3_robot2")
+GRIPPER1_DEF_CANDIDATES = ("GRIPPER_MAIN",)
+GRIPPER2_DEF_CANDIDATES = ("GRIPPER_MAIN2", "GRIPPER_MAIN")
 
 
 def resolve_webots_robot_node(supervisor, robot_id: int):
@@ -63,6 +65,125 @@ def resolve_webots_robot_node(supervisor, robot_id: int):
         except Exception:
             continue
     return None
+
+
+def resolve_webots_gripper_node(supervisor, robot_id: int):
+    """Return the Webots gripper node for robot_id using world-file DEF fallbacks."""
+    if supervisor is None:
+        return None
+    candidates = GRIPPER2_DEF_CANDIDATES if robot_id == 2 else GRIPPER1_DEF_CANDIDATES
+    for def_name in candidates:
+        try:
+            node = supervisor.getFromDef(def_name)
+            if node is not None:
+                return node
+        except Exception:
+            continue
+    return None
+
+
+def measure_gripper_object_distance(supervisor, robot_id: int) -> float:
+    """Minimum 3D distance (m) between the robot gripper DEF and its target object."""
+    import numpy as _np
+
+    if supervisor is None:
+        return 9999.0
+    target_def = "TARGET_OBJECT" if robot_id == 1 else "TARGET_OBJECT2"
+    o_node = supervisor.getFromDef(target_def)
+    g_node = resolve_webots_gripper_node(supervisor, robot_id)
+    if o_node is None or g_node is None:
+        if g_node is None:
+            print(f"[GRASP R{robot_id}] Gripper DEF not found — closest_dist sentinel")
+        return 9999.0
+    o_pos = _np.array(o_node.getPosition())
+    g_pos = _np.array(g_node.getPosition())
+    return float(_np.linalg.norm(o_pos - g_pos))
+
+
+def measure_gripper_object_distance_xz(supervisor, robot_id: int) -> float:
+    """Horizontal (table X-Z) distance (m) between gripper DEF and target object center."""
+    import numpy as _np
+
+    if supervisor is None:
+        return 9999.0
+    target_def = "TARGET_OBJECT" if robot_id == 1 else "TARGET_OBJECT2"
+    o_node = supervisor.getFromDef(target_def)
+    g_node = resolve_webots_gripper_node(supervisor, robot_id)
+    if o_node is None or g_node is None:
+        return 9999.0
+    o_pos = _np.array(o_node.getPosition())
+    g_pos = _np.array(g_node.getPosition())
+    return float(_np.hypot(o_pos[0] - g_pos[0], o_pos[2] - g_pos[2]))
+
+
+def _resolve_webots_supervisor(webots_bridge) -> Optional[Any]:
+    if webots_bridge is None:
+        return None
+    sup = getattr(webots_bridge, 'supervisor', None)
+    if sup is not None and hasattr(sup, 'supervisor'):
+        sup = sup.supervisor
+    return sup
+
+
+# Max gripper–object separation while counted as "held" after retreat (height not scored).
+HELD_GRIPPER_DIST_M = 0.085
+# Tiny table clearance — any lift counts; magnitude is not used for success.
+MIN_PICKUP_LIFT_M = 0.001
+PICKUP_HOLD_DURATION_S = 0.6
+
+
+def evaluate_grasp_pickup_success(
+    webots_bridge,
+    robot_id: int,
+    object_node,
+    initial_y: float,
+) -> Tuple[bool, Optional[float]]:
+    """
+    Success when the block leaves the table and stays near the gripper through a short hold.
+    Lift height is logged but not thresholded.
+    """
+    if object_node is None:
+        return False, None
+
+    sup = _resolve_webots_supervisor(webots_bridge)
+    table_y = float(initial_y) + MIN_PICKUP_LIFT_M
+    held = True
+
+    if sup is not None and webots_bridge is not None:
+        n_checks = max(1, int(PICKUP_HOLD_DURATION_S * 80))
+        for _ in range(n_checks):
+            webots_bridge.step()
+            dist = measure_gripper_object_distance(sup, robot_id)
+            y = float(object_node.getPosition()[1])
+            if dist > HELD_GRIPPER_DIST_M or y <= table_y:
+                held = False
+                break
+
+    final_y = float(object_node.getPosition()[1])
+    lift_delta = final_y - float(initial_y)
+    if math.isnan(lift_delta):
+        return False, None
+    success = held and lift_delta > MIN_PICKUP_LIFT_M
+    return success, lift_delta
+
+
+def measure_lateral_aim_error(
+    supervisor,
+    robot_id: int,
+    aim_x: float,
+    aim_z: float,
+) -> float:
+    """Horizontal (world X-Z) distance from an aim point to the target block center."""
+    if supervisor is None:
+        return 9999.0
+    target_def = "TARGET_OBJECT" if robot_id == 1 else "TARGET_OBJECT2"
+    o_node = supervisor.getFromDef(target_def)
+    if o_node is None:
+        return 9999.0
+    o_pos = o_node.getPosition()
+    dx = float(o_pos[0]) - float(aim_x)
+    dz = float(o_pos[2]) - float(aim_z)
+    return float(sqrt(dx * dx + dz * dz))
 
 class UR3KinematicsController:
     """
@@ -165,6 +286,12 @@ class UR3KinematicsController:
                 self.webots_bridge.step()
         else:
             time.sleep(duration)
+
+    def evaluate_pickup_success(self, object_node, initial_y: float) -> Tuple[bool, Optional[float]]:
+        """True if block is picked up and remains held (not height-based)."""
+        return evaluate_grasp_pickup_success(
+            self.webots_bridge, self.robot_id, object_node, initial_y,
+        )
 
     def _axis_angle_to_rotation(self, axis: np.ndarray, angle: float) -> np.ndarray:
         """Converts an axis-angle representation into a 3x3 rotation matrix."""
@@ -575,6 +702,14 @@ class UR3KinematicsController:
 
         # Phase 3: Vertical Descent
         N_STEPS = 15
+        closest = 9999.0
+        closest_xz = 9999.0
+        sup = None
+        if self.webots_bridge and hasattr(self.webots_bridge, 'supervisor'):
+            sup = self.webots_bridge.supervisor
+            if hasattr(sup, 'supervisor'):
+                sup = sup.supervisor
+
         for i in range(1, N_STEPS + 1):
             t = i / float(N_STEPS)
             interp_z = hover_z + t * (grasp_z - hover_z)
@@ -585,28 +720,29 @@ class UR3KinematicsController:
             j = list(j)
             j[5] = wrist_compensated
             self.move_to_joint_positions(j, duration=0.05, wait=True)
+            if sup is not None:
+                step_dist = measure_gripper_object_distance(sup, self.robot_id)
+                if step_dist < closest:
+                    closest = step_dist
+                step_dist_xz = measure_gripper_object_distance_xz(sup, self.robot_id)
+                if step_dist_xz < closest_xz:
+                    closest_xz = step_dist_xz
         self._wait_step(0.2)
 
-        # Phase 4: Proximity Check
+        # Phase 4: Proximity Check (final snapshot; keep minimum from descent)
         try:
-            closest = 9999.0
-            if self.webots_bridge and hasattr(self.webots_bridge, 'supervisor'):
-                sup = self.webots_bridge.supervisor
-                if hasattr(sup, 'supervisor'):
-                    sup = sup.supervisor
-                target_def = "TARGET_OBJECT" if self.robot_id == 1 else "TARGET_OBJECT2"
-                o_node = sup.getFromDef(target_def)
-                g_node = sup.getFromDef("GRIPPER_MAIN")
-                if g_node is None: g_node = sup.getFromDef("UR3e")
-                if g_node is None: g_node = sup.getFromDef("UR3")
-                if o_node and g_node:
-                    import numpy as _np
-                    o_pos = _np.array(o_node.getPosition())
-                    g_pos = _np.array(g_node.getPosition())
-                    closest = float(_np.linalg.norm(o_pos - g_pos))
+            if sup is not None:
+                final_dist = measure_gripper_object_distance(sup, self.robot_id)
+                if final_dist < closest:
+                    closest = final_dist
+                final_dist_xz = measure_gripper_object_distance_xz(sup, self.robot_id)
+                if final_dist_xz < closest_xz:
+                    closest_xz = final_dist_xz
             self._closest_approach_dist = closest
+            self._closest_approach_dist_xz = closest_xz
         except Exception:
             self._closest_approach_dist = 9999.0
+            self._closest_approach_dist_xz = 9999.0
 
         # Phase 5: Actuate Gripper
         if self.gripper:

@@ -127,15 +127,17 @@ Grasp **training** progresses through six spawn phases (0–5). Each phase place
 | **1** | 0.5–1.5 cm radius |
 | **2** | 1.5–3.5 cm radius |
 | **3** | 3.5–7.0 cm radius |
-| **4** | 7.0–11.5 cm radius band |
+| **4** | 7.0–11.5 cm outer ring |
 | **5** | Anywhere on usable platform (uniform) |
 
-**Inference** (`--mode inference`) does not advance the curriculum. Pick how spawns behave:
+Training and inference use the same spawn rules for each phase number. **`--phase N`** locks inference to that phase; with no flag, spawns follow the saved phase in `config/curriculum_state.json`.
+
+**Inference** (`--mode inference`) does not advance phases. Pick how spawns behave:
 
 | Flag | Behavior |
 |------|----------|
-| `--phase N` | Lock spawns to phase **0–5** (e.g. **`--phase 4`** for the outer ring) |
-| *(no extra flag)* | Use saved curriculum state from `config/curriculum_state.json` |
+| `--phase N` | Lock spawns to phase **0–5** (same regions as the table above) |
+| *(no extra flag)* | Use saved phase from `config/curriculum_state.json` |
 | `--cycle N` | Rotate through phases (default **0→5**); add **`--cycle-from`** / **`--cycle-to`** to limit the range |
 | `--cycle-from N` / `--cycle-to M` | With **`--cycle`**, only rotate phases **N…M** (e.g. **1–4**) |
 | `--free` | No auto-spawn; place the block manually in Webots |
@@ -270,6 +272,156 @@ Outputs PDF under `data/episode report/`. See `data/README.md` for more options.
 
 ---
 
+## Locator + geometry grasp (Phase 1)
+
+Opt-in pipeline: train CNN **`aux_position`** on sim object `(X,Z)` labels, then at inference convert predicted position through shared teacher geometry into a grasp pose. BC `pose_6dof`, fine-tune, and residual RL paths are unchanged unless you pass the flags below.
+
+Config: [`host_gpu_system/config/locator_train_config.yaml`](host_gpu_system/config/locator_train_config.yaml)
+
+| Setting | Default | Purpose |
+|---------|---------|---------|
+| `sampling.weak_ratio` | `0.7` | Training batch mix (weak vs normal buffer) |
+| `training.learning_rate` | `1e-4` | Locator-only aux loss |
+| `collection.weak_spawn_probability` | `0.7` | Episode spawn mix (same weak regions as fine-tune) |
+| `checkpoints.save_r1` / `save_r2` | `R1_locator.pth` / `R2_locator.pth` | Per-arm locator checkpoints |
+
+More detail: [`docs/locator_geo_grasp.md`](docs/locator_geo_grasp.md)
+
+### Terminal 1 — GPU server (locator training)
+
+```powershell
+cd host_gpu_system
+.\venv\Scripts\Activate.ps1
+python src\gpu_server.py --locator-train
+```
+
+On first run, loads base weights from `models/ur3_live_model_r1.pth` / `ur3_live_model_r2.pth`. Restarts resume from `models/R1_locator.pth` / `R2_locator.pth` when present.
+
+**Collection:** spawn → camera snapshot → GPU demo (no arm pick). Labels = spawn X/Z. Look for `[LOCATOR-COLLECT R1]` and `grasp=locator_collect` in client logs; GPU shows `LOC Step` / `Aux:` loss. Restart train after updating collection code (do not mix old buffer labels).
+
+### Terminal 2 — Robot 1 locator client
+
+```powershell
+cd vm_simulation_system
+python src\simulation_client.py --mode locator_train --robot-id 1
+```
+
+Episode logs: `data/episode_log_r1_locator_train.xlsx` (labels + per-demo CNN error). GPU step log: `data/locator_train_steps_r1.csv` (aux loss curve). Report: `python analysis/locator_train_report.py data/episode_log_r1_locator_train.xlsx`
+
+### Evaluate geo-grasp (phase 4 baseline)
+
+1. Start GPU server with locator weights and geo-grasp routing:
+
+```powershell
+python host_gpu_system\src\gpu_server.py --geo-grasp
+```
+
+Weights load from `host_gpu_system\models\R1_locator.pth` and `R2_locator.pth` by default. Override with `--model models\R1_locator.pth --model-r2 models\R2_locator.pth` (paths relative to `host_gpu_system\`, not `host_gpu_system\host_gpu_system\`).
+
+2. Run locked-phase inference:
+
+```powershell
+python vm_simulation_system\src\simulation_client.py --mode inference --use-geo-grasp --phase 4 --robot-id 1
+```
+
+Diagnostic (no workspace clip, like teacher explore):
+
+```powershell
+python vm_simulation_system\src\simulation_client.py --mode inference --use-geo-grasp --phase 4 --robot-id 2 --no-workspace-clamp
+```
+
+Logs include `pred_obj_x_m`, `pred_obj_z_m`, and `locator_err_m` (predicted vs spawn center). Compare success rate and `clamp_limited` against BC fine-tune on the same phase:
+
+```powershell
+python analysis\spawn_spatial_report.py data\episode_log_r1_phase4.xlsx --spawn-phase 4 -o "data\episode report"
+```
+
+**Phase 1 targets:** R1 phase 4 success above BC ~62%; R2 phase 4 success up and/or `clamp_limited` down vs BC ~28% / ~60%; median `locator_err_m` below ~3 cm on failures.
+
+---
+
+## Residual RL fine-tune (TD3, BC frozen)
+
+Opt-in RL on top of BC checkpoints. BC training/inference paths are unchanged unless you pass RL flags.
+
+**History / failed attempts:** [`docs/rl_residual_training_chronicle.md`](docs/rl_residual_training_chronicle.md) — chronology of every RL run, reward version, bugs, and collapse pattern.
+
+Config: [`host_gpu_system/config/rl_train_config.yaml`](host_gpu_system/config/rl_train_config.yaml) (per-robot reward weights and max residual Δ).
+
+**Start from the repo root** (adjust if your clone lives elsewhere):
+
+```powershell
+cd C:\Users\m0ha0001\Desktop\VR-DT-DRL
+```
+
+### Terminal 1 — GPU server (RL train)
+
+```powershell
+cd C:\Users\m0ha0001\Desktop\VR-DT-DRL\host_gpu_system
+.\venv\Scripts\Activate.ps1
+python src\gpu_server.py --rl-train --model models\ur3_live_model_r1.pth --model-r2 models\ur3_live_model_r2.pth
+```
+
+Saves **`models/R1_RL_residual.pth`** / **`R2_RL_residual.pth`** (never overwrites BC weights). If those files are missing, TD3 starts fresh. **Current experiment:** minimal dynamics — `LR=1e-4`, exploration noise anneal, gated `w_align`, skip clamp-limited replay — see [`docs/rl_residual_training_chronicle.md`](docs/rl_residual_training_chronicle.md) §12.
+
+### Terminal 2 — RL train client (R1)
+
+```powershell
+cd C:\Users\m0ha0001\Desktop\VR-DT-DRL\host_gpu_system
+.\venv\Scripts\Activate.ps1
+cd ..\vm_simulation_system
+
+$env:WEBOTS_HOME = "$env:LOCALAPPDATA\Programs\Webots"
+$env:WEBOTS_ROBOT_NAME = "ur3e_robot"
+
+python src\simulation_client.py --mode rl_train --robot-id 1
+```
+
+### Terminal 3 — RL train client (R2, dual-arm)
+
+```powershell
+cd C:\Users\m0ha0001\Desktop\VR-DT-DRL\host_gpu_system
+.\venv\Scripts\Activate.ps1
+cd ..\vm_simulation_system
+
+$env:WEBOTS_HOME = "$env:LOCALAPPDATA\Programs\Webots"
+$env:WEBOTS_ROBOT_NAME = "ur3e_robot2"
+
+python src\simulation_client.py --mode rl_train --robot-id 2
+```
+
+Episode logs: `data/episode_log_r1_rl_train.xlsx` / `r2_...` (includes `residual_dx/dz/dyaw`, `lateral_aim_err_m`, etc.).
+
+### Inference with residual
+
+```powershell
+cd host_gpu_system
+.\venv\Scripts\Activate.ps1
+python src\gpu_server.py --rl-residual-r1 models/R1_RL_residual.pth --rl-residual-r2 models/R2_RL_residual.pth
+```
+
+```powershell
+cd host_gpu_system
+.\venv\Scripts\Activate.ps1
+cd ..\vm_simulation_system
+
+$env:WEBOTS_HOME = "$env:LOCALAPPDATA\Programs\Webots"
+$env:WEBOTS_ROBOT_NAME = "ur3e_robot"
+
+python src\simulation_client.py --mode inference --use-residual --phase 4 --robot-id 1
+```
+
+### Evaluate failure mix + reward config
+
+```powershell
+cd host_gpu_system
+.\venv\Scripts\Activate.ps1
+cd ..
+python analysis\evaluate_rl_rewards.py data\episode_log_r1_rl_train.xlsx
+```
+
+---
+
 ## Episode logs
 
 Written under **`VR-DT-DRL/data/`** (repo root), e.g.:
@@ -277,6 +429,8 @@ Written under **`VR-DT-DRL/data/`** (repo root), e.g.:
 - `data/episode_log_r1.xlsx` (cycle / normal inference)
 - `data/episode_log_r1_phase4.xlsx` (when using `--phase 4`)
 - `data/episode_log_r1_fine_tune.xlsx` (targeted fine-tune collection)
+- `data/episode_log_r1_locator_train.xlsx` (locator supervised collection)
+- `data/episode_log_r1_rl_train.xlsx` (residual RL training)
 
 Column **timestamp_local** uses your Windows timezone in 12-hour format.
 
