@@ -1,14 +1,18 @@
+# Click SpawnArea corners in ai_vision_debug_rgb_sim_r2.jpg as VISUAL TL, BL, TR, BR.
+# permutation remaps clicks to grid order (fixes R2 camera vs world axes).
 image_corner_order: visual
+image_corner_permutation: [3, 1, 2, 0]
 post_flip_vertical: false
+post_flip_horizontal: false
 image_corners:
 - - 57
-  - 22
-- - 52
-  - 211
+  - 25
+- - 54
+  - 207
 - - 168
-  - 22
-- - 183
-  - 210
+  - 26
+- - 181
+  - 209
 world_corners:
 - - -1.5050000000000001
   - 0.935

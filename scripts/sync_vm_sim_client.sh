@@ -17,4 +17,8 @@ fi
 
 cp "$SHARE"/*.py "$DEST/"
 echo "Synced Python files to $DEST"
-python3 "$DEST/simulation_client.py" --help | grep use-geo-grasp && echo "OK: --use-geo-grasp available"
+if grep -q -- '--use-local-bbox-dqn' "$DEST/simulation_client.py"; then
+  echo "OK: --use-local-bbox-dqn available"
+else
+  echo "WARN: --use-local-bbox-dqn not found in synced client" >&2
+fi

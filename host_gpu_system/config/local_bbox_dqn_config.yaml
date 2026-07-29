@@ -30,7 +30,7 @@ reward:
   teacher_cell_bonus: 0.0
 
 checkpoints:
-  save_r1: models/R1_local_bbox_dqn.pth
+  save_r1: models/THIS ONE/R1_local_bbox_dqn.pth
   save_r2: models/R2_local_bbox_dqn.pth
 
 # YOLO weights / thresholds (same schema as yolo_locator_config.yaml)

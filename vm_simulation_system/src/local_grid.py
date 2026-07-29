@@ -1,6 +1,7 @@
 """Local table grid for hybrid locator + cell-picker grasp (world XZ meters)."""
 
-from __future__ import annotations
+# Melodic VM runs Python 3.6 — do NOT add `from __future__ import annotations`
+# (that future is 3.7+ and breaks `python3` import of this module on the real-arm VM).
 
 import math
 from pathlib import Path
