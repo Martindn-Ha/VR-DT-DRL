@@ -1,304 +1,118 @@
-﻿# VR-DT-DRL
-
-Vision-based **UR3e grasping** with a **Webots digital twin** and a **GPU inference server** on Windows.
-
-**Current pipeline:** local-bbox DQN ΓÇö YOLO detects the block, a fixed world window is cropped around the bbox center, and a DQN picks the grasp cell.
-
-MIT License ┬╖ [Aqlanlab](LICENSE)
+# Vision-Based Sim-to-Real Reinforcement Learning for Cobot Precision Pick-and-Place
 
 ---
 
-## What runs where (Windows setup)
+## 1. Introduction
 
-Everything runs on **one Windows PC**:
+In advanced manufacturing, collaborative robots (cobots) are increasingly used for assembly, sorting, packaging, and small-part handling. Among these applications, precision pick-and-place is especially challenging because it demands millimeter-level alignment under realistic operating conditions.
 
-| Component | What it does |
-|-----------|----------------|
-| **Webots** | Simulation world (`updated_world/worlds/Environmentnewww.wbt`) |
-| **`gpu_server.py`** | YOLO + local-bbox DQN on your NVIDIA GPU |
-| **`simulation_client.py`** | Robot control, cameras, episodes (one process per arm) |
-
-Clients talk to the GPU server over **`127.0.0.1:8888`**.
-
-```mermaid
-flowchart LR
-  WB[Webots]
-  GS[gpu_server.py]
-  R1[simulation_client R1]
-  R2[simulation_client R2]
-  R1 --> WB
-  R2 --> WB
-  R1 -->|localhost :8888| GS
-  R2 -->|localhost :8888| GS
-```
+However, achieving reliable results under realistic conditions remains difficult and time-consuming, and many systems are validated only in simulation or idealized lab setups. Bridging this **sim-to-real gap**—policies trained in simulation that still work on hardware—is the focus of this work.
 
 ---
 
-## One-time setup
+## 2. Project objectives
 
-### 1. Install software
+**Research question:** Can a cobot reliably lift a small 3D-printed block (about 1.1 cm × 3.3 cm × 1.1 cm) in a realistic environment when trained only in simulation?
 
-| Tool | Version / notes |
-|------|-----------------|
-| **Python** | **3.9** (required for Webots 2021a controller API) |
-| **Webots** | **2021a** ([download](https://github.com/cyberbotics/webots/releases)) |
-| **NVIDIA driver + CUDA** | For GPU inference (PyTorch cu118/cu121) |
+Goals:
 
-Default Webots install path on Windows:
-
-`%LOCALAPPDATA%\Programs\Webots`
-
-### 2. Webots world assets
-
-The Webots project lives in **`updated_world/`** at the repo root (create that folder and put the contents of **`Webots.rar`** from Box inside ΓÇö see [Files on Box](#files-on-box-not-on-github)). Open in Webots:
-
-- `updated_world/worlds/Environmentnewww.wbt`
-- `updated_world/protos/` (meshes, textures, UR3e protos)
-
-If you copy a fresh tree from Box and paths still reference Linux (`/home/seth/...`), fix once:
-
-```powershell
-cd VR-DT-DRL
-python vm_simulation_system\Webots\scripts\fix_vm_paths_for_windows.py
-```
-
-The script defaults to `updated_world/`. Domain-randomization texture JPGs are also read from `vm_simulation_system/Webots/protos/textures/Dataset/` when the client runs.
-
-### 3. Python environment (GPU + sim client)
-
-```powershell
-cd host_gpu_system
-python -m venv venv
-.\venv\Scripts\Activate.ps1
-pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu121
-```
-
-Confirm CUDA:
-
-```powershell
-python -c "import torch; print(torch.cuda.is_available())"
-```
-
-`openpyxl` is included in `requirements.txt` (episode Excel logs).
-
-### 4. Network config (localhost)
-
-In `vm_simulation_system/config/network_config.yaml`:
-
-```yaml
-network:
-  host_ip: "127.0.0.1"
-  host_port: 8888
-```
-
-Leave `host_gpu_system/config/network_config.yaml` as `host_ip: "0.0.0.0"`.
-
-### 5. Models
-
-Place weights under `host_gpu_system/models/` (gitignored):
-
-| File | Role |
-|------|------|
-| `block_yolo/weights/best.pt` | YOLO block detector (path set in config) |
-| `R1_local_bbox_dqn.pth` | Local-bbox DQN (Robot 1) |
-| `R2_local_bbox_dqn.pth` | Local-bbox DQN (Robot 2, dual-arm) |
-
-Paths are configured in [`host_gpu_system/config/local_bbox_dqn_config.yaml`](host_gpu_system/config/local_bbox_dqn_config.yaml).
-
-### 6. GPU server firewall (once)
-
-```powershell
-netsh advfirewall firewall add rule name="UR3e GPU Server" dir=in action=allow protocol=TCP localport=8888
-```
-
-### 7. Dual-arm barrier (if using one or two robots)
-
-In `host_gpu_system/src/gpu_server.py` (~line 114), set `_barrier_num_robots`:
-
-| Arms running | Value |
-|--------------|-------|
-| Robot 1 only | `1` |
-| Robot 1 + 2 | `2` |
-
-With **two** clients, the GPU server uses setup barriers: Robot 1 sets up the world first, Robot 2 second, then **both** wait until setup is complete before either resumes grasping.
+- Build a matched **Webots** digital twin of the physical cell
+- Train a vision-based grasp policy entirely in simulation
+- Transfer that policy to a physical **UR3e** without additional fine-tuning
 
 ---
 
-## Curriculum phases
+## 3. Research methodology
 
-Spawns use six phases (0ΓÇô5). Each phase places the block at increasing distance from the platform centre.
+- **Detector:** YOLOv8n trained to localize the block in the board view
+- **Grasp policy:** Dual-MobileNetV2 DQN (RGB + depth) with ε-greedy exploration; selects a grasp cell in a local window around the detection
+- **Hardware:** UR3e cobot, Intel RealSense D455, LulzBot TAZ Workhorse print bed; oblique camera view is warped to a top-down board image before perception
 
-| Phase | Spawn region |
-|-------|----------------|
-| **0** | Centre only (fixed) |
-| **1** | 0.5ΓÇô1.5 cm radius |
-| **2** | 1.5ΓÇô3.5 cm radius |
-| **3** | 3.5ΓÇô7.0 cm radius |
-| **4** | 7.0ΓÇô11.5 cm radius band |
-| **5** | Anywhere on usable platform (uniform) |
+Training and evaluation use the same perception–control stack in Webots and on the real arm (GPU inference on Windows; ROS on the robot side for hardware runs).
 
-**Inference** (`--mode inference`) does not advance phases. Pick how spawns behave:
+<p align="center">
+  <img src="images/figure1_architecture.png" alt="Proposed vision-based grasp architecture" width="720">
+</p>
 
-| Flag | Behavior |
-|------|----------|
-| `--phase N` | Lock spawns to phase **0ΓÇô5** |
-| *(no extra flag)* | Use saved phase from `config/curriculum_state.json` |
-| `--cycle N` | Rotate through phases (default **0ΓåÆ5**); add **`--cycle-from`** / **`--cycle-to`** to limit the range |
-| `--free` | No auto-spawn; place the block manually in Webots |
-
-Episode logs for `--phase N` go to `data/episode_log_r1_phaseN.xlsx`.
+<p align="center"><em>Figure 1. Proposed vision-based grasp architecture.</em></p>
 
 ---
 
-## Real UR3e arm (physical hardware)
+## 4. Limitations
 
-Webots is not required. Full bring-up for **Ubuntu VM + Windows GPU** is in **[docs/physical_arms.md](docs/physical_arms.md)**.
+- Missing or unreliable depth near bed edges
+- Perspective distortion from the oblique D455 mount (not a true overhead camera)
 
----
+<p align="center">
+  <img src="images/figure2_realsense.png" alt="Intel RealSense D455 RGB and depth streams" width="720">
+</p>
 
-## Local-bbox DQN
-
-Pipeline: warp board RGB ΓåÆ YOLO block detection ΓåÆ crop a fixed world window around the bbox center ΓåÆ DQN picks a cell in that local grid ΓåÆ analytic grasp from cell world XZ.
-
-Config: [`host_gpu_system/config/local_bbox_dqn_config.yaml`](host_gpu_system/config/local_bbox_dqn_config.yaml)
-
-| Setting | Default | Purpose |
-|---------|---------|---------|
-| `grid.n` / `grid.window_m` | `20` / `0.02` | Local grid size; 2 cm window (~1 mm/cell) |
-| `crop.out_size` | `224` | Crop resolution into the DQN encoder |
-| `training.phase` | `rl` | `shaping`, `rl`, or `both` |
-| `reward.center_success_m` | `0.002` | Pick vs spawn center Γëñ this ΓåÆ success |
-| `checkpoints.save_r1` / `save_r2` | `R1_local_bbox_dqn.pth` / `R2_local_bbox_dqn.pth` | Per-arm checkpoints |
-| `yolo.weights` | `models/block_yolo/weights/best.pt` | YOLO detector used to center the window |
-
-**Order every session:** GPU server ΓåÆ Webots **Play** ΓåÆ client(s).
-
-**Stopping:** PowerShell **Ctrl+Pause** (often **Ctrl+Fn+Pause** on laptops).
-
-### Train
-
-**Terminal 1 ΓÇö GPU server**
-
-```powershell
-cd host_gpu_system
-.\venv\Scripts\Activate.ps1
-python src\gpu_server.py --local-bbox-dqn-train
-```
-
-**Webots:** open `updated_world\worlds\Environmentnewww.wbt` ΓåÆ **Reset Simulation** ΓåÆ **Play**.
-
-**Terminal 2 ΓÇö Robot 1**
-
-```powershell
-cd host_gpu_system
-.\venv\Scripts\Activate.ps1
-cd ..\vm_simulation_system
-
-$env:WEBOTS_HOME = "$env:LOCALAPPDATA\Programs\Webots"
-$env:WEBOTS_ROBOT_NAME = "ur3e_robot"
-
-python src\simulation_client.py --mode local_bbox_dqn_train --robot-id 1
-```
-
-Episode logs: `data/episode_log_r1_local_bbox_dqn_train.xlsx`. Checkpoints every `checkpoint_every_steps` (default 100).
-
-### Inference
-
-**Terminal 1 ΓÇö GPU server**
-
-```powershell
-cd host_gpu_system
-.\venv\Scripts\Activate.ps1
-python src\gpu_server.py --local-bbox-dqn
-```
-
-**Terminal 2 ΓÇö Robot 1**
-
-```powershell
-cd host_gpu_system
-.\venv\Scripts\Activate.ps1
-cd ..\vm_simulation_system
-
-$env:WEBOTS_HOME = "$env:LOCALAPPDATA\Programs\Webots"
-$env:WEBOTS_ROBOT_NAME = "ur3e_robot"
-
-python src\simulation_client.py --mode inference --use-local-bbox-dqn --phase 5 --robot-id 1
-```
-
-Optional Robot 2: same client command with `--robot-id 2` and `$env:WEBOTS_ROBOT_NAME = "ur3e_robot2"`.
-
-Override DQN weights with `--local-bbox-model` / `--local-bbox-model-r2` on the GPU server if needed.
-
-### Good startup signs
-
-- `[WebotsBridge] Connected to robot 'ur3e_robot'`
-- `Webots motors bound: 6/6`
-- `Connected to GPU server at 127.0.0.1:8888`
-- Local-bbox / YOLO activity in GPU or client logs when an episode runs
-
-### Evaluate
-
-```powershell
-python analysis\spawn_spatial_report.py data\episode_log_r1_phase5.xlsx --spawn-phase 5 -o "data\episode report"
-```
-
-Outputs PDF under `data/episode report/`. See `data/README.md` for more options.
+<p align="center"><em>Figure 2. Intel RealSense D455 RGB and depth streams.</em></p>
 
 ---
 
-## Episode logs
+## 5. Results
 
-Written under **`VR-DT-DRL/data/`** (repo root), e.g.:
+- **Simulation:** 1,975 episodes
+- **Real world:** 156 trials; overall success **84.6%** across block colors (yellow, green, blue, purple, grey, red)
 
-- `data/episode_log_r1_local_bbox_dqn_train.xlsx` (local-bbox DQN training)
-- `data/episode_log_r1_phase5.xlsx` (inference with `--phase 5`)
+Success varies with block position on the bed. Failures are concentrated in harder regions rather than uniform random misses.
 
-Column **timestamp_local** uses your Windows timezone in 12-hour format.
+<p align="center">
+  <img src="images/figure3_sim_spatial.png" alt="Spatial distribution of grasp results in simulation" width="560">
+</p>
 
----
+<p align="center"><em>Figure 3. Spatial distribution of grasp results (simulation).</em></p>
 
-## Troubleshooting
+<p align="center">
+  <img src="images/table1_real_results.png" alt="Real-world grasp trial results by block color" width="480">
+</p>
 
-| Problem | Fix |
-|---------|-----|
-| `Webots not connected` | Webots must be **playing** before starting the client; use **Reset Simulation** then Play |
-| `DLL load failed` / wrong python API | Use **Python 3.9** venv; Webots API folder must be `python39`, not `python38` |
-| Client exits immediately | Start `gpu_server.py` first; check `host_ip: "127.0.0.1"` in client config |
-| Hang between episodes | Match `_barrier_num_robots` to number of running clients (1 or 2) |
-| Missing textures / meshes | Ensure `updated_world/protos/` is complete; run path fix script on `updated_world/` |
-| `openpyxl` error | `pip install openpyxl` in `host_gpu_system\venv` |
-| YOLO / local-bbox miss | Confirm `yolo.weights` exists and `--local-bbox-dqn` / `--use-local-bbox-dqn` are both set |
-
-**Connection test** (Webots playing, Robot 1 env set):
-
-```powershell
-python vm_simulation_system\Webots\scripts\probe_webots_connection.py
-```
-
-Expected: `OK robot=ur3e_robot timestep=16`
+<p align="center"><em>Table 1. Real-world grasp trial results.</em></p>
 
 ---
 
-## Files on Box (not on GitHub)
+## 6. Discussion
 
-Clone the repo first, then download these from **Box** and place them as shown.
+Of the failed real-world trials, common modes include pressed grasps, pushes, unreliable lifts, and missed detections. Excluding one especially problematic position raises success to about **91.7%**, which suggests localization and edge sensing—not coarse grasp planning—limit performance in poorly sensed regions.
 
-**`Webots.rar`** on Box contains the **contents** of the Webots project (`worlds/`, `protos/`, etc.) ΓÇö not a folder named `updated_world/`. After clone:
+<p align="center">
+  <img src="images/table2_failure_taxonomy.png" alt="Grasp failure taxonomy" width="560">
+</p>
 
-1. Create `VR-DT-DRL/updated_world/`
-2. Extract `Webots.rar` and move everything into that folder (you should see `updated_world/worlds/Environmentnewww.wbt`, `updated_world/protos/`, ΓÇª)
+<p align="center"><em>Table 2. Grasp failure taxonomy.</em></p>
 
-| Item | Put here |
-|------|----------|
-| Webots project (from `Webots.rar`) | `VR-DT-DRL/updated_world/` |
-| YOLO `best.pt` | `host_gpu_system/models/block_yolo/weights/` |
-| `R1_local_bbox_dqn.pth` | `host_gpu_system/models/` |
-| `R2_local_bbox_dqn.pth` | `host_gpu_system/models/` (dual-arm only) |
+---
 
-Also copy `updated_world/protos/textures/Dataset/` ΓåÆ `vm_simulation_system/Webots/protos/textures/Dataset/` (domain randomization; sim runs without it, but with colour-only textures).
+## 7. Conclusion
+
+A vision-based policy trained entirely in simulation can transfer to a physical cobot for precision pick-and-place **without additional fine-tuning**.
+
+---
+
+## 8. Future work
+
+- Local vision-language model (VLM) for free-form language-guided block selection
+- Extend the pipeline beyond blocks (e.g. toy car parts)
+
+---
+
+## 9. Acknowledgements
+
+Mentorship from Dr. Faisal Aqlan and Jaime Morales. Thanks to Seth Gibbs for assistance with the Webots environment. Supported by the National Science Foundation REU Site in Advanced Manufacturing and Supply Chain.
+
+---
+
+## Setup documentation
+
+| Guide | Contents |
+|-------|----------|
+| [docs/setup.md](docs/setup.md) | One-time setup: software, world files, Python env, models |
+| [docs/simulation.md](docs/simulation.md) | Train and run in Webots |
+| [docs/physical_arms.md](docs/physical_arms.md) | Run on the real UR3e arm |
 
 ---
 
 ## License
 
-MIT License ΓÇö Copyright (c) 2026 Aqlanlab. See [LICENSE](LICENSE).
+MIT License — Copyright (c) 2026 Aqlanlab. See [LICENSE](LICENSE).

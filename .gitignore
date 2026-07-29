@@ -14,7 +14,7 @@ vm_simulation_system/data/*
 **/curriculum_state_robot2.json
 
 # Local analysis and exports (not for version control)
-docs/
+old doc/
 analysis/output/
 
 # Python
