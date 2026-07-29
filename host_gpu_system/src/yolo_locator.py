@@ -229,8 +229,9 @@ class LocalYoloLocator:
         self._model = YOLO(str(self.weights_path))
         print(f"[YOLO] loaded local weights: {self.weights_path}", flush=True)
 
-    def detect_bbox(self, rgb_w: np.ndarray) -> Tuple[Optional[BBox], Any]:
-        """Returns (bbox, raw_result dict)."""
+    def _predict_raw(
+        self, rgb_w: np.ndarray, *, max_det: int,
+    ) -> Tuple[List[BBox], Dict[str, Any]]:
         if rgb_w.dtype != np.uint8:
             rgb_u8 = np.clip(rgb_w, 0, 255).astype(np.uint8)
         else:
@@ -240,43 +241,62 @@ class LocalYoloLocator:
             source=bgr,
             imgsz=self.imgsz,
             conf=self.conf,
-            max_det=1,
+            max_det=int(max_det),
             verbose=False,
         )
         raw: Dict[str, Any] = {"predictions": [], "weights": str(self.weights_path)}
         if not results:
-            return None, raw
+            return [], raw
         r0 = results[0]
         if r0.boxes is None or len(r0.boxes) == 0:
-            return None, raw
+            return [], raw
 
-        box = r0.boxes[0]
-        xyxy = box.xyxy[0].cpu().numpy()
-        conf = float(box.conf[0].cpu().numpy())
-        cls_id = int(box.cls[0].cpu().numpy()) if box.cls is not None else 0
         names = getattr(r0, "names", {}) or {}
-        cls_name = str(names.get(cls_id, "block"))
-
-        x1, y1, x2, y2 = [float(v) for v in xyxy]
         s = float(self.warp_size)
-        x1 = min(max(x1, 0.0), s - 1.0)
-        y1 = min(max(y1, 0.0), s - 1.0)
-        x2 = min(max(x2, 0.0), s - 1.0)
-        y2 = min(max(y2, 0.0), s - 1.0)
-        if x2 <= x1 or y2 <= y1:
-            return None, raw
+        boxes: List[BBox] = []
+        preds: List[Dict[str, Any]] = []
+        for box in r0.boxes:
+            xyxy = box.xyxy[0].cpu().numpy()
+            conf = float(box.conf[0].cpu().numpy())
+            cls_id = int(box.cls[0].cpu().numpy()) if box.cls is not None else 0
+            cls_name = str(names.get(cls_id, "block"))
+            x1, y1, x2, y2 = [float(v) for v in xyxy]
+            x1 = min(max(x1, 0.0), s - 1.0)
+            y1 = min(max(y1, 0.0), s - 1.0)
+            x2 = min(max(x2, 0.0), s - 1.0)
+            y2 = min(max(y2, 0.0), s - 1.0)
+            if x2 <= x1 or y2 <= y1:
+                continue
+            bbox = BBox(
+                x1=x1, y1=y1, x2=x2, y2=y2,
+                confidence=conf, class_name=cls_name,
+            )
+            filtered = _filter_bbox(
+                bbox,
+                min_confidence=self.min_confidence,
+                class_name=self.class_name,
+            )
+            preds.append({
+                "x1": x1, "y1": y1, "x2": x2, "y2": y2,
+                "confidence": conf, "class": cls_name, "class_id": cls_id,
+            })
+            if filtered is not None:
+                boxes.append(filtered)
+        raw["predictions"] = preds
+        return boxes, raw
 
-        bbox = BBox(x1=x1, y1=y1, x2=x2, y2=y2, confidence=conf, class_name=cls_name)
-        raw["predictions"] = [{
-            "x1": x1, "y1": y1, "x2": x2, "y2": y2,
-            "confidence": conf, "class": cls_name, "class_id": cls_id,
-        }]
-        filtered = _filter_bbox(
-            bbox,
-            min_confidence=self.min_confidence,
-            class_name=self.class_name,
-        )
-        return filtered, raw
+    def detect_bbox(self, rgb_w: np.ndarray) -> Tuple[Optional[BBox], Any]:
+        """Returns (bbox, raw_result dict). Single top detection."""
+        boxes, raw = self._predict_raw(rgb_w, max_det=1)
+        if not boxes:
+            return None, raw
+        return boxes[0], raw
+
+    def detect_bboxes(
+        self, rgb_w: np.ndarray, *, max_det: int = 20,
+    ) -> Tuple[List[BBox], Any]:
+        """Returns all conf-filtered boxes (for VLM select)."""
+        return self._predict_raw(rgb_w, max_det=max_det)
 
 
 YoloLocator = LocalYoloLocator

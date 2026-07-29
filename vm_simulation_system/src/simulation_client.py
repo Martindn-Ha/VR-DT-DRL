@@ -20,6 +20,7 @@ import yaml
 import argparse
 import base64
 import struct
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
@@ -83,6 +84,47 @@ def _agent_debug_log(location: str, message: str, data: Optional[Dict] = None,
 def running_inside_webots() -> bool:
     """True when Webots launched this process as an extern controller."""
     return bool(os.environ.get("WEBOTS_CONTROLLER_URL"))
+
+
+_LOCATION_PLACE_RE = re.compile(
+    r"(?:"
+    r"\bleft\b|\bright\b|\btop\b|\bbottom\b|\bcenter\b|\bcentre\b|"
+    r"\bquadrant\b|\bq\s*[1-4]\b|"
+    r"\bnear\b|\bnext\s+to\b|\bbeside\b|\bbetween\b|"
+    r"\babove\b|\bbelow\b|"
+    r"\bleft\s+of\b|\bright\s+of\b"
+    r")",
+    re.IGNORECASE,
+)
+
+
+def instruction_has_location(text: str) -> bool:
+    return bool(_LOCATION_PLACE_RE.search(text or ""))
+
+
+def prompt_vlm_instruction() -> Optional[str]:
+    """Per-episode Instruction: + optional Location? re-prompt. None if empty after retry."""
+    try:
+        raw = input("Instruction: ").strip()
+    except EOFError:
+        raw = ""
+    if not raw:
+        try:
+            raw = input("Instruction (required): ").strip()
+        except EOFError:
+            raw = ""
+    if not raw:
+        return None
+    if instruction_has_location(raw):
+        return raw
+    try:
+        loc = input("Location? (top-left, Q2, near blue, …): ").strip()
+    except EOFError:
+        loc = ""
+    if not loc:
+        print("[VLM] location required when instruction has no place cue — skipping episode")
+        return None
+    return f"{raw} {loc}".strip()
 
 
 EPISODE_LOG_COLUMNS = [
@@ -588,6 +630,7 @@ class SimulationClient:
                  use_yolo_locator_test: bool = False,
                  use_yolo_fuse: bool = False,
                  use_local_bbox_dqn: bool = False,
+                 use_vlm_select: bool = False,
                  no_workspace_clamp: bool = False,
                  rl_train_config_path: Optional[str] = None,
                  grid_config_path: Optional[str] = None,
@@ -607,13 +650,17 @@ class SimulationClient:
         self.use_yolo_locator_test = use_yolo_locator_test
         self.use_yolo_fuse = use_yolo_fuse
         self.use_local_bbox_dqn = use_local_bbox_dqn
+        self.use_vlm_select = use_vlm_select
         self.no_workspace_clamp = no_workspace_clamp
+        self._pending_vlm_instruction: Optional[str] = None
         self._rl_reward_cfg: Dict[str, Any] = {}
         self._grid_reward_cfg: Dict[str, Any] = {}
         self._board_reward_cfg: Dict[str, Any] = {}
         self._local_bbox_reward_cfg: Dict[str, Any] = {}
         self._grid_phase: str = 'shaping'
         self._board_phase: str = 'shaping'
+        # Solo R2: True so scene domain rand runs like R1 solo. Dual-arm: R1 owns it.
+        self._owns_domain_rand = (robot_id == 1)
         self.config     = self._load_config(config_path)
 
         if ROS_AVAILABLE:
@@ -2101,7 +2148,8 @@ class SimulationClient:
         try:
             with self.connection_lock:
                 self.host_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                self.host_socket.settimeout(30.0)
+                # VLM inference can exceed 30s; keep a longer recv timeout when enabled.
+                self.host_socket.settimeout(120.0 if self.use_vlm_select else 30.0)
                 self.host_socket.connect((host_ip, host_port))
                 self.connected = True
             rospy.loginfo(f"Connected to GPU server at {host_ip}:{host_port}")
@@ -2139,6 +2187,8 @@ class SimulationClient:
             else:
                 self.latest_depth_b64 = ""
 
+            self._pending_vlm_instruction = None
+
             payload = {
                 'type':     'camera_data',
                 'data':     {'rgb': self.latest_rgb_b64, 'depth': self.latest_depth_b64},
@@ -2153,6 +2203,7 @@ class SimulationClient:
                 'use_yolo_locator_test': self.use_yolo_locator_test,
                 'use_yolo_fuse': self.use_yolo_fuse,
                 'use_local_bbox_dqn': self.use_local_bbox_dqn,
+                'use_vlm_select': self.use_vlm_select,
                 'session_episode': self.session_episode_count,
             }
             spawn_x_log = self._episode_log_fields.get('spawn_x', '')
@@ -2173,7 +2224,39 @@ class SimulationClient:
                         payload['object_z'] = float(dp[2])
                 except Exception:
                     pass
-            
+
+            # VLM: send frame first (no instruction) so GPU saves board_warp_r*_latest.jpg,
+            # then prompt after preview is ready.
+            if self.use_vlm_select and self.use_local_bbox_dqn:
+                preview = self._send_message_to_host(payload)
+                if not preview or preview.get('type') != 'warp_ready':
+                    if preview and preview.get('type') == 'error':
+                        print(f"[GPU R{self.robot_id}] Inference error: {preview.get('message')}")
+                    else:
+                        print(f"[VLM R{self.robot_id}] expected warp_ready, got: {preview}")
+                    return
+                print(
+                    f"[VLM R{self.robot_id}] board warp ready — look at "
+                    f"host_gpu_system/debug/board_warp_r{self.robot_id}_latest.jpg"
+                )
+                instr = prompt_vlm_instruction()
+                if not instr:
+                    self.last_grasp_mode = 'vlm_select_failed'
+                    if self.episode_active:
+                        self._episode_log_fields.update({
+                            'grasp_mode': 'vlm_select_failed',
+                            'success': 0,
+                            'reward': '0.000000',
+                            'outcome_class': 'vlm_select_failed',
+                        })
+                        print(f"[VLM R{self.robot_id}] empty instruction — skipping episode")
+                        self._end_episode_and_restart(False)
+                    else:
+                        print(f"[VLM R{self.robot_id}] empty instruction — not sending")
+                    return
+                self._pending_vlm_instruction = instr
+                payload['instruction'] = instr
+
             response = self._send_message_to_host(payload)
             if response and response.get('type') == 'grasp_prediction':
                 if self.real_robot:
@@ -2201,6 +2284,7 @@ class SimulationClient:
             elif response and response.get('type') == 'error':
                 msg = response.get('message')
                 print(f"[GPU R{self.robot_id}] Inference error: {msg}")
+                outcome = response.get('outcome_class')
                 yolo_miss = (
                     isinstance(msg, str)
                     and 'No valid YOLO bbox' in msg
@@ -2209,6 +2293,20 @@ class SimulationClient:
                         self.use_yolo_locator_test
                         or self._is_local_bbox_dqn_train()
                         or self.use_local_bbox_dqn
+                    )
+                )
+                vlm_fail = (
+                    self.use_vlm_select
+                    and (
+                        outcome in ('vlm_unavailable', 'vlm_select_failed')
+                        or (
+                            isinstance(msg, str)
+                            and (
+                                msg.startswith('vlm_unavailable')
+                                or msg.startswith('vlm_select_failed')
+                                or 'VLM select requires' in msg
+                            )
+                        )
                     )
                 )
                 if yolo_miss:
@@ -2221,6 +2319,22 @@ class SimulationClient:
                     })
                     print(f"[YOLO R{self.robot_id}] detection failed — skipping episode")
                     self._end_episode_and_restart(False)
+                elif vlm_fail:
+                    oc = outcome if outcome in ('vlm_unavailable', 'vlm_select_failed') else 'vlm_select_failed'
+                    self.last_grasp_mode = oc
+                    print(f"[VLM R{self.robot_id}] {oc}")
+                    if self.episode_active:
+                        self._episode_log_fields.update({
+                            'grasp_mode': oc,
+                            'success': 0,
+                            'reward': '0.000000',
+                            'outcome_class': oc,
+                        })
+                        print(f"[VLM R{self.robot_id}] {oc} — skipping episode")
+                        self._end_episode_and_restart(False)
+                    else:
+                        # Real IRL loop has no episode_active; wait then retry capture+prompt.
+                        time.sleep(0.5)
             elif self.episode_active:
                 print(f"[GPU R{self.robot_id}] Unexpected response: {response}")
         except Exception as e:
@@ -3252,10 +3366,10 @@ class SimulationClient:
         self.curriculum.update(self.episode_count)
 
         if not self.real_robot:
-            if self.robot_id == 1:
+            # Solo R1 or solo R2: owner randomizes scene. Dual-arm: R1 only.
+            if self._owns_domain_rand:
                 domain_log = self._randomize_domain()
                 self._record_domain_rand_for_log(domain_log)
-            # R2: support-shade columns stay empty — R1 logs scene rand (avoids dual-supervisor read crash)
 
         if not self.real_robot:
             self._randomize_camera_poses()
@@ -3314,8 +3428,6 @@ class SimulationClient:
             return
 
         if self.robot_id == 2:
-            if not self._is_grid_train():
-                print(f"[SETUP BARRIER R{self.robot_id}] Waiting for R1 world setup...")
             _agent_debug_log(
                 "simulation_client.py:_begin_next_episode_serialized",
                 "setup_wait_request",
@@ -3329,8 +3441,13 @@ class SimulationClient:
             if not response or response.get('type') != 'proceed':
                 msg = (response or {}).get('message', response)
                 raise RuntimeError(f"Setup barrier failed for R2: {msg}")
+            self._owns_domain_rand = bool(response.get('owns_domain_rand', False))
+            num_robots = int(response.get('num_robots', 1))
             if not self._is_grid_train():
-                print(f"[SETUP BARRIER R{self.robot_id}] R1 setup done — starting R2 episode setup")
+                if num_robots >= 2:
+                    print(f"[SETUP BARRIER R{self.robot_id}] R1 setup done — starting R2 episode setup")
+                else:
+                    print(f"[SETUP BARRIER R{self.robot_id}] Solo mode — owning domain rand")
 
         self.start_new_episode()
 
@@ -3807,6 +3924,8 @@ def main():
                         help='Inference: YOLO bbox → best board-DQN Q in box (requires --use-board-dqn and gpu_server --yolo-fuse)')
     parser.add_argument('--use-local-bbox-dqn', action='store_true',
                         help='Inference: YOLO center → fixed window → local DQN (requires gpu_server --local-bbox-dqn)')
+    parser.add_argument('--use-vlm-select', action='store_true',
+                        help='Inference: per-episode text → Ollama VLM point → nearest YOLO box (requires --use-local-bbox-dqn)')
     parser.add_argument('--no-workspace-clamp', action='store_true',
                         help='Inference: skip X/Y/Z workspace clip on exploit/exploit_geo poses (diagnostic; teacher explore unchanged)')
     parser.add_argument('--episodes', type=int, default=None,
@@ -3877,6 +3996,10 @@ def main():
         parser.error("--use-yolo-fuse requires --mode inference.")
     if args.use_local_bbox_dqn and mode != 'inference':
         parser.error("--use-local-bbox-dqn requires --mode inference.")
+    if args.use_vlm_select and mode != 'inference':
+        parser.error("--use-vlm-select requires --mode inference.")
+    if args.use_vlm_select and not args.use_local_bbox_dqn:
+        parser.error("--use-vlm-select requires --use-local-bbox-dqn.")
     if args.use_board_locator and not args.use_board_dqn:
         parser.error("--use-board-locator requires --use-board-dqn.")
     if args.use_yolo_fuse and not args.use_board_dqn:
@@ -3965,6 +4088,7 @@ def main():
             use_yolo_locator_test=args.use_yolo_locator_test,
             use_yolo_fuse=args.use_yolo_fuse,
             use_local_bbox_dqn=args.use_local_bbox_dqn,
+            use_vlm_select=args.use_vlm_select,
             no_workspace_clamp=args.no_workspace_clamp,
             rl_train_config_path=args.rl_train_config,
             grid_config_path=args.grid_config,
@@ -4067,6 +4191,10 @@ def main():
 
     if mode == 'inference' and args.use_yolo_fuse:
         print(f"[INFERENCE R{robot_id}] YOLO bbox → best Q in box (--use-yolo-fuse)")
+
+    if mode == 'inference' and args.use_local_bbox_dqn:
+        vlm_note = " + VLM select" if args.use_vlm_select else ""
+        print(f"[INFERENCE R{robot_id}] Local-bbox DQN (--use-local-bbox-dqn){vlm_note}")
 
     if mode == 'inference' and args.no_workspace_clamp:
         print(f"[INFERENCE R{robot_id}] Workspace clamp DISABLED (--no-workspace-clamp)")
