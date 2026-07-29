@@ -47,6 +47,10 @@ from local_bbox_window import (
     bbox_center_world, crop_fixed_window, local_cell_to_world, world_to_local_cell,
     window_xyxy_warp,
 )
+from vlm_box_selector import (
+    DEFAULT_OLLAMA_URL, DEFAULT_VLM_MODEL,
+    VlmSelectFailedError, VlmUnavailableError, select_bbox_by_vlm_point,
+)
 from board_seg_labels import make_block_mask_warp, blend_mask_overlay, mask_grid_to_cell
 
 _REPO_ROOT = Path(__file__).resolve().parent.parent.parent
@@ -130,6 +134,9 @@ class GPUInferenceServer:
                  local_bbox_dqn_config_path: str = None,
                  local_bbox_model_path: str = None,
                  local_bbox_model_path_r2: str = None,
+                 use_vlm_select: bool = False,
+                 vlm_model: str = None,
+                 ollama_url: str = None,
                  rl_train: bool = False, rl_train_config_path: str = None,
                  rl_residual_r1: str = None, rl_residual_r2: str = None):
         self.config     = self._load_config(config_path)
@@ -156,6 +163,9 @@ class GPUInferenceServer:
         self.local_bbox_dqn_train = local_bbox_dqn_train
         self.local_bbox_model_path = local_bbox_model_path
         self.local_bbox_model_path_r2 = local_bbox_model_path_r2
+        self.use_vlm_select = bool(use_vlm_select)
+        self.vlm_model = str(vlm_model or DEFAULT_VLM_MODEL)
+        self.ollama_url = str(ollama_url or DEFAULT_OLLAMA_URL)
         self.yolo_locator_cfg: Dict = {}
         self.yolo_client: Optional[LocalYoloLocator] = None
         self.local_bbox_cfg: Dict = {}
@@ -1513,7 +1523,16 @@ class GPUInferenceServer:
         y1 = int(crop['crop_y1'] * h)
         x0 = int(crop['crop_x0'] * w)
         x1 = int(crop['crop_x1'] * w)
-        return rgb[y0:y1, x0:x1].copy(), depth[y0:y1, x0:x1].copy()
+        rgb_c = rgb[y0:y1, x0:x1].copy()
+        depth_c = depth[y0:y1, x0:x1].copy()
+        try:
+            debug_dir = Path(__file__).resolve().parent.parent / "debug"
+            debug_dir.mkdir(parents=True, exist_ok=True)
+            out = debug_dir / f"ai_vision_debug_rgb_sim_r{robot_id}.jpg"
+            cv2.imwrite(str(out), cv2.cvtColor(rgb_c, cv2.COLOR_RGB2BGR))
+        except Exception:
+            pass
+        return rgb_c, depth_c
 
     def _preprocess_board_pair(self, camera_data: Dict, is_simulation: bool,
                                robot_id: int) -> Tuple[torch.Tensor, torch.Tensor]:
@@ -1688,6 +1707,25 @@ class GPUInferenceServer:
             if local_pick_px is not None:
                 px, py = int(local_pick_px[0]), int(local_pick_px[1])
                 cv2.drawMarker(vis_bgr, (px, py), (0, 255, 0), cv2.MARKER_TILTED_CROSS, 14, 2)
+
+            if meta and meta.get('vlm_point_uv') is not None:
+                try:
+                    vu, vv = meta['vlm_point_uv']
+                    cv2.drawMarker(
+                        vis_bgr, (int(round(vu)), int(round(vv))),
+                        (255, 255, 0), cv2.MARKER_STAR, 16, 2,
+                    )
+                except Exception:
+                    pass
+            if meta and meta.get('instruction'):
+                try:
+                    txt = str(meta['instruction'])[:80]
+                    cv2.putText(
+                        vis_bgr, txt, (4, h - 8),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255, 255, 255), 1, cv2.LINE_AA,
+                    )
+                except Exception:
+                    pass
 
             if meta and meta.get('dqn_outside_bbox') and meta.get('dqn_cell') is not None:
                 dx, dy = self._board_cell_pixel(int(meta['dqn_cell']), h, w, robot_id)
@@ -2067,6 +2105,29 @@ class GPUInferenceServer:
             'timestamp': time.time(),
         }
 
+    def _warp_preview_ready(self, full_message: Dict) -> Dict:
+        """Warp + save board_warp debug, then wait for client instruction."""
+        robot_id = int(full_message.get('robot_id', 1))
+        camera_data = full_message['data']
+        rgb_w = self._warp_rgb_for_debug(camera_data, robot_id)
+        instruction = str(full_message.get('instruction') or '').strip()
+        try:
+            self._save_board_debug_overlay(
+                rgb_w, robot_id, cnn_cell=None, teacher_cell=None,
+                meta={
+                    'mode': 'warp_preview',
+                    'instruction': instruction or None,
+                    'awaiting_instruction': True,
+                },
+            )
+        except Exception as exc:
+            print(f"[WARP PREVIEW R{robot_id}] save failed: {exc}", flush=True)
+        return {
+            'type': 'warp_ready',
+            'robot_id': robot_id,
+            'timestamp': time.time(),
+        }
+
     def _warp_rgb_depth_pair(self, camera_data: Dict, robot_id: int) -> Tuple[np.ndarray, np.ndarray]:
         img = self.decode_b64_image(camera_data)
         rgb = cv2.cvtColor(img['rgb'], cv2.COLOR_BGR2RGB)
@@ -2118,9 +2179,73 @@ class GPUInferenceServer:
         if mod is None:
             return {'type': 'error', 'message': 'Local-bbox DQN module not loaded'}
 
+        use_vlm = self.use_vlm_select or bool(full_message.get('use_vlm_select', False))
+        instruction = str(full_message.get('instruction') or '').strip()
+        vlm_point_uv = None
+        vlm_raw = None
+
         rgb_w, depth_w = self._warp_rgb_depth_pair(camera_data, robot_id)
         try:
-            bbox, raw_result = self.yolo_client.detect_bbox(rgb_w)
+            if use_vlm:
+                if not instruction:
+                    return {
+                        'type': 'error',
+                        'message': 'VLM select requires non-empty instruction',
+                        'outcome_class': 'vlm_select_failed',
+                    }
+                boxes, raw_result = self.yolo_client.detect_bboxes(rgb_w)
+                if not boxes:
+                    try:
+                        self._save_board_debug_overlay(
+                            rgb_w, robot_id, cnn_cell=None, teacher_cell=None,
+                            meta={
+                                'mode': 'local_bbox_dqn', 'yolo_miss': True,
+                                'instruction': instruction,
+                            },
+                        )
+                    except Exception:
+                        pass
+                    return {
+                        'type': 'error',
+                        'message': 'No valid YOLO bbox for local-bbox DQN',
+                        'yolo_raw': raw_result,
+                    }
+                try:
+                    sel = select_bbox_by_vlm_point(
+                        rgb_w, instruction, boxes,
+                        ollama_url=self.ollama_url,
+                        model=self.vlm_model,
+                    )
+                except VlmUnavailableError as exc:
+                    return {
+                        'type': 'error',
+                        'message': f'vlm_unavailable: {exc}',
+                        'outcome_class': 'vlm_unavailable',
+                        'yolo_raw': raw_result,
+                    }
+                except VlmSelectFailedError as exc:
+                    try:
+                        self._save_board_debug_overlay(
+                            rgb_w, robot_id, cnn_cell=None, teacher_cell=None,
+                            meta={
+                                'mode': 'local_bbox_dqn',
+                                'instruction': instruction,
+                                'vlm_fail': str(exc),
+                            },
+                        )
+                    except Exception:
+                        pass
+                    return {
+                        'type': 'error',
+                        'message': f'vlm_select_failed: {exc}',
+                        'outcome_class': 'vlm_select_failed',
+                        'yolo_raw': raw_result,
+                    }
+                bbox = sel.bbox
+                vlm_point_uv = list(sel.point_uv)
+                vlm_raw = sel.raw_text
+            else:
+                bbox, raw_result = self.yolo_client.detect_bbox(rgb_w)
         except Exception as exc:
             return {'type': 'error', 'message': f'YOLO inference failed: {exc}'}
 
@@ -2175,30 +2300,36 @@ class GPUInferenceServer:
         pick_u, pick_v = world_xz_to_warp_pixel(
             wx, wz, robot_id, out_size=rgb_w.shape[1], cfg=self.board_cfg,
         )
+        meta = {
+            'mode': 'local_bbox_explore' if explore else 'local_bbox_dqn',
+            'label_x': label_x,
+            'label_z': label_z,
+            'yolo_bbox_px': list(yolo_bbox_px),
+            'yolo_conf': bbox.confidence,
+            'window_xyxy': list(win_xyxy),
+            'window_center_x': center_x,
+            'window_center_z': center_z,
+            'local_cell': cell,
+            'teacher_local_cell': teacher_cell,
+            'pick_warp_px': [pick_u, pick_v],
+        }
+        if use_vlm:
+            meta['instruction'] = instruction
+            meta['vlm_point_uv'] = vlm_point_uv
+            meta['vlm_raw'] = vlm_raw
+            meta['use_vlm_select'] = True
         self._save_board_debug_overlay(
             rgb_w, robot_id,
             cnn_cell=None,
             teacher_cell=None,
             yolo_bbox=yolo_bbox_px,
-            meta={
-                'mode': 'local_bbox_explore' if explore else 'local_bbox_dqn',
-                'label_x': label_x,
-                'label_z': label_z,
-                'yolo_bbox_px': list(yolo_bbox_px),
-                'yolo_conf': bbox.confidence,
-                'window_xyxy': list(win_xyxy),
-                'window_center_x': center_x,
-                'window_center_z': center_z,
-                'local_cell': cell,
-                'teacher_local_cell': teacher_cell,
-                'pick_warp_px': [pick_u, pick_v],
-            },
+            meta=meta,
             local_pick_px=(pick_u, pick_v),
             window_xyxy=win_xyxy,
         )
 
         mode = 'local_bbox_explore' if explore else 'local_bbox_dqn'
-        return {
+        out = {
             'type': 'grasp_prediction',
             'pose': grasp_pose,
             'mode': mode,
@@ -2218,6 +2349,12 @@ class GPUInferenceServer:
             'confidence': bbox.confidence,
             'timestamp': time.time(),
         }
+        if use_vlm:
+            out['instruction'] = instruction
+            out['vlm_point_uv'] = vlm_point_uv
+            out['vlm_raw'] = vlm_raw
+            out['use_vlm_select'] = True
+        return out
 
     def format_local_bbox_shaping_batch(
         self, batch: List[Dict], robot_id: int,
@@ -3147,6 +3284,10 @@ class GPUInferenceServer:
                 return self._predict_local_bbox_pose(full_message, explore=True)
 
             if self.local_bbox_dqn or bool(full_message.get('use_local_bbox_dqn', False)):
+                use_vlm = self.use_vlm_select or bool(full_message.get('use_vlm_select', False))
+                instruction = str(full_message.get('instruction') or '').strip()
+                if use_vlm and not instruction:
+                    return self._warp_preview_ready(full_message)
                 return self._predict_local_bbox_pose(full_message, explore=False)
 
             if self.yolo_locator_test or bool(full_message.get('use_yolo_locator_test', False)):
@@ -3219,11 +3360,19 @@ class GPUInferenceServer:
                     x1 = int(crop['crop_x1'] * w)
 
                     rgb_crop = rgb[y0:y1, x0:x1].copy()
-                    cv2.imwrite(f"ai_vision_debug_rgb_sim_r{robot_id}.jpg", rgb_crop)
+                    debug_dir = Path(__file__).resolve().parent.parent / "debug"
+                    debug_dir.mkdir(parents=True, exist_ok=True)
+                    cv2.imwrite(
+                        str(debug_dir / f"ai_vision_debug_rgb_sim_r{robot_id}.jpg"),
+                        rgb_crop,
+                    )
                     depth_crop = depth[y0:y1, x0:x1].copy()
                     depth_vis  = cv2.normalize(depth_crop, None, 0, 255,
                                                cv2.NORM_MINMAX).astype(np.uint8)
-                    cv2.imwrite(f"ai_vision_debug_depth_sim_r{robot_id}.png", depth_vis)
+                    cv2.imwrite(
+                        str(debug_dir / f"ai_vision_debug_depth_sim_r{robot_id}.png"),
+                        depth_vis,
+                    )
                 except Exception as e:
                     print(f"[DEBUG R{robot_id}] Sim image save failed: {e}")
 
@@ -3506,8 +3655,12 @@ class GPUInferenceServer:
 
     def _handle_episode_setup_wait(self, robot_id: int) -> Dict:
         """Robot 2 blocks until Robot 1 completes episode setup (dual-arm only)."""
+        # Solo (barrier=1): whichever arm is running owns scene domain rand.
+        # Dual (barrier=2): only R1 owns it (avoids dual-supervisor crash).
+        owns_domain_rand = self._barrier_num_robots < 2 or robot_id == 1
         if self._barrier_num_robots < 2 or robot_id != 2:
-            return {'type': 'proceed'}
+            return {'type': 'proceed', 'owns_domain_rand': owns_domain_rand,
+                    'num_robots': self._barrier_num_robots}
         print(f"[SETUP BARRIER] R{robot_id} waiting for R1 world setup...")
         if not self._setup_r1_event.wait(timeout=self._setup_wait_timeout_s):
             return {
@@ -3515,7 +3668,8 @@ class GPUInferenceServer:
                 'message': f'timeout ({self._setup_wait_timeout_s}s) waiting for R1 setup',
             }
         print(f"[SETUP BARRIER] R{robot_id} cleared — starting local setup")
-        return {'type': 'proceed'}
+        return {'type': 'proceed', 'owns_domain_rand': False,
+                'num_robots': self._barrier_num_robots}
 
     def _handle_episode_setup_all_wait(self, robot_id: int) -> Dict:
         """Block until every robot has finished episode setup (dual-arm only)."""
@@ -3600,14 +3754,17 @@ class GPUInferenceServer:
         self.server_socket.listen(5)
         mode_label = "YOLO locator test" if self.yolo_locator_test else (
             "local-bbox DQN train" if self.local_bbox_dqn_train else (
-                "local-bbox DQN" if self.local_bbox_dqn else (
-                "board locator train" if self.board_locator_train else (
-                    "board DQN train" if self.board_dqn_train else (
-                        "board DQN" if self.board_dqn else (
-                            "residual RL" if self.rl_train else (
-                                "grid train" if self.grid_train else (
-                                    "locator train" if self.locator_train else (
-                                        "targeted fine-tune" if self.fine_tune else "behavior cloning"
+                "local-bbox DQN + VLM" if (self.local_bbox_dqn and self.use_vlm_select) else (
+                    "local-bbox DQN" if self.local_bbox_dqn else (
+                        "board locator train" if self.board_locator_train else (
+                            "board DQN train" if self.board_dqn_train else (
+                                "board DQN" if self.board_dqn else (
+                                    "residual RL" if self.rl_train else (
+                                        "grid train" if self.grid_train else (
+                                            "locator train" if self.locator_train else (
+                                                "targeted fine-tune" if self.fine_tune else "behavior cloning"
+                                            )
+                                        )
                                     )
                                 )
                             )
@@ -3615,9 +3772,10 @@ class GPUInferenceServer:
                     )
                 )
             )
-            )
         )
         print(f"GPU Server listening on {host}:{port} ({mode_label} mode)")
+        if self.local_bbox_dqn and self.use_vlm_select:
+            print(f"   VLM select: model={self.vlm_model} url={self.ollama_url}")
         if self.local_grid and not self.grid_train:
             print(f"   Local grid inference enabled (locator + Q-cell → geometry)")
         if self.geo_grasp and not self.locator_train and not self.local_grid:
@@ -3751,6 +3909,12 @@ if __name__ == "__main__":
                         help='Local-bbox DQN checkpoint for R1')
     parser.add_argument('--local-bbox-model-r2', type=str, default=None,
                         help='Local-bbox DQN checkpoint for R2')
+    parser.add_argument('--use-vlm-select', action='store_true',
+                        help='With --local-bbox-dqn: Ollama VLM picks box via point on warp')
+    parser.add_argument('--vlm-model', type=str, default=None,
+                        help=f'Ollama model name (default {DEFAULT_VLM_MODEL})')
+    parser.add_argument('--ollama-url', type=str, default=None,
+                        help=f'Ollama base URL (default {DEFAULT_OLLAMA_URL})')
     parser.add_argument('--rl-train', action='store_true',
                         help='TD3 residual RL fine-tune (BC frozen; separate RL checkpoints)')
     parser.add_argument('--rl-train-config', type=str, default=None,
@@ -3760,6 +3924,15 @@ if __name__ == "__main__":
     parser.add_argument('--rl-residual-r2', type=str, default=None,
                         help='RL residual checkpoint for R2')
     args   = parser.parse_args()
+
+    # Default bare launch: local-bbox DQN inference (THIS ONE checkpoint via config).
+    if not any((
+        args.fine_tune, args.locator_train, args.geo_grasp, args.grid_train,
+        args.local_grid, args.board_dqn_train, args.board_dqn,
+        args.board_locator_train, args.board_locator, args.yolo_locator_test,
+        args.local_bbox_dqn, args.local_bbox_dqn_train, args.rl_train,
+    )):
+        args.local_bbox_dqn = True
 
     if args.rl_train and args.fine_tune:
         parser.error('Use either --rl-train or --fine-tune, not both.')
@@ -3827,6 +4000,10 @@ if __name__ == "__main__":
         parser.error('Use either --yolo-locator-test or --local-grid, not both.')
     if args.local_bbox_dqn_train and args.local_bbox_dqn:
         parser.error('Use --local-bbox-dqn-train for training; --local-bbox-dqn is inference only.')
+    if args.use_vlm_select and not args.local_bbox_dqn:
+        parser.error('--use-vlm-select requires --local-bbox-dqn.')
+    if args.use_vlm_select and args.local_bbox_dqn_train:
+        parser.error('--use-vlm-select is inference-only (not with --local-bbox-dqn-train).')
     if args.local_bbox_dqn and args.board_dqn:
         parser.error('Use either --local-bbox-dqn or --board-dqn, not both.')
     if args.local_bbox_dqn and args.yolo_locator_test:
@@ -3869,6 +4046,9 @@ if __name__ == "__main__":
         local_bbox_dqn_config_path=args.local_bbox_dqn_config,
         local_bbox_model_path=args.local_bbox_model,
         local_bbox_model_path_r2=args.local_bbox_model_r2,
+        use_vlm_select=args.use_vlm_select,
+        vlm_model=args.vlm_model,
+        ollama_url=args.ollama_url,
         rl_train=args.rl_train,
         rl_train_config_path=args.rl_train_config,
         rl_residual_r1=args.rl_residual_r1,
