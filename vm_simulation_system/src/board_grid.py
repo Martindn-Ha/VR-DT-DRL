@@ -1,7 +1,5 @@
 """Full-board fixed grid for Gomes-style DQN (world XZ meters, 112×112)."""
 
-from __future__ import annotations
-
 import math
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple, Union

@@ -1,7 +1,5 @@
 """Projective board warp and grid↔world mapping (Gomes paper style)."""
 
-from __future__ import annotations
-
 from functools import lru_cache
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -137,9 +135,11 @@ def _legacy_image_corner_order(img_corners: np.ndarray) -> np.ndarray:
 
 
 def _default_corner_permutation(robot_id: int) -> Optional[List[int]]:
-    """Map yaml visual [TL, BL, TR, BR] → grid [x_min,z_max | x_max,z_max | x_min,z_min | x_max,z_min]."""
+    """Map yaml visual [TL, BL, TR, BR] → src order for _warp_dst_corners."""
     if int(robot_id) == 1:
         return [0, 2, 1, 3]
+    if int(robot_id) == 2:
+        return [3, 1, 2, 0]
     return None
 
 
