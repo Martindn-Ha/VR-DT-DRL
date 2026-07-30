@@ -1685,8 +1685,8 @@ class SimulationClient:
         try:
             with self.connection_lock:
                 self.host_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                # VLM inference can exceed 30s; keep a longer recv timeout when enabled.
-                self.host_socket.settimeout(120.0 if self.use_vlm_select else 30.0)
+                # VLM/Ollama can exceed 60s; recv must outlast vlm_box_selector DEFAULT_TIMEOUT_S.
+                self.host_socket.settimeout(240.0 if self.use_vlm_select else 30.0)
                 self.host_socket.connect((host_ip, host_port))
                 self.connected = True
             rospy.loginfo(f"Connected to GPU server at {host_ip}:{host_port}")

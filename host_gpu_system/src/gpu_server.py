@@ -385,6 +385,14 @@ class GPUInferenceServer:
                 x1, y1, x2, y2 = [int(round(v)) for v in yolo_bbox]
                 cv2.rectangle(vis_bgr, (x1, y1), (x2, y2), (0, 128, 255), 2)
 
+            if meta and meta.get('yolo_bboxes_px'):
+                try:
+                    for box in meta['yolo_bboxes_px']:
+                        x1, y1, x2, y2 = [int(round(v)) for v in box[:4]]
+                        cv2.rectangle(vis_bgr, (x1, y1), (x2, y2), (0, 128, 255), 2)
+                except Exception:
+                    pass
+
             if window_xyxy is not None:
                 wx1, wy1, wx2, wy2 = [int(v) for v in window_xyxy]
                 cv2.rectangle(vis_bgr, (wx1, wy1), (wx2, wy2), (255, 0, 255), 2)
@@ -564,11 +572,23 @@ class GPUInferenceServer:
         }
 
     def _warp_preview_ready(self, full_message: Dict) -> Dict:
-        """Warp + save board_warp debug, then wait for client instruction."""
+        """Warp + YOLO boxes on board_warp debug, then wait for client instruction."""
         robot_id = int(full_message.get('robot_id', 1))
         camera_data = full_message['data']
         rgb_w = self._warp_rgb_for_debug(camera_data, robot_id)
         instruction = str(full_message.get('instruction') or '').strip()
+        yolo_boxes_px = []
+        n_raw = 0
+        if self.yolo_client is not None:
+            try:
+                boxes, raw = self.yolo_client.detect_bboxes(rgb_w)
+                n_raw = len((raw or {}).get('predictions') or [])
+                yolo_boxes_px = [
+                    [float(b.x1), float(b.y1), float(b.x2), float(b.y2), float(b.confidence)]
+                    for b in boxes
+                ]
+            except Exception as exc:
+                print(f"[WARP PREVIEW R{robot_id}] YOLO failed: {exc}", flush=True)
         try:
             self._save_board_debug_overlay(
                 rgb_w, robot_id, cnn_cell=None, teacher_cell=None,
@@ -576,6 +596,9 @@ class GPUInferenceServer:
                     'mode': 'warp_preview',
                     'instruction': instruction or None,
                     'awaiting_instruction': True,
+                    'yolo_bboxes_px': yolo_boxes_px,
+                    'yolo_detections_raw': n_raw,
+                    'yolo_miss': len(yolo_boxes_px) == 0,
                 },
             )
         except Exception as exc:
@@ -584,6 +607,7 @@ class GPUInferenceServer:
             'type': 'warp_ready',
             'robot_id': robot_id,
             'timestamp': time.time(),
+            'yolo_box_count': len(yolo_boxes_px),
         }
 
     def _warp_rgb_depth_pair(self, camera_data: Dict, robot_id: int) -> Tuple[np.ndarray, np.ndarray]:
@@ -643,69 +667,72 @@ class GPUInferenceServer:
         vlm_raw = None
 
         rgb_w, depth_w = self._warp_rgb_depth_pair(camera_data, robot_id)
-        try:
-            if use_vlm:
-                if not instruction:
-                    return {
-                        'type': 'error',
-                        'message': 'VLM select requires non-empty instruction',
-                        'outcome_class': 'vlm_select_failed',
-                    }
+        if use_vlm:
+            if not instruction:
+                return {
+                    'type': 'error',
+                    'message': 'VLM select requires non-empty instruction',
+                    'outcome_class': 'vlm_select_failed',
+                }
+            try:
                 boxes, raw_result = self.yolo_client.detect_bboxes(rgb_w)
-                if not boxes:
-                    try:
-                        self._save_board_debug_overlay(
-                            rgb_w, robot_id, cnn_cell=None, teacher_cell=None,
-                            meta={
-                                'mode': 'local_bbox_dqn', 'yolo_miss': True,
-                                'instruction': instruction,
-                            },
-                        )
-                    except Exception:
-                        pass
-                    return {
-                        'type': 'error',
-                        'message': 'No valid YOLO bbox for local-bbox DQN',
-                        'yolo_raw': raw_result,
-                    }
+            except Exception as exc:
+                return {'type': 'error', 'message': f'YOLO inference failed: {exc}'}
+            if not boxes:
                 try:
-                    sel = select_bbox_by_vlm_point(
-                        rgb_w, instruction, boxes,
-                        ollama_url=self.ollama_url,
-                        model=self.vlm_model,
+                    self._save_board_debug_overlay(
+                        rgb_w, robot_id, cnn_cell=None, teacher_cell=None,
+                        meta={
+                            'mode': 'local_bbox_dqn', 'yolo_miss': True,
+                            'instruction': instruction,
+                        },
                     )
-                except VlmUnavailableError as exc:
-                    return {
-                        'type': 'error',
-                        'message': f'vlm_unavailable: {exc}',
-                        'outcome_class': 'vlm_unavailable',
-                        'yolo_raw': raw_result,
-                    }
-                except VlmSelectFailedError as exc:
-                    try:
-                        self._save_board_debug_overlay(
-                            rgb_w, robot_id, cnn_cell=None, teacher_cell=None,
-                            meta={
-                                'mode': 'local_bbox_dqn',
-                                'instruction': instruction,
-                                'vlm_fail': str(exc),
-                            },
-                        )
-                    except Exception:
-                        pass
-                    return {
-                        'type': 'error',
-                        'message': f'vlm_select_failed: {exc}',
-                        'outcome_class': 'vlm_select_failed',
-                        'yolo_raw': raw_result,
-                    }
-                bbox = sel.bbox
-                vlm_point_uv = list(sel.point_uv)
-                vlm_raw = sel.raw_text
-            else:
+                except Exception:
+                    pass
+                return {
+                    'type': 'error',
+                    'message': 'No valid YOLO bbox for local-bbox DQN',
+                    'yolo_raw': raw_result,
+                }
+            try:
+                sel = select_bbox_by_vlm_point(
+                    rgb_w, instruction, boxes,
+                    ollama_url=self.ollama_url,
+                    model=self.vlm_model,
+                )
+            except VlmUnavailableError as exc:
+                return {
+                    'type': 'error',
+                    'message': f'vlm_unavailable: {exc}',
+                    'outcome_class': 'vlm_unavailable',
+                    'yolo_raw': raw_result,
+                }
+            except VlmSelectFailedError as exc:
+                try:
+                    self._save_board_debug_overlay(
+                        rgb_w, robot_id, cnn_cell=None, teacher_cell=None,
+                        meta={
+                            'mode': 'local_bbox_dqn',
+                            'instruction': instruction,
+                            'vlm_fail': str(exc),
+                        },
+                    )
+                except Exception:
+                    pass
+                return {
+                    'type': 'error',
+                    'message': f'vlm_select_failed: {exc}',
+                    'outcome_class': 'vlm_select_failed',
+                    'yolo_raw': raw_result,
+                }
+            bbox = sel.bbox
+            vlm_point_uv = list(sel.point_uv)
+            vlm_raw = sel.raw_text
+        else:
+            try:
                 bbox, raw_result = self.yolo_client.detect_bbox(rgb_w)
-        except Exception as exc:
-            return {'type': 'error', 'message': f'YOLO inference failed: {exc}'}
+            except Exception as exc:
+                return {'type': 'error', 'message': f'YOLO inference failed: {exc}'}
 
         if bbox is None:
             try:

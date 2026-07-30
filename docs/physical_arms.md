@@ -220,13 +220,19 @@ python src\gpu_server.py --local-bbox-dqn
 
 ### Pick by typed instruction (optional)
 
-Needs Ollama on Windows with `qwen3-vl:8b-instruct`.
+Needs Ollama on Windows with `qwen3-vl:8b-instruct`. Use **one** `gpu_server` only (extra copies on port `8888` cause confusing VLM failures).
 
 ```powershell
 cd host_gpu_system
 .\venv\Scripts\Activate.ps1
+# Confirm the model is installed and loaded before starting the server:
+ollama list
+ollama run qwen3-vl:8b-instruct "say ok"
+ollama ps
 python src\gpu_server.py --local-bbox-dqn --use-vlm-select --vlm-model qwen3-vl:8b-instruct
 ```
+
+The server prints `VLM select: model=qwen3-vl:8b-instruct` — that name must appear in `ollama list`.
 
 ---
 
@@ -285,6 +291,9 @@ rostopic hz /camera/color/image_raw
 | Gripper topics up but no motion | `gFLT` / `gSTA` wrong — run reset + activate again |
 | `/tmp/ttyUR` missing | Fix driver + External Control Play first |
 | Robot “compile error” | Power-cycle the robot controller; restart driver with the correct `reverse_ip` |
+| `vlm_unavailable` / Ollama `HTTP 404` | Almost always wrong or missing model, or a **stale second `gpu_server`**. On Windows: `ollama list` must show `qwen3-vl:8b-instruct`; `ollama ps` should list it after warmup. Kill every old server (`Get-Process python` / Task Manager), confirm nothing listens on `8888`, start **one** `gpu_server` with `--vlm-model qwen3-vl:8b-instruct`, then **Ctrl+C and relaunch** the VM client so it reconnects. |
+| `vlm_unavailable` / Ollama timeout | First vision call is slow if the model is cold. Run `ollama run qwen3-vl:8b-instruct "say ok"` first; keep only one VLM model installed. |
+| `vlm_select_failed` (point too far / NONE) | Check `host_gpu_system/debug/board_warp_r1_latest.jpg`; rephrase with a clear place cue (`left`, `Q2`, `bottom right`). |
 
 Reset stuck drivers:
 

@@ -6,6 +6,7 @@ import base64
 import json
 import math
 import re
+import socket
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
@@ -17,8 +18,8 @@ import numpy as np
 from yolo_locator import BBox
 
 DEFAULT_OLLAMA_URL = "http://127.0.0.1:11434"
-DEFAULT_VLM_MODEL = "qwen3-vl:8b"
-DEFAULT_TIMEOUT_S = 60.0
+DEFAULT_VLM_MODEL = "qwen3-vl:8b-instruct"
+DEFAULT_TIMEOUT_S = 180.0
 
 _SYSTEM_PROMPT = """You select a block on a top-down warped board image.
 Left/right/top/bottom mean sides of THIS image.
@@ -61,12 +62,17 @@ def nearest_bbox(
     point_uv: Tuple[float, float],
     boxes: Sequence[BBox],
     *,
-    min_floor_px: float = 8.0,
+    min_floor_px: float = 24.0,
 ) -> Tuple[BBox, float]:
     """Pick box with nearest center. Raises VlmSelectFailedError if too far."""
     if not boxes:
         raise VlmSelectFailedError("no YOLO boxes for nearest match")
     u, v = point_uv
+    # Prefer any box that contains the point.
+    for b in boxes:
+        if b.contains(u, v):
+            cx, cy = _bbox_center(b)
+            return b, float(math.hypot(u - cx, v - cy))
     best: Optional[BBox] = None
     best_d = float("inf")
     for b in boxes:
@@ -76,7 +82,8 @@ def nearest_bbox(
             best_d = d
             best = b
     assert best is not None
-    thresh = max(min_floor_px, _bbox_half_diag(best))
+    # Allow ~2x half-diagonal — VLM points are often slightly off YOLO centers.
+    thresh = max(min_floor_px, 2.0 * _bbox_half_diag(best))
     if best_d > thresh:
         raise VlmSelectFailedError(
             f"point ({u:.1f},{v:.1f}) too far from nearest box "
@@ -153,7 +160,7 @@ def _ollama_chat(
     body = {
         "model": model,
         "stream": False,
-        "think": False,
+        "keep_alive": "60m",
         "messages": [
             {"role": "system", "content": system},
             {
@@ -175,10 +182,19 @@ def _ollama_chat(
     try:
         with urllib.request.urlopen(req, timeout=float(timeout_s)) as resp:
             payload = json.loads(resp.read().decode("utf-8"))
+    except (TimeoutError, socket.timeout) as exc:
+        raise VlmUnavailableError(f"Ollama timeout after {timeout_s}s") from exc
+    except urllib.error.HTTPError as exc:
+        detail = ""
+        try:
+            detail = exc.read().decode("utf-8", errors="replace")[:300]
+        except Exception:
+            detail = ""
+        raise VlmUnavailableError(
+            f"Ollama HTTP {exc.code} for model={model!r}: {detail or exc.reason}"
+        ) from exc
     except urllib.error.URLError as exc:
         raise VlmUnavailableError(f"Ollama request failed: {exc}") from exc
-    except TimeoutError as exc:
-        raise VlmUnavailableError(f"Ollama timeout after {timeout_s}s") from exc
 
     msg = payload.get("message") or {}
     content = msg.get("content")

@@ -81,7 +81,7 @@ Example with manual placement: replace `--phase 5` with `--free`.
 
 Use this when there are several blocks and you want to say which one (for example “yellow bottom right”).
 
-You need [Ollama](https://ollama.com) on this PC with model `qwen3-vl:8b-instruct`.
+You need [Ollama](https://ollama.com) on this PC with model `qwen3-vl:8b-instruct`. Run only **one** `gpu_server`. Warm the model first (`ollama run qwen3-vl:8b-instruct "say ok"`).
 
 ### Terminal 1 — AI program
 
@@ -125,3 +125,5 @@ Use the log file name you actually produced under `data/`.
 | Robot not connected | Webots must be **Play** before Terminal 2 |
 | Client exits right away | Start Terminal 1 (AI) first |
 | No block found | Check models are under `host_gpu_system/models/` |
+| `vlm_unavailable` / Ollama `HTTP 404` | Stale extra `gpu_server` or wrong model name. Kill all old servers, start one with `--vlm-model qwen3-vl:8b-instruct`, restart the client. `ollama list` must show that model. |
+| `vlm_unavailable` / timeout | Cold Ollama load — run `ollama run qwen3-vl:8b-instruct "say ok"` first. |
