@@ -135,6 +135,8 @@ ROS_NAMESPACE=ur3e_robot1 rosrun robotiq_2f_gripper_control \
   Robotiq2FGripperRtuNode.py /tmp/ttyUR __name:=gripper_node
 ```
 
+This command is flaky — it sometimes fails to stay up or talk to the gripper. If it dies or gripper topics never appear, stop it and run the same command again. A few retries is normal. The `SyntaxWarning` about `queue_size` is harmless and not a failure.
+
 ### Reset and activate (required)
 
 Use a **new terminal** (source ROS first). Stream with `-r 10` (not a one-shot publish).
@@ -282,6 +284,7 @@ rostopic hz /camera/color/image_raw
 | Pendant “connection refused” | Driver not running, or Host IP / port `50002` wrong |
 | “Connection dropped” looping | Kill old drivers; re-check `src` IP; only one robot-network card; start client later |
 | Launch file not found | Run Step 4 (source ROS) again |
+| Gripper node exits / no gripper topics | Re-run `Robotiq2FGripperRtuNode.py` — flaky; retries are normal |
 | Gripper topics up but no motion | `gFLT` / `gSTA` wrong — run reset + activate again |
 | `/tmp/ttyUR` missing | Fix driver + External Control Play first |
 | Robot “compile error” | Power-cycle the robot controller; restart driver with the correct `reverse_ip` |
