@@ -24,7 +24,7 @@ Goals:
 
 ## 3. Research methodology
 
-- **Detector:** YOLOv8n trained to localize the block in the board view
+- **Detector:** YOLOv26n trained to localize the block in the board view
 - **Grasp policy:** Dual-MobileNetV2 DQN (RGB + depth) with ε-greedy exploration; selects a grasp cell in a local window around the detection
 - **Hardware:** UR3e cobot, Intel RealSense D455, LulzBot TAZ Workhorse print bed; oblique camera view is warped to a top-down board image before perception
 
