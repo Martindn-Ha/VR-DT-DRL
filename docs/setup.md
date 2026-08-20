@@ -68,7 +68,7 @@ These are **not on GitHub**. Download them from **Box** and place them under `ho
 
 | File | What it is |
 |------|------------|
-| `best.pt` | Finds the block in the camera image |
+| `yolo26n.pt` | Finds the block in the camera image |
 | `R1_local_bbox_dqn.pth` | Grasp policy for robot 1 |
 | `R2_local_bbox_dqn.pth` | Grasp policy for robot 2 (dual-arm only) |
 
