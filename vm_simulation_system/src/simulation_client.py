@@ -2,9 +2,8 @@
 """
 VM Simulation Client for UR3e System
 
-This module handles the simulation and real-world execution of a UR3e robotic arm.
-It manages network communications, state tracking, domain randomization, and an
-automated curriculum for reinforcement learning.
+Simulation and real-world execution for local-bbox DQN train/infer, VLM select,
+and YOLO-locator-test grasp modes.
 """
 
 import socket
@@ -26,33 +25,16 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple, Any
 
 from failure_taxonomy import classify_outcome, is_clamp_limited
-from rl_reward import load_rl_train_config, get_robot_rl_config, calculate_rl_reward
-from spawn_geometry import (
-    load_fine_tune_config,
-    load_locator_train_config,
-    load_board_locator_train_config,
-    pick_random_weak_cell,
-    quadrant_from_spawn,
-    sample_spawn_in_phase_quadrant,
-)
+from spawn_geometry import quadrant_from_spawn
 from grasp_geometry import (
     compute_grasp_pose_from_object_world,
     fallback_grasp_pose,
     ROBOT_GEOMETRY,
 )
 from local_grid import (
-    calculate_grid_reward,
     calculate_local_bbox_center_reward,
     cell_to_world,
-    grid_params,
-    load_grid_train_config,
-    teacher_grasp_xy,
     world_to_cell,
-)
-from board_grid import (
-    calculate_board_reward,
-    load_board_dqn_config,
-    world_to_board_cell,
 )
 from collections import deque
 
@@ -623,42 +605,22 @@ class SimulationClient:
     def __init__(self, config_path: str = "config/network_config.yaml",
                  mode: str = 'inference', real_robot: bool = False,
                  robot_id: int = 1, ros_camera: bool = False,
-                 use_residual: bool = False, use_geo_grasp: bool = False,
-                 use_local_grid: bool = False,
-                 use_board_dqn: bool = False,
-                 use_board_locator: bool = False,
                  use_yolo_locator_test: bool = False,
-                 use_yolo_fuse: bool = False,
                  use_local_bbox_dqn: bool = False,
                  use_vlm_select: bool = False,
                  no_workspace_clamp: bool = False,
-                 rl_train_config_path: Optional[str] = None,
-                 grid_config_path: Optional[str] = None,
-                 board_config_path: Optional[str] = None,
-                 board_locator_config_path: Optional[str] = None,
                  local_bbox_config_path: Optional[str] = None):
         
         self.mode       = mode
         self.real_robot = real_robot
         self.robot_id   = robot_id   
         self.ros_camera = ros_camera 
-        self.use_residual = use_residual
-        self.use_geo_grasp = use_geo_grasp
-        self.use_local_grid = use_local_grid
-        self.use_board_dqn = use_board_dqn
-        self.use_board_locator = use_board_locator
         self.use_yolo_locator_test = use_yolo_locator_test
-        self.use_yolo_fuse = use_yolo_fuse
         self.use_local_bbox_dqn = use_local_bbox_dqn
         self.use_vlm_select = use_vlm_select
         self.no_workspace_clamp = no_workspace_clamp
         self._pending_vlm_instruction: Optional[str] = None
-        self._rl_reward_cfg: Dict[str, Any] = {}
-        self._grid_reward_cfg: Dict[str, Any] = {}
-        self._board_reward_cfg: Dict[str, Any] = {}
         self._local_bbox_reward_cfg: Dict[str, Any] = {}
-        self._grid_phase: str = 'shaping'
-        self._board_phase: str = 'shaping'
         # Solo R2: True so scene domain rand runs like R1 solo. Dual-arm: R1 owns it.
         self._owns_domain_rand = (robot_id == 1)
         self.config     = self._load_config(config_path)
@@ -695,27 +657,12 @@ class SimulationClient:
         self._cycle_phase             = self._cycle_phases[0]
         self._cycle_count_in_phase    = 0
 
-        self._fine_tune_cfg           = None
-        self._fine_tune_weak_regions  = {}
-        self._fine_tune_weak_spawn_p  = 0.7
         self._fine_tune_demo_bucket   = ''
         self._fine_tune_spawn_phase   = 0
         self._fine_tune_spawn_collection = ''
         self._fine_tune_spawn_quadrant = 0
-        if mode == 'fine_tune':
-            self._load_fine_tune_settings()
-        if mode == 'locator_train':
-            self._load_locator_train_settings()
-        if mode == 'grid_train':
-            self._load_grid_train_settings(grid_config_path)
-        if mode == 'board_dqn_train':
-            self._load_board_train_settings(board_config_path)
-        if mode == 'board_locator_train':
-            self._load_board_locator_train_settings(board_locator_config_path)
         if mode == 'local_bbox_dqn_train':
             self._load_local_bbox_train_settings(local_bbox_config_path)
-        if mode == 'rl_train':
-            self._load_rl_train_settings(rl_train_config_path)
 
         self._episode_log_dir = VR_DRL_DATA_DIR
         self._episode_xlsx_path = None
@@ -770,60 +717,12 @@ class SimulationClient:
                     "(--robot-id 1) or Webots may not step the simulation."
                 )
 
-    def _load_fine_tune_settings(self, config_path: Optional[str] = None):
-        path = config_path or str(
-            VR_DRL_DATA_DIR.parent / "host_gpu_system" / "config" / "fine_tune_config.yaml"
-        )
-        self._fine_tune_cfg = load_fine_tune_config(path)
-        self._fine_tune_weak_regions = self._fine_tune_cfg['_weak_regions_parsed']
-        self._fine_tune_weak_spawn_p = float(
-            self._fine_tune_cfg.get('collection', {}).get('weak_spawn_probability', 0.7)
-        )
-        print(
-            f"[FINE-TUNE R{self.robot_id}] weak_spawn_p={self._fine_tune_weak_spawn_p:.0%} | "
-            f"weak cells={self._fine_tune_weak_regions.get(self.robot_id, [])}"
-        )
-
-    def _load_locator_train_settings(self, config_path: Optional[str] = None):
-        path = config_path or str(
-            VR_DRL_DATA_DIR.parent / "host_gpu_system" / "config" / "locator_train_config.yaml"
-        )
-        cfg = load_locator_train_config(path)
-        self._fine_tune_cfg = cfg
-        self._fine_tune_weak_regions = cfg['_weak_regions_parsed']
-        self._fine_tune_weak_spawn_p = float(
-            cfg.get('collection', {}).get('weak_spawn_probability', 0.7)
-        )
-        print(
-            f"[LOCATOR-TRAIN R{self.robot_id}] weak_spawn_p={self._fine_tune_weak_spawn_p:.0%} | "
-            f"weak cells={self._fine_tune_weak_regions.get(self.robot_id, [])}"
-        )
-
-    def _load_grid_train_settings(self, config_path: Optional[str] = None):
-        path = config_path or str(
-            VR_DRL_DATA_DIR.parent / "host_gpu_system" / "config" / "grid_train_config.yaml"
-        )
-        cfg = load_grid_train_config(path)
-        self._fine_tune_cfg = cfg
-        self._fine_tune_weak_regions = cfg['_weak_regions_parsed']
-        self._fine_tune_weak_spawn_p = float(
-            cfg.get('collection', {}).get('weak_spawn_probability', 0.7)
-        )
-        self._grid_reward_cfg = cfg.get('reward', {})
-        print(
-            f"[GRID-TRAIN R{self.robot_id}] weak_spawn_p={self._fine_tune_weak_spawn_p:.0%} | "
-            f"weak cells={self._fine_tune_weak_regions.get(self.robot_id, [])}"
-        )
-
     def _load_local_bbox_train_settings(self, config_path: Optional[str] = None):
         path = Path(config_path) if config_path else (
             VR_DRL_DATA_DIR.parent / "host_gpu_system" / "config" / "local_bbox_dqn_config.yaml"
         )
         with open(path, encoding="utf-8") as f:
             cfg = yaml.safe_load(f) or {}
-        self._fine_tune_cfg = cfg
-        self._fine_tune_weak_regions = {}
-        self._fine_tune_weak_spawn_p = 0.0
         self._local_bbox_reward_cfg = cfg.get('reward', {})
         self._local_bbox_n = int(cfg.get('grid', {}).get('n', 20))
         self._local_bbox_window_m = float(cfg.get('grid', {}).get('window_m', 0.02))
@@ -833,89 +732,10 @@ class SimulationClient:
             flush=True,
         )
 
-    def _load_board_train_settings(self, config_path: Optional[str] = None):
-        path = config_path or str(
-            VR_DRL_DATA_DIR.parent / "host_gpu_system" / "config" / "board_dqn_config.yaml"
-        )
-        cfg = load_board_dqn_config(path)
-        self._fine_tune_cfg = cfg
-        self._fine_tune_weak_regions = cfg['_weak_regions_parsed']
-        self._fine_tune_weak_spawn_p = float(
-            cfg.get('collection', {}).get('weak_spawn_probability', 0.7)
-        )
-        g = cfg.get('grid', {})
-        self._board_reward_cfg = {
-            'grasp_reward': float(g.get('grasp_reward', 1.0)),
-            'reward_dist_m': float(g.get('reward_dist_m', 0.02)),
-        }
-        print(
-            f"[BOARD-DQN R{self.robot_id}] weak_spawn_p={self._fine_tune_weak_spawn_p:.0%} | "
-            f"112x112 full board"
-        )
-
-    def _load_board_locator_train_settings(self, config_path: Optional[str] = None):
-        path = config_path or str(
-            VR_DRL_DATA_DIR.parent / "host_gpu_system" / "config" / "board_locator_train_config.yaml"
-        )
-        cfg = load_board_locator_train_config(path)
-        self._fine_tune_cfg = cfg
-        self._fine_tune_weak_regions = cfg['_weak_regions_parsed']
-        self._fine_tune_weak_spawn_p = float(
-            cfg.get('collection', {}).get('weak_spawn_probability', 0.7)
-        )
-        print(
-            f"[BOARD-LOC R{self.robot_id}] weak_spawn_p={self._fine_tune_weak_spawn_p:.0%} | "
-            f"warp seg labels from spawn XZ"
-        )
-
-    def _is_grid_train(self) -> bool:
-        return self.mode == 'grid_train'
-
-    def _is_board_dqn_train(self) -> bool:
-        return self.mode == 'board_dqn_train'
-
-    def _is_board_locator_train(self) -> bool:
-        return self.mode == 'board_locator_train'
-
     def _is_local_bbox_dqn_train(self) -> bool:
         return self.mode == 'local_bbox_dqn_train'
 
-    def _log_grid_result(self, robot_id: int, line: str) -> None:
-        print()
-        print(line)
-        print()
-
-    def _log_board_result(self, robot_id: int, line: str) -> None:
-        print()
-        print(line)
-        print()
-
-    def _load_rl_train_settings(self, config_path: Optional[str] = None):
-        path = config_path or str(
-            VR_DRL_DATA_DIR.parent / "host_gpu_system" / "config" / "rl_train_config.yaml"
-        )
-        rl_cfg = load_rl_train_config(path)
-        self._rl_reward_cfg = get_robot_rl_config(rl_cfg, self.robot_id)
-        rw = self._rl_reward_cfg.get('reward', {})
-        print(
-            f"[RL-TRAIN R{self.robot_id}] reward weights loaded from {path} | "
-            f"w_dist={rw.get('w_dist')} w_lift={rw.get('w_lift')} "
-            f"w_miss={rw.get('w_miss')} w_corr={rw.get('w_corr')}"
-        )
-
     def _episode_log_stem(self) -> str:
-        if self.mode == 'rl_train':
-            return f"episode_log_r{self.robot_id}_rl_train"
-        if self.mode == 'fine_tune':
-            return f"episode_log_r{self.robot_id}_fine_tune"
-        if self.mode == 'locator_train':
-            return f"episode_log_r{self.robot_id}_locator_train"
-        if self.mode == 'grid_train':
-            return f"episode_log_r{self.robot_id}_grid_train"
-        if self.mode == 'board_dqn_train':
-            return f"episode_log_r{self.robot_id}_board_dqn_train"
-        if self.mode == 'board_locator_train':
-            return f"episode_log_r{self.robot_id}_board_locator_train"
         if self.mode == 'local_bbox_dqn_train':
             return f"episode_log_r{self.robot_id}_local_bbox_dqn_train"
         if self.mode == 'inference' and self.inference_mode == 'phase':
@@ -929,14 +749,6 @@ class SimulationClient:
         print(f"[LOG R{self.robot_id}] XLSX → {self._episode_xlsx_path.resolve()}")
 
     def _episode_log_columns(self) -> List[str]:
-        if self.mode == 'locator_train':
-            return LOCATOR_EPISODE_LOG_COLUMNS
-        if self.mode == 'board_locator_train':
-            return LOCATOR_EPISODE_LOG_COLUMNS
-        if self.mode == 'grid_train':
-            return GRID_EPISODE_LOG_COLUMNS
-        if self.mode == 'board_dqn_train':
-            return BOARD_EPISODE_LOG_COLUMNS
         return EPISODE_LOG_COLUMNS
 
     def _episode_log_xlsx_headers(self) -> List[str]:
@@ -992,19 +804,7 @@ class SimulationClient:
         row['episode']          = self.episode_count
         row['session_episode']  = self.session_episode_count
         row['run_mode']         = self.mode
-        if self.mode == 'locator_train':
-            if row.get('demo_ok') == '':
-                row['demo_ok'] = int(bool(success))
-        elif self.mode == 'grid_train':
-            if row.get('success') == '':
-                row['success'] = int(bool(success))
-        elif self.mode == 'board_dqn_train':
-            if row.get('success') == '':
-                row['success'] = int(bool(success))
-        elif self.mode == 'board_locator_train':
-            if row.get('demo_ok') == '':
-                row['demo_ok'] = int(bool(success))
-        elif self.mode == 'local_bbox_dqn_train':
+        if self.mode == 'local_bbox_dqn_train':
             if row.get('success') == '':
                 row['success'] = int(bool(success))
         else:
@@ -1040,19 +840,12 @@ class SimulationClient:
                         ws.cell(1, col_idx, header)
                 self._write_episode_xlsx_row(ws, row)
                 wb.save(xlsx_path)
-            if not self._is_grid_train():
-                print(f"[LOG R{self.robot_id}] Appended episode {self.episode_count} → {xlsx_path.resolve()}")
+            print(f"[LOG R{self.robot_id}] Appended episode {self.episode_count} → {xlsx_path.resolve()}")
         except Exception as e:
             rospy.logwarn(f"[LOG R{self.robot_id}] Failed to write episode row: {e}")
 
     def _spawn_phase_label(self) -> str:
-        if self.mode == 'fine_tune':
-            return str(self._fine_tune_spawn_phase)
-        if self.mode == 'locator_train':
-            return str(self._fine_tune_spawn_phase)
-        if self.mode == 'grid_train':
-            return str(self._fine_tune_spawn_phase)
-        if self.mode == 'board_locator_train':
+        if self.mode == 'local_bbox_dqn_train':
             return str(self._fine_tune_spawn_phase)
         if self.mode != 'inference':
             return str(self.curriculum.phase)
@@ -1127,262 +920,6 @@ class SimulationClient:
             p = duck_node.getPosition()
             return [float(p[0]), float(p[2])]
         return [0.0, 0.0]
-
-    def _get_teacher_pose_stable(self) -> List[float]:
-        """Teacher grasp from object position without jitter (stable grid labels)."""
-        robot_id = self.robot_id
-        object_def = "TARGET_OBJECT2" if robot_id == 2 else "TARGET_OBJECT"
-        fallback = fallback_grasp_pose(robot_id)
-        try:
-            supervisor = self.webots_bridge.supervisor
-            if hasattr(supervisor, 'supervisor'):
-                supervisor = supervisor.supervisor
-            duck_node = supervisor.getFromDef(object_def)
-            if not duck_node:
-                return fallback
-            d_pos = np.array(duck_node.getPosition())
-            if np.any(np.isnan(d_pos)):
-                return fallback
-            return compute_grasp_pose_from_object_world(
-                float(d_pos[0]), float(d_pos[1]), float(d_pos[2]),
-                robot_id, add_jitter=False,
-            )
-        except Exception as e:
-            rospy.logerr(f"Teacher pose error (R{robot_id}): {e}")
-            return fallback
-
-    def _grid_shaping_collect_and_grasp(
-        self, current_state: Dict, duck_node, node_found: bool, initial_y: float,
-    ):
-        robot_id = self.robot_id
-        teacher_pose = self._get_teacher_pose_stable()
-        tx, tz = teacher_grasp_xy(teacher_pose)
-        obj_pos = self._object_pos_for_locator_label(duck_node)
-        spawn_x_log = self._episode_log_fields.get('spawn_x', '')
-        spawn_z_log = self._episode_log_fields.get('spawn_z', '')
-
-        response = self._send_message_to_host({
-            'type':     'training_data',
-            'source':   'simulation',
-            'robot_id': robot_id,
-            'data':     {
-                'state':            current_state,
-                'mode':             'grid_collect',
-                'object_pos':       obj_pos,
-                'teacher_grasp_x':  tx,
-                'teacher_grasp_z':  tz,
-                'spawn_phase':      self._fine_tune_spawn_phase,
-                'spawn_x':          float(spawn_x_log) if spawn_x_log != '' else 0.0,
-                'spawn_z':          float(spawn_z_log) if spawn_z_log != '' else 0.0,
-                'quadrant':         self._fine_tune_spawn_quadrant,
-                'demo_bucket':      self._fine_tune_demo_bucket,
-                'spawn_collection': self._fine_tune_spawn_collection,
-            },
-        })
-
-        self._episode_log_fields.update({
-            'grasp_mode':     'grid_shaping_collect',
-            'training_phase': 'shaping',
-            'teacher_x_m':    self._fmt_log_float(tx),
-            'teacher_z_m':    self._fmt_log_float(tz),
-            'label_x_m':      self._fmt_log_float(obj_pos[0]),
-            'label_z_m':      self._fmt_log_float(obj_pos[1]),
-            'label_source':   'spawn' if spawn_x_log != '' else 'pre_grasp',
-            'object_found':   int(bool(node_found)),
-        })
-
-        if response and response.get('out_of_window') and not self._is_grid_train():
-            self._episode_log_fields['out_of_window'] = 1
-            print(
-                f"[GRID R{robot_id}] Label out of 4cm window (locator miss) — "
-                f"teacher grasp still runs"
-            )
-        elif response and response.get('out_of_window'):
-            self._episode_log_fields['out_of_window'] = 1
-
-        if response and response.get('type') == 'training_ack':
-            self._grid_phase = str(response.get('grid_phase', 'shaping'))
-            for key, field in (
-                ('teacher_cell', 'teacher_cell'), ('grid_cell', 'grid_cell'),
-                ('grid_center_x', 'grid_center_x'), ('grid_center_z', 'grid_center_z'),
-                ('pred_obj_x', 'pred_obj_x_m'), ('pred_obj_z', 'pred_obj_z_m'),
-                ('locator_err_m', 'locator_err_m'), ('grid_step', 'grid_step_at_pred'),
-            ):
-                val = response.get(key)
-                if val is not None:
-                    self._episode_log_fields[field] = (
-                        str(int(val)) if key in ('teacher_cell', 'grid_cell', 'grid_step')
-                        else self._fmt_log_float(val)
-                    )
-
-        self.robot_controller._closest_approach_dist = 9999.0
-        self.robot_controller._closest_approach_dist_xz = 9999.0
-        self.robot_controller.execute_grasp(teacher_pose)
-        closest_dist = getattr(self.robot_controller, '_closest_approach_dist', 9999.0)
-        closest_dist_xz = getattr(self.robot_controller, '_closest_approach_dist_xz', 9999.0)
-        success = False
-        lift_delta = None
-        if node_found and duck_node:
-            success, lift_delta = self.robot_controller.evaluate_pickup_success(duck_node, initial_y)
-            status = "SUCCESS" if success else "FAIL"
-            lift_str = f"{lift_delta:.4f}" if lift_delta is not None else "n/a"
-            self._log_grid_result(
-                self.robot_id,
-                f"[RESULT R{self.robot_id}] {status}. Lifted {lift_str}m (held={success})",
-            )
-        teacher_cell_val = self._episode_log_fields.get('teacher_cell')
-        teacher_cell = int(teacher_cell_val) if teacher_cell_val not in (None, '') else None
-        reward = calculate_grid_reward(
-            success, lift_delta, closest_dist, self._grid_reward_cfg,
-            grasp_mode="grid_shaping_exec",
-            object_found=int(bool(node_found)),
-            closest_dist_xz_m=closest_dist_xz,
-            cell_action=teacher_cell,
-            teacher_cell=teacher_cell,
-        )
-        xz_log = closest_dist_xz if closest_dist_xz < 9990.0 else closest_dist
-        lift_str = f"{lift_delta:.4f}" if lift_delta is not None else "n/a"
-        print(
-            f"[GRID REWARD R{self.robot_id}] xz_dist={xz_log:.4f} lift={lift_str} "
-            f"cell={teacher_cell} teacher={teacher_cell} → {reward:.4f}"
-        )
-        self._record_grasp_for_log(
-            grasp_mode='grid_shaping_exec', raw_pose=teacher_pose, clamp_pose=teacher_pose,
-            success=success, lift_delta=lift_delta, closest_dist=closest_dist,
-            closest_dist_xz=closest_dist_xz,
-            reward=reward, object_found=node_found,
-        )
-        self._episode_log_fields['success'] = int(bool(success))
-        self._episode_log_fields['reward'] = self._fmt_log_float(reward)
-        self._end_episode_and_restart(success=bool(success))
-
-    def _collect_locator_training_demo(self, current_state: Dict, duck_node, node_found: bool):
-        """Spawn-aligned RGB-D demo for locator_train (no teacher grasp)."""
-        robot_id = self.robot_id
-        self.last_grasp_mode = 'locator_collect'
-        spawn_xz = self._spawn_block_xz()
-        label_source = 'spawn' if spawn_xz is not None else 'pre_grasp'
-        obj_pos = self._object_pos_for_locator_label(duck_node)
-        print(
-            f"[LOCATOR-COLLECT R{robot_id}] label=({obj_pos[0]:.3f}, {obj_pos[1]:.3f}) "
-            f"| source={label_source} | bucket={self._fine_tune_demo_bucket}"
-        )
-
-        demo_sent = 0
-        demo_ok = 0
-        response = None
-
-        if current_state.get('rgb') and self.mode != 'inference':
-            spawn_x_log = self._episode_log_fields.get('spawn_x', '')
-            spawn_z_log = self._episode_log_fields.get('spawn_z', '')
-            train_payload = {
-                'state':      current_state,
-                'action':     [0.0] * 6,
-                'reward':     0.0,
-                'next_state': current_state,
-                'done':       True,
-                'mode':       'locator_collect',
-                'object_pos': obj_pos,
-                'spawn_phase':      self._fine_tune_spawn_phase,
-                'spawn_x':          float(spawn_x_log) if spawn_x_log != '' else 0.0,
-                'spawn_z':          float(spawn_z_log) if spawn_z_log != '' else 0.0,
-                'quadrant':         self._fine_tune_spawn_quadrant,
-                'demo_bucket':      self._fine_tune_demo_bucket,
-                'spawn_collection': self._fine_tune_spawn_collection,
-            }
-            response = self._send_message_to_host({
-                'type':     'training_data',
-                'source':   'simulation',
-                'robot_id': robot_id,
-                'data':     train_payload,
-            })
-            if response and response.get('type') == 'training_ack':
-                demo_sent = 1
-                demo_ok = 1
-
-        locator_fields: Dict[str, Any] = {
-            'grasp_mode':   'locator_collect',
-            'label_x_m':    self._fmt_log_float(obj_pos[0]),
-            'label_z_m':    self._fmt_log_float(obj_pos[1]),
-            'label_source': label_source,
-            'object_found': int(bool(node_found)),
-            'demo_sent':    demo_sent,
-            'demo_ok':      demo_ok,
-        }
-        if response and response.get('type') == 'training_ack':
-            pred_x = response.get('pred_obj_x')
-            pred_z = response.get('pred_obj_z')
-            if pred_x is not None and pred_z is not None:
-                locator_fields['pred_obj_x_m'] = self._fmt_log_float(pred_x)
-                locator_fields['pred_obj_z_m'] = self._fmt_log_float(pred_z)
-            err = response.get('locator_err_m')
-            if err is not None:
-                locator_fields['locator_err_m'] = self._fmt_log_float(err)
-            loc_step = response.get('loc_step')
-            if loc_step is not None:
-                locator_fields['loc_step_at_pred'] = int(loc_step)
-
-        self._episode_log_fields.update(locator_fields)
-        self._end_episode_and_restart(success=bool(demo_ok))
-
-    def _collect_board_locator_training_demo(self, current_state: Dict, duck_node, node_found: bool):
-        """Warp RGB-D + spawn XZ for board_locator_train (no grasp)."""
-        robot_id = self.robot_id
-        self.last_grasp_mode = 'board_locator_collect'
-        spawn_xz = self._spawn_block_xz()
-        label_source = 'spawn' if spawn_xz is not None else 'pre_grasp'
-        obj_pos = self._object_pos_for_locator_label(duck_node)
-        print(
-            f"[BOARD-LOC-COLLECT R{robot_id}] label=({obj_pos[0]:.3f}, {obj_pos[1]:.3f}) "
-            f"| source={label_source} | bucket={self._fine_tune_demo_bucket}"
-        )
-
-        demo_sent = 0
-        demo_ok = 0
-        response = None
-        if current_state.get('rgb') and self.mode != 'inference':
-            spawn_x_log = self._episode_log_fields.get('spawn_x', '')
-            spawn_z_log = self._episode_log_fields.get('spawn_z', '')
-            train_payload = {
-                'state': current_state,
-                'mode': 'board_locator_collect',
-                'object_pos': obj_pos,
-                'spawn_phase': self._fine_tune_spawn_phase,
-                'spawn_x': float(spawn_x_log) if spawn_x_log != '' else 0.0,
-                'spawn_z': float(spawn_z_log) if spawn_z_log != '' else 0.0,
-                'quadrant': self._fine_tune_spawn_quadrant,
-                'demo_bucket': self._fine_tune_demo_bucket,
-                'spawn_collection': self._fine_tune_spawn_collection,
-            }
-            response = self._send_message_to_host({
-                'type': 'training_data',
-                'source': 'simulation',
-                'robot_id': robot_id,
-                'data': train_payload,
-            })
-            if response and response.get('type') == 'training_ack':
-                demo_sent = 1
-                demo_ok = 1
-
-        fields: Dict[str, Any] = {
-            'grasp_mode': 'board_locator_collect',
-            'label_x_m': self._fmt_log_float(obj_pos[0]),
-            'label_z_m': self._fmt_log_float(obj_pos[1]),
-            'label_source': label_source,
-            'object_found': int(bool(node_found)),
-            'demo_sent': demo_sent,
-            'demo_ok': demo_ok,
-        }
-        if response and response.get('type') == 'training_ack':
-            tc = response.get('teacher_cell')
-            if tc is not None:
-                fields['teacher_cell'] = str(int(tc))
-            loc_step = response.get('locator_step')
-            if loc_step is not None:
-                fields['locator_step_at_pred'] = int(loc_step)
-
-        self._episode_log_fields.update(fields)
-        self._end_episode_and_restart(success=bool(demo_ok))
 
     def _compute_lateral_aim_metrics(
         self,
@@ -1552,7 +1089,7 @@ class SimulationClient:
                 new_axis = (rotvec / new_angle).tolist()
             node.getField('rotation').setSFRotation(new_axis + [new_angle])
 
-        if not self._is_grid_train() and not self._is_local_bbox_dqn_train():
+        if not self._is_local_bbox_dqn_train():
             print(f"[CAM RAND R{self.robot_id}] "
                   f"Δxyz=({dx*100:.2f},{dy*100:.2f},{dz*100:.2f}) cm  "
                   f"Δpitch={np.rad2deg(d_pitch):.2f}°  "
@@ -2148,8 +1685,8 @@ class SimulationClient:
         try:
             with self.connection_lock:
                 self.host_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-                # VLM inference can exceed 30s; keep a longer recv timeout when enabled.
-                self.host_socket.settimeout(120.0 if self.use_vlm_select else 30.0)
+                # VLM/Ollama can exceed 60s; recv must outlast vlm_box_selector DEFAULT_TIMEOUT_S.
+                self.host_socket.settimeout(240.0 if self.use_vlm_select else 30.0)
                 self.host_socket.connect((host_ip, host_port))
                 self.connected = True
             rospy.loginfo(f"Connected to GPU server at {host_ip}:{host_port}")
@@ -2195,13 +1732,7 @@ class SimulationClient:
                 'mode':     self.mode,
                 'source':   'real' if self.real_robot else 'simulation',
                 'robot_id': self.robot_id,
-                'use_residual': self.use_residual,
-                'use_geo_grasp': self.use_geo_grasp,
-                'use_local_grid': self.use_local_grid,
-                'use_board_dqn': self.use_board_dqn,
-                'use_board_locator': self.use_board_locator,
                 'use_yolo_locator_test': self.use_yolo_locator_test,
-                'use_yolo_fuse': self.use_yolo_fuse,
                 'use_local_bbox_dqn': self.use_local_bbox_dqn,
                 'use_vlm_select': self.use_vlm_select,
                 'session_episode': self.session_episode_count,
@@ -2211,19 +1742,6 @@ class SimulationClient:
             if spawn_x_log != '' and spawn_z_log != '':
                 payload['spawn_x'] = float(spawn_x_log)
                 payload['spawn_z'] = float(spawn_z_log)
-            if self.episode_active and self.mode == 'board_dqn_train':
-                try:
-                    supervisor = self.webots_bridge.supervisor
-                    if hasattr(supervisor, 'supervisor'):
-                        supervisor = supervisor.supervisor
-                    object_def = "TARGET_OBJECT2" if self.robot_id == 2 else "TARGET_OBJECT"
-                    duck_node = supervisor.getFromDef(object_def)
-                    if duck_node:
-                        dp = duck_node.getPosition()
-                        payload['object_x'] = float(dp[0])
-                        payload['object_z'] = float(dp[2])
-                except Exception:
-                    pass
 
             # VLM: send frame first (no instruction) so GPU saves board_warp_r*_latest.jpg,
             # then prompt after preview is ready.
@@ -2383,35 +1901,6 @@ class SimulationClient:
         object_found: bool,
         lateral_improve: Optional[float] = None,
     ) -> float:
-        if self.mode == 'rl_train':
-            reward_cfg = self._rl_reward_cfg.get('reward', self._rl_reward_cfg)
-            reward = calculate_rl_reward(
-                robot_id=self.robot_id,
-                success=success,
-                closest_dist=closest_dist,
-                lifted_m=lift_delta,
-                delta_x=float(delta[0]),
-                delta_z=float(delta[1]),
-                delta_yaw=float(delta[2]),
-                clamp_limited=bool(clamp_limited),
-                object_found=object_found,
-                reward_cfg=reward_cfg,
-                max_delta=(
-                    float(self._rl_reward_cfg.get('max_delta_x_m', 0.03)),
-                    float(self._rl_reward_cfg.get('max_delta_z_m', 0.03)),
-                    float(self._rl_reward_cfg.get('max_delta_yaw_rad', 0.17)),
-                ),
-                lateral_improve_m=lateral_improve,
-            )
-            align_note = (
-                f" align={lateral_improve:+.4f}m"
-                if lateral_improve is not None else ""
-            )
-            print(
-                f"[RL REWARD R{self.robot_id}] dist={closest_dist:.4f} lift={lift_delta} "
-                f"delta={delta} clamp={clamp_limited}{align_note} → {reward:.4f}"
-            )
-            return reward
         return self._calculate_shaped_reward(success, closest_dist)
 
     def _generate_guided_random_grasp(self) -> List[float]:
@@ -2502,20 +1991,6 @@ class SimulationClient:
                 pre_grasp_obj_pos = [float(dp[0]), float(dp[2])]
             mode = prediction.get('mode', 'unknown')
 
-            if self.mode == 'locator_train':
-                self._collect_locator_training_demo(current_state, duck_node, node_found)
-                return
-
-            if self.mode == 'board_locator_train':
-                self._collect_board_locator_training_demo(current_state, duck_node, node_found)
-                return
-
-            if self.mode == 'grid_train' and mode == 'explore':
-                self._grid_shaping_collect_and_grasp(
-                    current_state, duck_node, node_found, initial_y,
-                )
-                return
-
             residual_delta = [0.0, 0.0, 0.0]
             if mode == 'explore':
                 pose = self._generate_guided_random_grasp()
@@ -2523,58 +1998,7 @@ class SimulationClient:
             else:
                 raw_pose = list(prediction['pose'])
                 residual_delta = list(prediction.get('delta', [0.0, 0.0, 0.0]))
-                if mode == 'exploit_geo':
-                    pred_x = prediction.get('pred_obj_x')
-                    pred_z = prediction.get('pred_obj_z')
-                    print(
-                        f"[GEO GRASP R{robot_id}] pred_obj=({pred_x:.3f}, {pred_z:.3f}) "
-                        f"→ grasp={raw_pose[:3]}…"
-                    )
-                elif mode in ('exploit_grid', 'grid_explore'):
-                    print(
-                        f"[GRID R{robot_id}] cell={prediction.get('grid_cell')} "
-                        f"center=({prediction.get('grid_center_x'):.3f}, "
-                        f"{prediction.get('grid_center_z'):.3f})"
-                    )
-                    self._episode_log_fields['grid_cell'] = str(prediction.get('grid_cell', ''))
-                    self._episode_log_fields['grid_center_x'] = self._fmt_log_float(
-                        prediction.get('grid_center_x'))
-                    self._episode_log_fields['grid_center_z'] = self._fmt_log_float(
-                        prediction.get('grid_center_z'))
-                    if mode == 'grid_explore':
-                        self._episode_log_fields['training_phase'] = 'rl'
-                        eps = prediction.get('epsilon')
-                        if eps is not None:
-                            self._episode_log_fields['epsilon'] = self._fmt_log_float(eps)
-                elif mode in ('exploit_board', 'board_explore'):
-                    print(
-                        f"[BOARD R{robot_id}] cell={prediction.get('board_cell')} "
-                        f"target=({prediction.get('target_x_m'):.3f}, "
-                        f"{prediction.get('target_z_m'):.3f})"
-                    )
-                    self._episode_log_fields['board_cell'] = str(prediction.get('board_cell', ''))
-                    self._episode_log_fields['board_u'] = str(prediction.get('board_u', ''))
-                    self._episode_log_fields['board_v'] = str(prediction.get('board_v', ''))
-                    tc = prediction.get('teacher_cell')
-                    if tc is not None:
-                        self._episode_log_fields['teacher_cell'] = str(int(tc))
-                    self._episode_log_fields['target_x_m'] = self._fmt_log_float(
-                        prediction.get('target_x_m'))
-                    self._episode_log_fields['target_z_m'] = self._fmt_log_float(
-                        prediction.get('target_z_m'))
-                    for q_key in (
-                        'q_teacher', 'q_argmax', 'teacher_rank', 'mass_near_teacher',
-                        'topk_centroid_err_m', 'argmax_err_m',
-                    ):
-                        q_val = prediction.get(q_key)
-                        if q_val is not None:
-                            self._episode_log_fields[q_key] = self._fmt_log_float(q_val)
-                    if mode == 'board_explore':
-                        self._episode_log_fields['training_phase'] = 'shaping'
-                        eps = prediction.get('epsilon')
-                        if eps is not None:
-                            self._episode_log_fields['epsilon'] = self._fmt_log_float(eps)
-                elif mode in ('local_bbox_explore', 'local_bbox_dqn', 'exploit_local_bbox'):
+                if mode in ('local_bbox_explore', 'local_bbox_dqn'):
                     self._episode_log_fields['local_cell'] = str(
                         prediction.get('local_cell', prediction.get('grid_cell', ''))
                     )
@@ -2613,9 +2037,8 @@ class SimulationClient:
                     pose[2] = float(np.clip(pose[2], CLAMP_Z[0], CLAMP_Z[1]))
 
                     if raw_pose[0] != pose[0] or raw_pose[1] != pose[1] or raw_pose[2] != pose[2]:
-                        if not self._is_grid_train():
-                            print(f"[AI CLAMP R{robot_id}] [{raw_pose[0]:.3f},{raw_pose[1]:.3f},{raw_pose[2]:.3f}]"
-                                  f" → [{pose[0]:.3f},{pose[1]:.3f},{pose[2]:.3f}]")
+                        print(f"[AI CLAMP R{robot_id}] [{raw_pose[0]:.3f},{raw_pose[1]:.3f},{raw_pose[2]:.3f}]"
+                              f" → [{pose[0]:.3f},{pose[1]:.3f},{pose[2]:.3f}]")
 
             clamp_xyz = [pose[0], pose[1], pose[2]]
             clamp_limited_flag = bool(
@@ -2639,20 +2062,12 @@ class SimulationClient:
                 status = "SUCCESS" if success else "FAIL"
                 lift_str = f"{lift_delta:.4f}" if lift_delta is not None else "n/a"
                 result_line = f"[RESULT R{robot_id}] {status}. Lifted {lift_str}m (held={success})"
-                if self._is_grid_train():
-                    self._log_grid_result(robot_id, result_line)
-                elif self._is_board_dqn_train():
-                    self._log_board_result(robot_id, result_line)
-                elif not self._is_local_bbox_dqn_train():
+                if not self._is_local_bbox_dqn_train():
                     print(result_line)
                 if lift_delta is not None and not math.isnan(lift_delta):
                     self._nan_reset_pending = False
             else:
-                if self._is_grid_train():
-                    self._log_grid_result(robot_id, f"[RESULT R{robot_id}] FAIL. Object not found.")
-                elif self._is_board_dqn_train():
-                    self._log_board_result(robot_id, f"[RESULT R{robot_id}] FAIL. Object not found.")
-                elif not self._is_local_bbox_dqn_train():
+                if not self._is_local_bbox_dqn_train():
                     print(f"[RESULT R{robot_id}] FAIL. Object not found.")
 
             block_xz = self._spawn_block_xz()
@@ -2660,35 +2075,7 @@ class SimulationClient:
                 duck_node, clamp_xyz, prediction.get('bc_pose'), block_xz=block_xz,
             )
 
-            if self.mode == 'grid_train' and mode == 'grid_explore':
-                spawn_x = float(self._episode_log_fields.get('spawn_x') or 0.0)
-                spawn_z = float(self._episode_log_fields.get('spawn_z') or 0.0)
-                center_x = prediction.get('grid_center_x')
-                center_z = prediction.get('grid_center_z')
-                teacher_cell = None
-                if center_x is not None and center_z is not None:
-                    n, window_m = grid_params(self._fine_tune_cfg)
-                    teacher_cell = world_to_cell(
-                        spawn_x, spawn_z, float(center_x), float(center_z),
-                        n=n, window_m=window_m,
-                    )
-                cell_action = prediction.get('grid_cell')
-                cell_action = int(cell_action) if cell_action is not None else None
-                reward = calculate_grid_reward(
-                    success, lift_delta, closest_dist, self._grid_reward_cfg,
-                    grasp_mode="grid_explore",
-                    object_found=int(bool(node_found)),
-                    closest_dist_xz_m=closest_dist_xz,
-                    cell_action=cell_action,
-                    teacher_cell=teacher_cell,
-                )
-                xz_log = closest_dist_xz if closest_dist_xz < 9990.0 else closest_dist
-                lift_str = f"{lift_delta:.4f}" if lift_delta is not None else "n/a"
-                print(
-                    f"[GRID REWARD R{robot_id}] xz_dist={xz_log:.4f} lift={lift_str} "
-                    f"cell={cell_action} teacher={teacher_cell} → {reward:.4f}"
-                )
-            elif self.mode == 'local_bbox_dqn_train' and mode == 'local_bbox_explore':
+            if self.mode == 'local_bbox_dqn_train' and mode == 'local_bbox_explore':
                 spawn_x = float(self._episode_log_fields.get('spawn_x') or 0.0)
                 spawn_z = float(self._episode_log_fields.get('spawn_z') or 0.0)
                 n_lb = int(getattr(self, '_local_bbox_n', 20))
@@ -2730,18 +2117,6 @@ class SimulationClient:
                     f"[LOCAL-BBOX R{robot_id}] cell={cell_action} "
                     f"teacher={teacher_cell} err={center_err*1000:.1f}mm r={reward:.3f}"
                 )
-            elif self.mode == 'board_dqn_train' and mode == 'board_explore':
-                dist_m = closest_dist_xz if closest_dist_xz < 9990.0 else closest_dist
-                spawn_x = float(self._episode_log_fields.get('spawn_x') or 0.0)
-                spawn_z = float(self._episode_log_fields.get('spawn_z') or 0.0)
-                teacher_cell = world_to_board_cell(spawn_x, spawn_z, robot_id)
-                cell_action = prediction.get('board_cell')
-                cell_action = int(cell_action) if cell_action is not None else None
-                reward = 0.0
-                print(
-                    f"[BOARD R{robot_id}] dist={dist_m:.4f} "
-                    f"cnn_cell={cell_action} teacher={teacher_cell}"
-                )
             else:
                 reward = self._calculate_episode_reward(
                     success, closest_dist, lift_delta, residual_delta,
@@ -2758,35 +2133,6 @@ class SimulationClient:
                 lateral_aim_bc_err=lateral_bc_err,
                 lateral_improve=lateral_improve,
             )
-            if mode == 'exploit_geo':
-                pred_x = prediction.get('pred_obj_x')
-                pred_z = prediction.get('pred_obj_z')
-                if pred_x is not None and pred_z is not None:
-                    self._episode_log_fields['pred_obj_x_m'] = f'{float(pred_x):.6f}'
-                    self._episode_log_fields['pred_obj_z_m'] = f'{float(pred_z):.6f}'
-                    spawn_x_log = self._episode_log_fields.get('spawn_x', '')
-                    spawn_z_log = self._episode_log_fields.get('spawn_z', '')
-                    if spawn_x_log != '' and spawn_z_log != '':
-                        locator_err = math.hypot(
-                            float(pred_x) - float(spawn_x_log),
-                            float(pred_z) - float(spawn_z_log),
-                        )
-                        self._episode_log_fields['locator_err_m'] = f'{locator_err:.6f}'
-                        print(f"[LOCATOR R{robot_id}] err vs spawn center: {locator_err:.4f}m")
-            if mode in ('exploit_grid', 'grid_explore'):
-                pred_x = prediction.get('pred_obj_x')
-                pred_z = prediction.get('pred_obj_z')
-                if pred_x is not None and pred_z is not None:
-                    self._episode_log_fields['pred_obj_x_m'] = f'{float(pred_x):.6f}'
-                    self._episode_log_fields['pred_obj_z_m'] = f'{float(pred_z):.6f}'
-                    spawn_x_log = self._episode_log_fields.get('spawn_x', '')
-                    spawn_z_log = self._episode_log_fields.get('spawn_z', '')
-                    if spawn_x_log != '' and spawn_z_log != '':
-                        locator_err = math.hypot(
-                            float(pred_x) - float(spawn_x_log),
-                            float(pred_z) - float(spawn_z_log),
-                        )
-                        self._episode_log_fields['locator_err_m'] = f'{locator_err:.6f}'
             if lateral_aim_err is not None and self.mode == 'inference':
                 print(
                     f"[AIM R{robot_id}] lateral_err={lateral_aim_err:.4f}m"
@@ -2828,52 +2174,8 @@ class SimulationClient:
                     'mode':       mode,
                     'object_pos': obj_pos,
                 }
-                if self.mode == 'rl_train':
-                    train_payload.update({
-                        'delta':           residual_delta,
-                        'residual_delta':  residual_delta,
-                        'bc_pose':         prediction.get('bc_pose'),
-                        'session_episode': self.session_episode_count,
-                        'clamp_limited':   int(clamp_limited_flag),
-                    })
-                if self.mode == 'fine_tune' or self.mode == 'locator_train' or self.mode == 'grid_train' or self.mode == 'board_dqn_train' or self.mode == 'local_bbox_dqn_train':
-                    spawn_x_log = self._episode_log_fields.get('spawn_x', '')
-                    spawn_z_log = self._episode_log_fields.get('spawn_z', '')
-                    train_payload.update({
-                        'spawn_phase':      self._fine_tune_spawn_phase,
-                        'spawn_x':          float(spawn_x_log) if spawn_x_log != '' else 0.0,
-                        'spawn_z':          float(spawn_z_log) if spawn_z_log != '' else 0.0,
-                        'quadrant':         self._fine_tune_spawn_quadrant,
-                        'demo_bucket':      self._fine_tune_demo_bucket,
-                        'spawn_collection': self._fine_tune_spawn_collection,
-                    })
                 rl_ack = None
-                if self.mode == 'grid_train' and mode == 'grid_explore':
-                    train_payload = {
-                        'state':       current_state,
-                        'next_state':  next_state,
-                        'mode':        'grid_rl',
-                        'reward':      reward,
-                        'done':        True,
-                        'object_pos':  obj_pos,
-                        'cell_action': int(prediction.get('grid_cell', 0)),
-                        'grid_cell':   int(prediction.get('grid_cell', 0)),
-                        'grid_center_x': prediction.get('grid_center_x'),
-                        'grid_center_z': prediction.get('grid_center_z'),
-                        'spawn_phase': self._fine_tune_spawn_phase,
-                        'spawn_x':     float(self._episode_log_fields.get('spawn_x') or 0.0),
-                        'spawn_z':     float(self._episode_log_fields.get('spawn_z') or 0.0),
-                        'quadrant':    self._fine_tune_spawn_quadrant,
-                        'demo_bucket': self._fine_tune_demo_bucket,
-                        'spawn_collection': self._fine_tune_spawn_collection,
-                    }
-                    rl_ack = self._send_message_to_host({
-                        'type':     'training_data',
-                        'source':   'simulation',
-                        'robot_id': robot_id,
-                        'data':     train_payload,
-                    })
-                elif self.mode == 'local_bbox_dqn_train' and mode == 'local_bbox_explore':
+                if self.mode == 'local_bbox_dqn_train' and mode == 'local_bbox_explore':
                     train_payload = {
                         'state':       current_state,
                         'next_state':  next_state,
@@ -2897,26 +2199,17 @@ class SimulationClient:
                         'robot_id': robot_id,
                         'data':     train_payload,
                     })
-                elif self.mode == 'board_dqn_train' and mode == 'board_explore':
-                    train_payload = {
-                        'state':       current_state,
-                        'mode':        'board_collect',
-                        'object_pos':  pre_grasp_obj_pos,
-                        'cnn_cell':    int(prediction.get('board_cell', 0)),
-                        'spawn_phase': self._fine_tune_spawn_phase,
-                        'spawn_x':     float(self._episode_log_fields.get('spawn_x') or 0.0),
-                        'spawn_z':     float(self._episode_log_fields.get('spawn_z') or 0.0),
-                        'quadrant':    self._fine_tune_spawn_quadrant,
-                        'demo_bucket': self._fine_tune_demo_bucket,
+                elif self.mode == 'local_bbox_dqn_train':
+                    spawn_x_log = self._episode_log_fields.get('spawn_x', '')
+                    spawn_z_log = self._episode_log_fields.get('spawn_z', '')
+                    train_payload.update({
+                        'spawn_phase':      self._fine_tune_spawn_phase,
+                        'spawn_x':          float(spawn_x_log) if spawn_x_log != '' else 0.0,
+                        'spawn_z':          float(spawn_z_log) if spawn_z_log != '' else 0.0,
+                        'quadrant':         self._fine_tune_spawn_quadrant,
+                        'demo_bucket':      self._fine_tune_demo_bucket,
                         'spawn_collection': self._fine_tune_spawn_collection,
-                    }
-                    rl_ack = self._send_message_to_host({
-                        'type':     'training_data',
-                        'source':   'simulation',
-                        'robot_id': robot_id,
-                        'data':     train_payload,
                     })
-                else:
                     self._send_message_to_host({
                         'type':     'training_data',
                         'source':   'simulation',
@@ -2925,40 +2218,9 @@ class SimulationClient:
                     })
 
                 if rl_ack and rl_ack.get('type') == 'training_ack':
-                    if self.mode == 'board_dqn_train':
-                        teacher_cell_ack = rl_ack.get('teacher_cell')
-                        if teacher_cell_ack is not None:
-                            self._episode_log_fields['teacher_cell'] = str(int(teacher_cell_ack))
-                        cnn_cell_ack = rl_ack.get('cnn_cell')
-                        if cnn_cell_ack is not None:
-                            self._episode_log_fields['board_cell'] = str(int(cnn_cell_ack))
-                        if rl_ack.get('cnn_correct') is not None:
-                            self._episode_log_fields['cnn_cell_correct'] = int(bool(rl_ack['cnn_correct']))
-                        board_step = rl_ack.get('board_step')
-                        if board_step is not None:
-                            self._episode_log_fields['board_step_at_pred'] = str(int(board_step))
-                    else:
-                        self._episode_log_fields['replay_used'] = int(bool(rl_ack.get('replay_used')))
-                        skip_reason = rl_ack.get('replay_skip_reason') or ''
-                        if skip_reason:
-                            self._episode_log_fields['replay_skip_reason'] = str(skip_reason)
-                        if skip_reason == 'out_of_window':
-                            self._episode_log_fields['out_of_window'] = 1
-                        if (
-                            not rl_ack.get('replay_used')
-                            and not self._is_grid_train()
-                            and not self._is_local_bbox_dqn_train()
-                        ):
-                            print(
-                                f"[GRID R{robot_id}] Replay skipped ({skip_reason or 'filtered'}) — "
-                                f"episode logged only"
-                            )
-                        if rl_ack.get('locator_err_m') is not None:
-                            self._episode_log_fields['locator_err_m'] = self._fmt_log_float(
-                                rl_ack['locator_err_m'])
-                        teacher_cell_ack = rl_ack.get('teacher_cell')
-                        if teacher_cell_ack is not None:
-                            self._episode_log_fields['teacher_cell'] = str(int(teacher_cell_ack))
+                    teacher_cell_ack = rl_ack.get('teacher_cell')
+                    if teacher_cell_ack is not None:
+                        self._episode_log_fields['teacher_cell'] = str(int(teacher_cell_ack))
 
             self._end_episode_and_restart(success)
 
@@ -2974,13 +2236,10 @@ class SimulationClient:
             hypothesis_id="C",
         )
         self.end_current_episode(success)
-        if self.mode != 'locator_train' and self.mode != 'board_locator_train':
-            self.robot_controller.home_position()
-        flush_steps = 20 if self.mode in ('locator_train', 'board_locator_train') else 40
-        self._flush_camera_buffers(steps=flush_steps)
+        self.robot_controller.home_position()
+        self._flush_camera_buffers(steps=40)
 
-        if not self._is_grid_train():
-            print(f"[BARRIER R{self.robot_id}] Waiting for other robot to finish episode...")
+        print(f"[BARRIER R{self.robot_id}] Waiting for other robot to finish episode...")
         _agent_debug_log(
             "simulation_client.py:_end_episode_and_restart:pre_barrier",
             "gpu_barrier_request",
@@ -2993,8 +2252,7 @@ class SimulationClient:
             'robot_id': self.robot_id
         })
         if response and response.get('type') == 'proceed':
-            if not self._is_grid_train():
-                print(f"[BARRIER R{self.robot_id}] Barrier cleared — starting next episode")
+            print(f"[BARRIER R{self.robot_id}] Barrier cleared — starting next episode")
         elif response and response.get('type') == 'error':
             print(
                 f"[BARRIER R{self.robot_id}] Barrier error: {response.get('message')} "
@@ -3375,33 +2633,7 @@ class SimulationClient:
             self._randomize_camera_poses()
 
         self._spawn_object_at_curriculum_position()
-        if self._is_grid_train():
-            sx = self._episode_log_fields.get('spawn_x', '?')
-            sz = self._episode_log_fields.get('spawn_z', '?')
-            print("-------")
-            print(
-                f"[GRID R{self.robot_id}] ep {self.episode_count} | "
-                f"spawn=({sx}, {sz}) | {self._fine_tune_demo_bucket} | "
-                f"grid_phase={self._grid_phase}"
-            )
-        elif self._is_board_dqn_train():
-            sx = self._episode_log_fields.get('spawn_x', '?')
-            sz = self._episode_log_fields.get('spawn_z', '?')
-            print("-------")
-            print(
-                f"[BOARD R{self.robot_id}] ep {self.episode_count} | "
-                f"spawn=({sx}, {sz}) | {self._fine_tune_demo_bucket} | "
-                f"board_phase={self._board_phase}"
-            )
-        elif self._is_board_locator_train():
-            sx = self._episode_log_fields.get('spawn_x', '?')
-            sz = self._episode_log_fields.get('spawn_z', '?')
-            print("-------")
-            print(
-                f"[BOARD-LOC R{self.robot_id}] ep {self.episode_count} | "
-                f"spawn=({sx}, {sz}) | {self._fine_tune_demo_bucket}"
-            )
-        elif self._is_local_bbox_dqn_train():
+        if self._is_local_bbox_dqn_train():
             sx = self._episode_log_fields.get('spawn_x', '?')
             sz = self._episode_log_fields.get('spawn_z', '?')
             print(
@@ -3443,15 +2675,14 @@ class SimulationClient:
                 raise RuntimeError(f"Setup barrier failed for R2: {msg}")
             self._owns_domain_rand = bool(response.get('owns_domain_rand', False))
             num_robots = int(response.get('num_robots', 1))
-            if not self._is_grid_train():
-                if num_robots >= 2:
-                    print(f"[SETUP BARRIER R{self.robot_id}] R1 setup done — starting R2 episode setup")
-                else:
-                    print(f"[SETUP BARRIER R{self.robot_id}] Solo mode — owning domain rand")
+            if num_robots >= 2:
+                print(f"[SETUP BARRIER R{self.robot_id}] R1 setup done — starting R2 episode setup")
+            else:
+                print(f"[SETUP BARRIER R{self.robot_id}] Solo mode — owning domain rand")
 
         self.start_new_episode()
 
-        if self.robot_id == 1 and not self._is_grid_train():
+        if self.robot_id == 1:
             print(f"[SETUP BARRIER R{self.robot_id}] World setup done — releasing R2")
         _agent_debug_log(
             "simulation_client.py:_begin_next_episode_serialized",
@@ -3488,42 +2719,16 @@ class SimulationClient:
             hypothesis_id="C",
         )
 
-    def _spawn_fine_tune_position(self) -> Tuple[float, float, float, Optional[float]]:
-        """Spawn for targeted fine-tune: weak cell or full-grid normal demo."""
+    def _spawn_local_bbox_train_position(self) -> Tuple[float, float, float, Optional[float]]:
+        """Full-board uniform spawn for local-bbox DQN training."""
         robot_id = self.robot_id
         cx = self.curriculum.PLATFORM_CENTER_X
         cz = self.curriculum.PLATFORM_CENTER_Z
-        half_x = getattr(self.curriculum, 'PLATFORM_HALF_SIZE_X', 0.143675)
-        half_z = getattr(self.curriculum, 'PLATFORM_HALF_SIZE_Z', 0.083675)
-        in_spawn = getattr(self.curriculum, '_in_spawn_area', None)
-
-        if np.random.random() < self._fine_tune_weak_spawn_p:
-            cell = pick_random_weak_cell(robot_id, self._fine_tune_weak_regions)
-            sx, sz, radius_m = sample_spawn_in_phase_quadrant(
-                cell['phase'], cell['quadrant'], cx, cz, half_x, half_z, in_spawn,
-            )
-            self._fine_tune_demo_bucket = 'weak'
-            self._fine_tune_spawn_phase = int(cell['phase'])
-            self._fine_tune_spawn_collection = 'weak_cell'
-            self._fine_tune_spawn_quadrant = quadrant_from_spawn(sx, sz, cx, cz)
-            if not self._is_grid_train() and not self._is_local_bbox_dqn_train():
-                print(
-                    f"[FINE-TUNE R{robot_id}] WEAK spawn band={cell['phase']} "
-                    f"Q{self._fine_tune_spawn_quadrant} ({sx:.3f}, {sz:.3f}) "
-                    f"r={radius_m * 100:.1f}cm"
-                )
-            return sx, sz, radius_m * 100.0
-
         sx, sz, radius_cm = self._sample_full_board_spawn()
         self._fine_tune_demo_bucket = 'normal'
         self._fine_tune_spawn_phase = CurriculumManager.FULL_BOARD_PHASE
         self._fine_tune_spawn_collection = 'full_grid'
         self._fine_tune_spawn_quadrant = quadrant_from_spawn(sx, sz, cx, cz)
-        if not self._is_grid_train() and not self._is_local_bbox_dqn_train():
-            print(
-                f"[FINE-TUNE R{robot_id}] NORMAL full-grid ({sx:.3f}, {sz:.3f}) "
-                f"Q{self._fine_tune_spawn_quadrant}"
-            )
         return sx, sz, radius_cm
 
     def _spawn_object_at_curriculum_position(self):
@@ -3546,8 +2751,8 @@ class SimulationClient:
                 return
 
             spawn_radius_cm = None
-            if self.mode in ('fine_tune', 'locator_train', 'grid_train', 'board_dqn_train', 'board_locator_train', 'local_bbox_dqn_train'):
-                spawn_x, spawn_z, spawn_radius_cm = self._spawn_fine_tune_position()
+            if self.mode == 'local_bbox_dqn_train':
+                spawn_x, spawn_z, spawn_radius_cm = self._spawn_local_bbox_train_position()
                 self._episode_log_fields['spawn_quadrant'] = str(self._fine_tune_spawn_quadrant)
                 self._episode_log_fields['demo_bucket'] = self._fine_tune_demo_bucket
                 self._episode_log_fields['spawn_collection'] = self._fine_tune_spawn_collection
@@ -3559,7 +2764,7 @@ class SimulationClient:
                 spawn_x, _, spawn_z = self.curriculum.get_spawn_position()
 
             spawn_y = 0.461
-            if self.mode in ('fine_tune', 'locator_train', 'grid_train', 'board_dqn_train', 'board_locator_train', 'local_bbox_dqn_train'):
+            if self.mode == 'local_bbox_dqn_train':
                 self._episode_log_fields['spawn_phase'] = str(self._fine_tune_spawn_phase)
 
             position_field = obj_node.getField("translation")
@@ -3626,7 +2831,7 @@ class SimulationClient:
             sz = np.random.uniform(cz - half_z, cz + half_z)
 
         radius_cm = math.hypot(sx - cx, sz - cz) * 100.0
-        if not self._is_grid_train() and not self._is_local_bbox_dqn_train():
+        if not self._is_local_bbox_dqn_train():
             print(f"[INFERENCE R{self.robot_id}] Phase {CurriculumManager.FULL_BOARD_PHASE} "
                   f"(full board) spawn: ({sx:.3f}, {sz:.3f}) | radius {radius_cm:.1f}cm")
         return (sx, sz, radius_cm)
@@ -3635,17 +2840,6 @@ class SimulationClient:
         self.episode_active = False
         mode     = getattr(self, 'last_grasp_mode', 'explore')
         robot_id = self.robot_id
-
-        if self.mode in ('training', 'rl_train'):
-            self.curriculum.record_result(success, mode)
-            advanced = self.curriculum.check_phase_advance()
-            if advanced:
-                print(f"[CURRICULUM R{robot_id}] Phase advanced to {self.curriculum.phase}!")
-                self._send_message_to_host({
-                    'type':     'reset_epsilon',
-                    'value':    0.4,
-                    'robot_id': robot_id
-                })
 
         if self.mode == 'inference' and self.inference_mode == 'cycle':
             self._cycle_count_in_phase += 1
@@ -3659,49 +2853,6 @@ class SimulationClient:
         status = "OK" if success else "FAIL"
         if self.mode == 'inference':
             print(f"[INFERENCE R{robot_id}] {status} Episode {self.episode_count} (session {self.session_episode_count}) complete")
-        elif self.mode == 'fine_tune':
-            print(
-                f"[FINE-TUNE R{robot_id}] {status} Ep {self.episode_count} (session {self.session_episode_count}) | "
-                f"bucket={self._fine_tune_demo_bucket} | "
-                f"band={self._fine_tune_spawn_phase} Q{self._fine_tune_spawn_quadrant} | "
-                f"grasp={mode}"
-            )
-        elif self.mode == 'locator_train':
-            print(
-                f"[LOCATOR-TRAIN R{robot_id}] {status} Ep {self.episode_count} (session {self.session_episode_count}) | "
-                f"bucket={self._fine_tune_demo_bucket} | "
-                f"band={self._fine_tune_spawn_phase} Q{self._fine_tune_spawn_quadrant} | "
-                f"grasp={mode}"
-            )
-        elif self.mode == 'board_locator_train':
-            print(
-                f"[BOARD-LOC-TRAIN R{robot_id}] {status} Ep {self.episode_count} (session {self.session_episode_count}) | "
-                f"bucket={self._fine_tune_demo_bucket} | "
-                f"band={self._fine_tune_spawn_phase} Q{self._fine_tune_spawn_quadrant} | "
-                f"grasp={mode}"
-            )
-        elif self.mode == 'rl_train':
-            print(
-                f"[RL-TRAIN R{robot_id}] {status} Ep {self.episode_count} (session {self.session_episode_count}) | "
-                f"Phase {self.curriculum.phase} | reward logged | grasp={mode}"
-            )
-        elif self._is_board_dqn_train():
-            replay_len = self._episode_log_fields.get('replay_len', '')
-            replay_note = f" | replay_len={replay_len}" if replay_len != '' else ''
-            print(
-                f"[BOARD DONE R{robot_id}] {status} | {mode}{replay_note}"
-            )
-        elif self._is_grid_train():
-            replay = self._episode_log_fields.get('replay_used', '')
-            skip = self._episode_log_fields.get('replay_skip_reason', '')
-            replay_note = ''
-            if replay != '':
-                replay_note = f" | replay={'yes' if str(replay) == '1' else 'no'}"
-                if skip:
-                    replay_note += f" ({skip})"
-            print(
-                f"[GRID DONE R{robot_id}] {status} | {mode}{replay_note}"
-            )
         elif self._is_local_bbox_dqn_train():
             outcome = self._episode_log_fields.get('outcome_class', '') or mode
             print(
@@ -3738,7 +2889,7 @@ class SimulationClient:
             time.sleep(0.016)
         self.latest_rgb_image   = self.camera_handler.current_rgb_frame
         self.latest_depth_image = self.camera_handler.current_depth_frame
-        if self.latest_rgb_image is not None and not self._is_grid_train():
+        if self.latest_rgb_image is not None:
             print(f"[CAM R{self.robot_id}] Fresh camera frame after {steps}-step flush")
         elif self.latest_rgb_image is None:
             print(
@@ -3765,15 +2916,13 @@ class SimulationClient:
             time.sleep(1.0)
             self._flush_camera_buffers()
             self._cache_camera_base_poses()
-            if not self._is_grid_train():
-                print(f"[BARRIER R{self.robot_id}] Waiting at startup barrier...")
+            print(f"[BARRIER R{self.robot_id}] Waiting at startup barrier...")
             response = self._send_message_to_host({
                 'type':     'episode_end',
                 'success':  False,
                 'robot_id': self.robot_id
             })
-            if not self._is_grid_train():
-                print(f"[BARRIER R{self.robot_id}] Startup barrier cleared")
+            print(f"[BARRIER R{self.robot_id}] Startup barrier cleared")
             self._begin_next_episode_serialized()
             self._flush_camera_buffers(steps=20)
         else:
@@ -3892,45 +3041,21 @@ def main():
         description='UR3 Simulation Client',
         formatter_class=argparse.RawTextHelpFormatter
     )
-    parser.add_argument('--mode', type=str, default='training',
-                        help='training | fine_tune | locator_train | grid_train | board_dqn_train | board_locator_train | local_bbox_dqn_train | rl_train | inference')
-    parser.add_argument('--fine-tune-config', type=str, default=None,
-                        help='Path to fine_tune_config.yaml (fine_tune mode only)')
-    parser.add_argument('--locator-config', type=str, default=None,
-                        help='Path to locator_train_config.yaml (locator_train mode only)')
-    parser.add_argument('--grid-config', type=str, default=None,
-                        help='Path to grid_train_config.yaml (grid_train mode only)')
-    parser.add_argument('--board-config', type=str, default=None,
-                        help='Path to board_dqn_config.yaml (board_dqn_train mode only)')
-    parser.add_argument('--board-locator-config', type=str, default=None,
-                        help='Path to board_locator_train_config.yaml (board_locator_train mode only)')
+    parser.add_argument('--mode', type=str, default='inference',
+                        help='local_bbox_dqn_train | inference')
     parser.add_argument('--local-bbox-config', type=str, default=None,
                         help='Path to local_bbox_dqn_config.yaml (local_bbox_dqn_train mode only)')
-    parser.add_argument('--rl-train-config', type=str, default=None,
-                        help='Path to rl_train_config.yaml (rl_train mode only)')
-    parser.add_argument('--use-residual', action='store_true',
-                        help='Inference: apply trained RL residual (requires gpu_server --rl-residual-r1/r2)')
-    parser.add_argument('--use-geo-grasp', action='store_true',
-                        help='Inference: CNN aux_position → analytic grasp geometry (requires gpu_server --geo-grasp)')
-    parser.add_argument('--use-local-grid', action='store_true',
-                        help='Inference: locator-centered grid Q-head (requires gpu_server --local-grid)')
-    parser.add_argument('--use-board-dqn', action='store_true',
-                        help='Inference: full-board DQN (requires gpu_server --board-dqn)')
-    parser.add_argument('--use-board-locator', action='store_true',
-                        help='Inference: fuse board locator with board DQN (requires --use-board-dqn and gpu_server --board-locator)')
     parser.add_argument('--use-yolo-locator-test', action='store_true',
                         help='Inference: local YOLO bbox → random cell (requires gpu_server --yolo-locator-test)')
-    parser.add_argument('--use-yolo-fuse', action='store_true',
-                        help='Inference: YOLO bbox → best board-DQN Q in box (requires --use-board-dqn and gpu_server --yolo-fuse)')
     parser.add_argument('--use-local-bbox-dqn', action='store_true',
                         help='Inference: YOLO center → fixed window → local DQN (requires gpu_server --local-bbox-dqn)')
     parser.add_argument('--use-vlm-select', action='store_true',
                         help='Inference: per-episode text → Ollama VLM point → nearest YOLO box (requires --use-local-bbox-dqn)')
     parser.add_argument('--no-workspace-clamp', action='store_true',
-                        help='Inference: skip X/Y/Z workspace clip on exploit/exploit_geo poses (diagnostic; teacher explore unchanged)')
+                        help='Inference: skip X/Y/Z workspace clip on exploit poses (diagnostic)')
     parser.add_argument('--episodes', type=int, default=None,
-                        help='Episode cap for this process. Inference: session episodes (resets each launch).\n'
-                             'Training: global curriculum episode total (resumes from curriculum_state.json).\n'
+                        help='Episode cap for this process. Inference: session episodes.\n'
+                             'local_bbox_dqn_train: global episode total.\n'
                              'Omit for infinite.')
     parser.add_argument('--real', action='store_true',
                         help='Run on real UR3e. Forces inference mode.')
@@ -3974,66 +3099,27 @@ def main():
     is_real = args.real or args.ros_camera
     mode = 'inference' if is_real else args.mode
 
-    if mode not in ('training', 'fine_tune', 'locator_train', 'grid_train', 'board_dqn_train', 'board_locator_train', 'local_bbox_dqn_train', 'rl_train', 'inference'):
-        parser.error("--mode must be training, fine_tune, locator_train, grid_train, board_dqn_train, board_locator_train, local_bbox_dqn_train, rl_train, or inference.")
+    if mode not in ('local_bbox_dqn_train', 'inference'):
+        parser.error("--mode must be local_bbox_dqn_train or inference.")
 
-    if mode == 'rl_train' and is_real:
-        parser.error("rl_train mode is simulation-only (omit --real).")
+    grasp_flags = (
+        args.use_local_bbox_dqn,
+        args.use_vlm_select,
+        args.use_yolo_locator_test,
+    )
+    if mode == 'inference' and not any(grasp_flags):
+        args.use_local_bbox_dqn = True
 
-    if args.use_residual and mode != 'inference':
-        parser.error("--use-residual requires --mode inference.")
-    if args.use_geo_grasp and mode != 'inference':
-        parser.error("--use-geo-grasp requires --mode inference.")
-    if args.use_local_grid and mode != 'inference':
-        parser.error("--use-local-grid requires --mode inference.")
-    if args.use_board_dqn and mode != 'inference':
-        parser.error("--use-board-dqn requires --mode inference.")
-    if args.use_board_locator and mode != 'inference':
-        parser.error("--use-board-locator requires --mode inference.")
     if args.use_yolo_locator_test and mode != 'inference':
         parser.error("--use-yolo-locator-test requires --mode inference.")
-    if args.use_yolo_fuse and mode != 'inference':
-        parser.error("--use-yolo-fuse requires --mode inference.")
     if args.use_local_bbox_dqn and mode != 'inference':
         parser.error("--use-local-bbox-dqn requires --mode inference.")
     if args.use_vlm_select and mode != 'inference':
         parser.error("--use-vlm-select requires --mode inference.")
     if args.use_vlm_select and not args.use_local_bbox_dqn:
         parser.error("--use-vlm-select requires --use-local-bbox-dqn.")
-    if args.use_board_locator and not args.use_board_dqn:
-        parser.error("--use-board-locator requires --use-board-dqn.")
-    if args.use_yolo_fuse and not args.use_board_dqn:
-        parser.error("--use-yolo-fuse requires --use-board-dqn.")
-    if args.use_yolo_fuse and args.use_yolo_locator_test:
-        parser.error("Use either --use-yolo-fuse or --use-yolo-locator-test, not both.")
     if args.use_local_bbox_dqn and args.use_yolo_locator_test:
         parser.error("Use either --use-local-bbox-dqn or --use-yolo-locator-test, not both.")
-    if args.use_local_bbox_dqn and args.use_board_dqn:
-        parser.error("Use either --use-local-bbox-dqn or --use-board-dqn, not both.")
-    if args.use_yolo_locator_test and args.use_board_dqn:
-        parser.error("Use either --use-yolo-locator-test or --use-board-dqn, not both.")
-    if args.use_yolo_locator_test and args.use_board_locator:
-        parser.error("Use either --use-yolo-locator-test or --use-board-locator, not both.")
-    if args.use_yolo_fuse and args.use_board_locator:
-        parser.error("Use either --use-yolo-fuse or --use-board-locator, not both.")
-    if args.use_yolo_locator_test and args.use_geo_grasp:
-        parser.error("Use either --use-yolo-locator-test or --use-geo-grasp, not both.")
-    if args.use_yolo_locator_test and args.use_local_grid:
-        parser.error("Use either --use-yolo-locator-test or --use-local-grid, not both.")
-    if args.use_yolo_locator_test and args.use_residual:
-        parser.error("Use either --use-yolo-locator-test or --use-residual, not both.")
-    if args.use_residual and args.use_geo_grasp:
-        parser.error("Use either --use-residual or --use-geo-grasp, not both.")
-    if args.use_geo_grasp and args.use_local_grid:
-        parser.error("Use either --use-geo-grasp or --use-local-grid, not both.")
-    if args.use_residual and args.use_local_grid:
-        parser.error("Use either --use-residual or --use-local-grid, not both.")
-    if args.use_board_dqn and args.use_geo_grasp:
-        parser.error("Use either --use-board-dqn or --use-geo-grasp, not both.")
-    if args.use_board_dqn and args.use_local_grid:
-        parser.error("Use either --use-board-dqn or --use-local-grid, not both.")
-    if args.use_residual and args.use_board_dqn:
-        parser.error("Use either --use-residual or --use-board-dqn, not both.")
     if args.no_workspace_clamp and mode != 'inference':
         parser.error("--no-workspace-clamp requires --mode inference (or --real).")
 
@@ -4042,20 +3128,8 @@ def main():
         parser.error("Only one of --cycle, --free, --phase may be used at a time.")
     if any(inf_flags) and mode != 'inference':
         parser.error("--cycle / --free / --phase require --mode inference (or --real / --ros-camera).")
-    if mode == 'fine_tune' and any(inf_flags):
-        parser.error("fine_tune mode does not support --cycle / --free / --phase.")
-    if mode == 'locator_train' and any(inf_flags):
-        parser.error("locator_train mode does not support --cycle / --free / --phase.")
-    if mode == 'grid_train' and any(inf_flags):
-        parser.error("grid_train mode does not support --cycle / --free / --phase.")
-    if mode == 'board_dqn_train' and any(inf_flags):
-        parser.error("board_dqn_train mode does not support --cycle / --free / --phase.")
-    if mode == 'board_locator_train' and any(inf_flags):
-        parser.error("board_locator_train mode does not support --cycle / --free / --phase.")
     if mode == 'local_bbox_dqn_train' and any(inf_flags):
         parser.error("local_bbox_dqn_train mode does not support --cycle / --free / --phase.")
-    if mode == 'rl_train' and any(inf_flags):
-        parser.error("rl_train mode does not support --cycle / --free / --phase.")
     if args.cycle is None and (args.cycle_from != 0 or args.cycle_to != 5):
         parser.error("--cycle-from / --cycle-to require --cycle.")
 
@@ -4080,20 +3154,10 @@ def main():
         client = SimulationClient(
             mode=mode, real_robot=is_real, robot_id=robot_id,
             ros_camera=args.ros_camera,
-            use_residual=args.use_residual,
-            use_geo_grasp=args.use_geo_grasp,
-            use_local_grid=args.use_local_grid,
-            use_board_dqn=args.use_board_dqn,
-            use_board_locator=args.use_board_locator,
             use_yolo_locator_test=args.use_yolo_locator_test,
-            use_yolo_fuse=args.use_yolo_fuse,
             use_local_bbox_dqn=args.use_local_bbox_dqn,
             use_vlm_select=args.use_vlm_select,
             no_workspace_clamp=args.no_workspace_clamp,
-            rl_train_config_path=args.rl_train_config,
-            grid_config_path=args.grid_config,
-            board_config_path=args.board_config,
-            board_locator_config_path=args.board_locator_config,
             local_bbox_config_path=args.local_bbox_config,
         )
     except Exception:
@@ -4104,93 +3168,13 @@ def main():
 
     print(f"[STARTUP] SimulationClient ready (mode={mode})")
 
-    if mode == 'fine_tune' and args.fine_tune_config:
-        client._load_fine_tune_settings(args.fine_tune_config)
-
-    if mode == 'locator_train' and args.locator_config:
-        client._load_locator_train_settings(args.locator_config)
-
-    if mode == 'grid_train' and args.grid_config:
-        client._load_grid_train_settings(args.grid_config)
-
-    if mode == 'board_dqn_train' and args.board_config:
-        client._load_board_train_settings(args.board_config)
-
-    if mode == 'board_locator_train' and args.board_locator_config:
-        client._load_board_locator_train_settings(args.board_locator_config)
-
-    if mode == 'fine_tune':
-        cfg = client._fine_tune_cfg or {}
-        wr = cfg.get('sampling', {}).get('weak_ratio', 0.7)
-        nr = cfg.get('sampling', {}).get('normal_ratio', 0.3)
+    if mode == 'local_bbox_dqn_train':
         print(
-            f"[FINE-TUNE R{robot_id}] Targeted BC collection | "
-            f"batch mix {wr:.0%} weak / {nr:.0%} normal"
+            f"[LOCAL-BBOX-TRAIN R{robot_id}] start gpu_server.py with --local-bbox-dqn-train"
         )
-
-    if mode == 'locator_train':
-        cfg = client._fine_tune_cfg or {}
-        wr = cfg.get('sampling', {}).get('weak_ratio', 0.7)
-        nr = cfg.get('sampling', {}).get('normal_ratio', 0.3)
-        print(
-            f"[LOCATOR-TRAIN R{robot_id}] Supervised (X,Z) collection | "
-            f"batch mix {wr:.0%} weak / {nr:.0%} normal | "
-            f"start gpu_server.py with --locator-train"
-        )
-
-    if mode == 'grid_train':
-        cfg = client._fine_tune_cfg or {}
-        wr = cfg.get('sampling', {}).get('weak_ratio', 0.7)
-        tr = cfg.get('training', {})
-        print(
-            f"[GRID-TRAIN R{robot_id}] Teacher shaping + DQN | "
-            f"batch mix {wr:.0%} weak | phase={tr.get('phase', 'both')} | "
-            f"start gpu_server.py with --grid-train"
-        )
-
-    if mode == 'board_dqn_train':
-        cfg = client._fine_tune_cfg or {}
-        wr = cfg.get('sampling', {}).get('weak_ratio', 0.7)
-        tr = cfg.get('training', {})
-        print(
-            f"[BOARD-DQN R{robot_id}] Paper session 2: CNN pick + oracle shaping | "
-            f"batch mix {wr:.0%} weak | shaping_episodes={tr.get('shaping_episodes', 250)} | "
-            f"start gpu_server.py with --board-dqn-train"
-        )
-
-    if mode == 'board_locator_train':
-        cfg = client._fine_tune_cfg or {}
-        wr = cfg.get('sampling', {}).get('weak_ratio', 0.7)
-        print(
-            f"[BOARD-LOC R{robot_id}] Warp seg labels from spawn XZ | "
-            f"batch mix {wr:.0%} weak | "
-            f"start gpu_server.py with --board-locator-train"
-        )
-
-    if mode == 'rl_train':
-        print(
-            f"[RL-TRAIN R{robot_id}] TD3 residual collection | "
-            f"start gpu_server.py with --rl-train and BC checkpoints"
-        )
-        if args.rl_train_config:
-            client._load_rl_train_settings(args.rl_train_config)
-
-    if mode == 'inference' and args.use_geo_grasp:
-        print(f"[INFERENCE R{robot_id}] Geo grasp (--use-geo-grasp) | aux_position → geometry")
-
-    if mode == 'inference' and args.use_local_grid:
-        print(f"[INFERENCE R{robot_id}] Local grid (--use-local-grid) | locator + Q-cell → geometry")
-
-    if mode == 'inference' and args.use_board_dqn:
-        loc_note = " + locator fusion" if args.use_board_locator else ""
-        yolo_note = " + YOLO fuse" if args.use_yolo_fuse else ""
-        print(f"[INFERENCE R{robot_id}] Full-board DQN (--use-board-dqn){loc_note}{yolo_note}")
 
     if mode == 'inference' and args.use_yolo_locator_test:
         print(f"[INFERENCE R{robot_id}] YOLO bbox random cell (--use-yolo-locator-test)")
-
-    if mode == 'inference' and args.use_yolo_fuse:
-        print(f"[INFERENCE R{robot_id}] YOLO bbox → best Q in box (--use-yolo-fuse)")
 
     if mode == 'inference' and args.use_local_bbox_dqn:
         vlm_note = " + VLM select" if args.use_vlm_select else ""
@@ -4198,9 +3182,6 @@ def main():
 
     if mode == 'inference' and args.no_workspace_clamp:
         print(f"[INFERENCE R{robot_id}] Workspace clamp DISABLED (--no-workspace-clamp)")
-
-    if mode == 'inference' and args.use_residual:
-        print(f"[INFERENCE R{robot_id}] BC + RL residual (--use-residual)")
 
     if mode == 'inference' and args.episodes is not None:
         print(f"[INFERENCE R{robot_id}] Session episode cap: {args.episodes}")
